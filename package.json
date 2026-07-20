@@ -1,0 +1,32 @@
+{
+  "name": "wolfpack-pi-tasks",
+  "module": "src/extension.ts",
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.80.10",
+    "@earendil-works/pi-coding-agent": "^0.80.10",
+    "@earendil-works/pi-tui": "^0.80.10",
+    "@types/bun": "^1.3.14",
+    "typebox": "^1.3.6",
+    "typescript": "^7.0.2"
+  },
+  "pi": {
+    "extensions": [
+      "./src/extension.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "private": true,
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "type": "module"
+}

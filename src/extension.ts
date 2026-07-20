@@ -3,6 +3,7 @@ import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
+import { buildBackgroundTaskNotificationPrompt, selectUnpromptedTerminalTasks } from "./auto-notify";
 import { buildAssignment, compactTaskResult, getCurrentSessionName } from "./protocol";
 import {
 	ackTask,
@@ -73,6 +74,7 @@ const DoneParams = Type.Object({
 export default function wolfpackPiTasks(pi: ExtensionAPI) {
 	let backgroundTimer: ReturnType<typeof setInterval> | undefined;
 	const notifiedTaskIds = new Set<string>();
+	const autoPromptedTaskIds = new Set<string>();
 
 	pi.on("session_start", async (_event, ctx) => {
 		const sessionName = getCurrentSessionName(process.env);
@@ -85,6 +87,13 @@ export default function wolfpackPiTasks(pi: ExtensionAPI) {
 		}, BACKGROUND_POLL_MS);
 
 		await refreshInboxStatus(ctx.cwd, sessionName, ctx).catch(() => undefined);
+	});
+
+	pi.on("agent_end", async (_event, ctx) => {
+		const sessionName = getCurrentSessionName(process.env);
+		setTimeout(() => {
+			void refreshInboxStatus(ctx.cwd, sessionName, ctx).catch(() => undefined);
+		}, 0);
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -102,6 +111,23 @@ export default function wolfpackPiTasks(pi: ExtensionAPI) {
 			if (notifiedTaskIds.has(task.id)) continue;
 			notifiedTaskIds.add(task.id);
 			ctx.ui.notify(`task ${task.id} ${task.status}: ${task.targetSession}`, task.status === "completed" ? "info" : "warning");
+		}
+		triggerIdleInboxPrompt(inbox, ctx);
+	}
+
+	function triggerIdleInboxPrompt(inbox: Awaited<ReturnType<typeof listInbox>>, ctx: ExtensionContext): void {
+		if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
+
+		const tasksToPrompt = selectUnpromptedTerminalTasks(inbox, autoPromptedTaskIds);
+		if (tasksToPrompt.length === 0) return;
+
+		try {
+			pi.sendUserMessage(buildBackgroundTaskNotificationPrompt(tasksToPrompt));
+			for (const task of tasksToPrompt) {
+				autoPromptedTaskIds.add(task.id);
+			}
+		} catch {
+			ctx.ui.notify("task results ready; parent is busy, will retry", "info");
 		}
 	}
 

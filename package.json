@@ -1,6 +1,11 @@
 {
   "name": "pi-tasks",
+  "description": "Structured task communication for Pi agents with pluggable stores and transports.",
   "module": "src/extension.ts",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/almogdepaz/pi-tasks.git"
+  },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",

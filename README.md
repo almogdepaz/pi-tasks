@@ -3,8 +3,9 @@
 Structured task communication for Pi agents.
 
 `pi-tasks` lets one Pi session hand work to another agent, session, process, or
-worker and get durable structured results back. Wolfpack is the default
-transport, but the core model is not Wolfpack-specific.
+worker and get durable structured results back. The core model is transport- and
+runner-neutral: local sessions, HTTP workers, queues, hosted control planes, and
+terminal multiplexers can all implement the same task lifecycle.
 
 ## what this is
 
@@ -19,13 +20,11 @@ A task lifecycle and communication layer:
 
 ## what this is not
 
-This is **not** a subagent spawner. Use Wolfpack, another process manager, HTTP
-workers, queues, cron jobs, or your own runner to create/host agents. `pi-tasks`
-only gives those agents a shared task protocol.
+This is **not** a subagent spawner. Use any process manager, terminal/session
+manager, HTTP worker pool, queue, cron job, or custom runner to create/host
+agents. `pi-tasks` only gives those agents a shared task protocol.
 
 ## mental model
-
-`pi-tasks` separates task state from assignment delivery:
 
 ```text
 parent pi session
@@ -43,19 +42,14 @@ parent pi session
   agent_task_status / agent_task_wait / agent_task_inbox
 ```
 
-The `to` field is transport-specific. For Wolfpack it is a session name/id. For
-HTTP it might be a worker id. For a queue it might be a queue/topic name. For a
-local CLI transport it might be a tmux pane, process id, or script target.
+The `to` field is transport-specific:
 
-## default behavior
-
-The default Pi extension composes:
-
-- filesystem store at `.wolfpack/tasks/` for compatibility with the original
-  Wolfpack-focused plugin
-- Wolfpack transport using `wolfpack session send`
-
-Generic filesystem storage defaults to `.pi/tasks/` when used directly.
+- session name
+- worker id
+- queue/topic name
+- tmux pane
+- process id
+- service-specific address
 
 ## install
 
@@ -75,56 +69,9 @@ Every participating Pi session must load this extension. If a target Pi session
 does not have `agent_task_done`, the sender can still create/dispatch the task,
 but it will remain non-terminal until timeout or cancellation.
 
-## quick start with wolfpack
+## quick start: local/custom transport
 
-1. open or select a Wolfpack target session.
-2. from the parent Pi session, call `agent_task_send`:
-
-```json
-{
-  "to": "target-session-name",
-  "task": "inspect the auth middleware and report risks",
-  "timeoutMs": 1800000
-}
-```
-
-3. keep working locally. do **not** poll terminal text for completion.
-4. later, call `agent_task_status`, `agent_task_wait`, or `agent_task_inbox`.
-5. the target session must finish by calling `agent_task_done` exactly once.
-
-Wolfpack dispatch command used internally:
-
-```bash
-wolfpack session send <target-session> <assignment>
-```
-
-## using without wolfpack
-
-You have two choices:
-
-1. reuse the filesystem store and write only a transport
-2. replace both store and transport when task state needs to live remotely
-
-Most integrations should start with option 1. Storage is already generic; only
-identity and delivery are environment-specific.
-
-### pattern 1: another way to message pi sessions
-
-Use this when your targets are still Pi sessions, but delivery is not Wolfpack:
-for example tmux, screen, ssh, a local supervisor, or a custom session manager.
-
-You implement:
-
-- `getCurrentSessionName(env)` — stable name for the current Pi session
-- `dispatchTask({ target, assignment })` — send assignment text to the target
-
-You keep:
-
-- `createFilesystemTaskStore({ tasksDir: ".pi/tasks" })`
-- `agent_task_done` in the target Pi session
-- `agent_task_status`, `agent_task_wait`, and `agent_task_inbox` in the parent
-
-Example local CLI transport:
+Most integrations reuse the filesystem store and provide only a transport:
 
 ```ts
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -158,12 +105,30 @@ export default function extension(pi: ExtensionAPI): void {
 }
 ```
 
-### pattern 2: http workers
+Then call `agent_task_send` from the parent session:
 
-Use this when a service owns worker processes and can receive assignments over
-HTTP. If workers are Pi sessions, have them call `agent_task_done`. If workers are
-not Pi sessions, expose a completion endpoint or let workers import/use your
-store implementation directly.
+```json
+{
+  "to": "worker-a",
+  "task": "inspect the auth middleware and report risks",
+  "timeoutMs": 1800000
+}
+```
+
+The parent should keep working and later use `agent_task_status`,
+`agent_task_wait`, or `agent_task_inbox`. Do **not** infer completion from
+terminal output.
+
+## using with non-pi workers
+
+A non-Pi worker can participate if it implements the same lifecycle:
+
+1. receive `pi.task.assignment.v1`
+2. do the assigned work
+3. write/report a terminal result with the same status and payload semantics
+4. never overwrite an already-terminal task
+
+Example HTTP transport from a Pi extension:
 
 ```ts
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -202,8 +167,9 @@ export default function extension(pi: ExtensionAPI): void {
 }
 ```
 
-For non-Pi HTTP workers, the server needs a matching completion path. The worker
-should report a terminal result equivalent to:
+For non-Pi workers, expose a completion endpoint or let workers use your store
+implementation directly. The worker should report a terminal result equivalent
+to:
 
 ```json
 {
@@ -214,13 +180,10 @@ should report a terminal result equivalent to:
 }
 ```
 
-The important part is not the HTTP shape; it is preserving the task lifecycle:
-once terminal, no second completion can replace it.
+## file inbox / polling workers
 
-### pattern 3: file inbox / polling workers
-
-Use this when a local worker watches a directory or queue instead of receiving a
-pushed message.
+A pushed message is not required. A transport can durably drop assignments into a
+file inbox or queue and return success once the assignment is written.
 
 One simple design:
 
@@ -230,21 +193,35 @@ One simple design:
 - worker reads the assignment, does the work, then completes through a store API
   or by invoking a Pi session that has `agent_task_done`
 
-That transport can return `{ ok: true }` once the assignment file is durably
-written. Completion is still separate and later.
+Completion is separate from dispatch. Dispatch means “assignment delivered,” not
+“work finished.”
 
-### when to implement a custom store
+## when to implement a custom store
 
 Do **not** implement a custom store just because you have a new dispatch
 mechanism. Implement `TaskStore` only when task state itself must be somewhere
 else:
 
-- a central HTTP service
+- central HTTP service
 - Redis/Postgres/SQLite shared by multiple machines
-- a multi-host queue system
-- a hosted control plane
+- multi-host queue system
+- hosted control plane
 
 If only delivery changes, keep the filesystem store.
+
+## included wolfpack transport
+
+This package includes a Wolfpack transport for convenience and backwards
+compatibility. The default exported extension composes:
+
+- filesystem store at `.wolfpack/tasks/`
+- transport command: `wolfpack session send <target-session> <assignment>`
+
+If you are using Wolfpack, install this extension in every participating Pi
+session and target a session name/id with `agent_task_send`.
+
+If you are not using Wolfpack, do not use the default export; register the tools
+with your own `{ store, transport }` composition.
 
 ## tools
 
@@ -315,6 +292,8 @@ Filesystem layout:
 └── result.json
 ```
 
+Generic filesystem storage defaults to `.pi/tasks/` when used directly.
+
 ## architecture
 
 `pi-tasks` separates storage from delivery:
@@ -380,5 +359,5 @@ bun run typecheck
 
 - no built-in HTTP/Redis transport yet
 - no runtime transport selector yet; compose a store/transport in an extension
-- default extension still uses Wolfpack transport for compatibility
+- default extension uses the included Wolfpack transport for compatibility
 - package is source-first and currently marked private in `package.json`; install locally with Pi

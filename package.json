@@ -1,10 +1,26 @@
 {
-  "name": "pi-tasks",
+  "name": "@sgtbeatdown/pi-tasks",
+  "version": "0.1.0",
   "description": "Structured task communication for Pi agents with pluggable stores and transports.",
   "module": "src/extension.ts",
   "repository": {
     "type": "git",
     "url": "https://github.com/almogdepaz/pi-tasks.git"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "agent",
+    "tasks"
+  ],
+  "files": [
+    "README.md",
+    "src",
+    "skills",
+    "tsconfig.json"
+  ],
+  "publishConfig": {
+    "access": "public"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -28,7 +44,6 @@
       "./skills"
     ]
   },
-  "private": true,
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit"

@@ -5,6 +5,23 @@ const packageJsonPath = new URL("../package.json", import.meta.url);
 const skillPath = new URL("../skills/wolfpack-pi-task-delegation/SKILL.md", import.meta.url);
 
 describe("package skill wiring", () => {
+	test("package metadata is publishable as a pi package", async () => {
+		const packageJson = JSON.parse(await readFile(packageJsonPath, "utf8")) as {
+			readonly name?: string;
+			readonly version?: string;
+			readonly private?: boolean;
+			readonly keywords?: readonly string[];
+			readonly files?: readonly string[];
+		};
+
+		expect(packageJson.name).toBe("@sgtbeatdown/pi-tasks");
+		expect(packageJson.version).toBe("0.1.0");
+		expect(packageJson.private).toBeUndefined();
+		expect(packageJson.keywords).toContain("pi-package");
+		expect(packageJson.files).toContain("src");
+		expect(packageJson.files).toContain("skills");
+	});
+
 	test("package exposes extension and skill resources", async () => {
 		const packageJson = JSON.parse(await readFile(packageJsonPath, "utf8")) as {
 			readonly pi?: { readonly extensions?: readonly string[]; readonly skills?: readonly string[] };

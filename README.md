@@ -78,13 +78,13 @@ protocol once the agents exist.
 Install locally into Pi:
 
 ```bash
-pi install -l ../pi-tasks
+pi install npm:@sgtbeatdown/pi-tasks
 ```
 
 Temporary one-off run:
 
 ```bash
-pi -e ../pi-tasks/src/extension.ts
+pi -e npm:@sgtbeatdown/pi-tasks
 ```
 
 Every participating Pi session must load this extension. If a target Pi session
@@ -97,9 +97,9 @@ Most integrations reuse the filesystem store and provide only a transport:
 
 ```ts
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { registerAgentTaskTools } from "pi-tasks/src/extension";
-import { createFilesystemTaskStore } from "pi-tasks/src/stores/filesystem";
-import type { TaskTransport } from "pi-tasks/src/task-communication";
+import { registerAgentTaskTools } from "@sgtbeatdown/pi-tasks/src/extension";
+import { createFilesystemTaskStore } from "@sgtbeatdown/pi-tasks/src/stores/filesystem";
+import type { TaskTransport } from "@sgtbeatdown/pi-tasks/src/task-communication";
 
 function createCliTransport(pi: ExtensionAPI): TaskTransport {
   return {
@@ -152,9 +152,9 @@ Create `.pi/extensions/pi-tasks-tmux.ts` in the project:
 
 ```ts
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { registerAgentTaskTools } from "pi-tasks/src/extension";
-import { createFilesystemTaskStore } from "pi-tasks/src/stores/filesystem";
-import type { TaskTransport } from "pi-tasks/src/task-communication";
+import { registerAgentTaskTools } from "@sgtbeatdown/pi-tasks/src/extension";
+import { createFilesystemTaskStore } from "@sgtbeatdown/pi-tasks/src/stores/filesystem";
+import type { TaskTransport } from "@sgtbeatdown/pi-tasks/src/task-communication";
 
 function createTmuxTransport(pi: ExtensionAPI): TaskTransport {
   return {
@@ -280,9 +280,9 @@ Example HTTP transport from a Pi extension:
 
 ```ts
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { registerAgentTaskTools } from "pi-tasks/src/extension";
-import { createFilesystemTaskStore } from "pi-tasks/src/stores/filesystem";
-import type { TaskTransport } from "pi-tasks/src/task-communication";
+import { registerAgentTaskTools } from "@sgtbeatdown/pi-tasks/src/extension";
+import { createFilesystemTaskStore } from "@sgtbeatdown/pi-tasks/src/stores/filesystem";
+import type { TaskTransport } from "@sgtbeatdown/pi-tasks/src/task-communication";
 
 const httpTransport: TaskTransport = {
   name: "http",
@@ -511,4 +511,4 @@ bun run typecheck
 - no built-in HTTP/Redis transport yet
 - no runtime transport selector yet; compose a store/transport in an extension
 - default extension uses the generic filesystem store plus the included Wolfpack transport
-- package is source-first and currently marked private in `package.json`; install locally with Pi
+- package is source-first; install with `pi install npm:@sgtbeatdown/pi-tasks`

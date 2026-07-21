@@ -5,7 +5,7 @@
   "module": "src/extension.ts",
   "repository": {
     "type": "git",
-    "url": "https://github.com/almogdepaz/pi-tasks.git"
+    "url": "git+https://github.com/almogdepaz/pi-tasks.git"
   },
   "keywords": [
     "pi-package",

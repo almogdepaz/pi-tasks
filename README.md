@@ -51,6 +51,28 @@ The `to` field is transport-specific:
 - process id
 - service-specific address
 
+## requirements for any runner
+
+For task communication to work, you need exactly these pieces:
+
+1. **running target** — an already-open Pi session, worker, process, or service.
+   `pi-tasks` does not open or close it.
+2. **transport** — code that delivers the assignment text to that target. This
+   can be `tmux paste-buffer`, HTTP POST, queue publish, file write, ssh, etc.
+3. **reachable task store** — parent and target must read/write the same task
+   state. With `createFilesystemTaskStore`, that means the same cwd and shared
+   `.pi/tasks` directory. For multi-host setups without shared disk, implement a
+   remote `TaskStore`.
+4. **completion capability** — Pi targets need this extension loaded so they have
+   `agent_task_done`. Non-Pi workers need an equivalent completion API/store
+   write.
+5. **preserved task id** — the target must complete the exact `taskId` from the
+   `pi.task.assignment.v1` assignment.
+
+If those are true, session lifecycle is irrelevant. Open agents with tmux,
+screen, ssh, a process manager, or manually; `pi-tasks` only handles the task
+protocol once the agents exist.
+
 ## install
 
 Install locally into Pi:
@@ -118,6 +140,132 @@ Then call `agent_task_send` from the parent session:
 The parent should keep working and later use `agent_task_status`,
 `agent_task_wait`, or `agent_task_inbox`. Do **not** infer completion from
 terminal output.
+
+## tmux recipe: already-open pi agents
+
+Use this when you manually open Pi agents in tmux panes and only need task
+communication between them.
+
+### 1. create a tmux transport extension
+
+Create `.pi/extensions/pi-tasks-tmux.ts` in the project:
+
+```ts
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerAgentTaskTools } from "pi-tasks/src/extension";
+import { createFilesystemTaskStore } from "pi-tasks/src/stores/filesystem";
+import type { TaskTransport } from "pi-tasks/src/task-communication";
+
+function createTmuxTransport(pi: ExtensionAPI): TaskTransport {
+  return {
+    name: "tmux",
+    getCurrentSessionName(env) {
+      return env.PI_TASK_SESSION ?? env.TMUX_PANE ?? `pid-${process.pid}`;
+    },
+    async dispatchTask({ target, assignment, task, signal }) {
+      const bufferName = `pi-task-${task.id}`;
+      const setBuffer = await pi.exec("tmux", ["set-buffer", "-b", bufferName, assignment], { signal });
+      if (setBuffer.code !== 0) {
+        return {
+          ok: false,
+          message: setBuffer.stderr || setBuffer.stdout || "tmux set-buffer failed",
+          retryable: true,
+        };
+      }
+
+      const paste = await pi.exec("tmux", ["paste-buffer", "-d", "-b", bufferName, "-t", target], { signal });
+      if (paste.code !== 0) {
+        return {
+          ok: false,
+          message: paste.stderr || paste.stdout || "tmux paste-buffer failed",
+          retryable: true,
+        };
+      }
+
+      const enter = await pi.exec("tmux", ["send-keys", "-t", target, "Enter"], { signal });
+      if (enter.code !== 0) {
+        return {
+          ok: false,
+          message: enter.stderr || enter.stdout || "tmux send-keys failed",
+          retryable: true,
+        };
+      }
+
+      return { ok: true };
+    },
+  };
+}
+
+export default function extension(pi: ExtensionAPI): void {
+  registerAgentTaskTools(pi, {
+    // All tmux panes must run in the same project cwd so they share .pi/tasks.
+    store: createFilesystemTaskStore({ tasksDir: ".pi/tasks" }),
+    transport: createTmuxTransport(pi),
+  });
+}
+```
+
+This transport does not open panes. It only pastes assignment text into an
+already-running pane and presses Enter.
+
+### 2. open the agents yourself
+
+Start each Pi agent in the same repo/cwd and load the extension. Give each one a
+stable session name:
+
+```bash
+# pane 1
+PI_TASK_SESSION=parent pi -e ./.pi/extensions/pi-tasks-tmux.ts
+
+# pane 2
+PI_TASK_SESSION=worker-a pi -e ./.pi/extensions/pi-tasks-tmux.ts
+```
+
+If the extension is installed with `pi install`, you can omit `-e`; the important
+parts are same cwd, same `.pi/tasks`, and distinct `PI_TASK_SESSION` values.
+
+### 3. find the target pane id
+
+From inside tmux:
+
+```bash
+tmux list-panes -a -F '#{pane_id} #{pane_current_path} #{pane_title}'
+```
+
+Pane ids look like `%12`. Use that pane id as `agent_task_send.to`.
+
+### 4. send a task
+
+From the parent Pi session, call:
+
+```json
+{
+  "to": "%12",
+  "task": "inspect the auth middleware and report risks",
+  "timeoutMs": 1800000
+}
+```
+
+Expected flow:
+
+1. parent creates `.pi/tasks/<taskId>/...`
+2. tmux transport pastes the assignment into pane `%12`
+3. worker receives `pi.task.assignment.v1`
+4. worker does the work
+5. worker calls `agent_task_done` with that `taskId`
+6. parent reads the result via `agent_task_status`, `agent_task_wait`, or
+   `agent_task_inbox`
+
+### tmux troubleshooting
+
+- If the target cannot complete the task, confirm it loaded the extension and has
+  `agent_task_done` available.
+- If status never changes, confirm parent and worker are in the same cwd and both
+  can see the same `.pi/tasks/<taskId>` directory.
+- If dispatch fails, run `tmux paste-buffer` manually against the same target id;
+  the pane id may be stale.
+- Do not use terminal output as the source of truth. The task result is the store
+  state, not visible prose in the pane.
 
 ## using with non-pi workers
 
@@ -211,17 +359,21 @@ If only delivery changes, keep the filesystem store.
 
 ## included wolfpack transport
 
-This package includes a Wolfpack transport for convenience and backwards
-compatibility. The default exported extension composes:
+This package includes a Wolfpack transport for convenience. It is only a delivery
+adapter:
 
-- filesystem store at `.wolfpack/tasks/`
-- transport command: `wolfpack session send <target-session> <assignment>`
+```bash
+wolfpack session send <target-session> <assignment>
+```
+
+It does not own storage. The default exported extension uses the generic
+filesystem store at `.pi/tasks/` plus the included Wolfpack transport.
 
 If you are using Wolfpack, install this extension in every participating Pi
 session and target a session name/id with `agent_task_send`.
 
-If you are not using Wolfpack, do not use the default export; register the tools
-with your own `{ store, transport }` composition.
+If you are not using Wolfpack, register the tools with your own `{ store,
+transport }` composition.
 
 ## tools
 
@@ -339,7 +491,6 @@ registerAgentTaskTools(pi, {
   - `createFilesystemTaskStore`
 - `src/transports/wolfpack.ts`
   - `createWolfpackTaskTransport`
-  - `WOLFPACK_TASKS_DIR`
 - `src/protocol.ts`
   - `buildAssignment`
   - `compactTaskResult`
@@ -359,5 +510,5 @@ bun run typecheck
 
 - no built-in HTTP/Redis transport yet
 - no runtime transport selector yet; compose a store/transport in an extension
-- default extension uses the included Wolfpack transport for compatibility
+- default extension uses the generic filesystem store plus the included Wolfpack transport
 - package is source-first and currently marked private in `package.json`; install locally with Pi

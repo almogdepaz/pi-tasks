@@ -16,7 +16,7 @@ success:
 status: done
 
 success:
-- creates tasks in `<project>/.wolfpack/tasks/<taskId>`
+- creates tasks in `<project>/.pi/tasks/<taskId>`
 - writes `task.json`, `events.jsonl`, `assignment.json`, `result.json`
 - uses atomic task writes and lock dirs
 - enforces terminal first-writer-wins

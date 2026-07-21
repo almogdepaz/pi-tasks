@@ -3,8 +3,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+import { createDefaultTaskCommunicationLayer } from "../src/extension";
 import { createFilesystemTaskStore } from "../src/stores/filesystem";
-import { createWolfpackTaskTransport, getCurrentWolfpackSessionName, WOLFPACK_TASKS_DIR } from "../src/transports/wolfpack";
+import { createWolfpackTaskTransport, getCurrentWolfpackSessionName } from "../src/transports/wolfpack";
 
 let projectDir: string;
 
@@ -78,18 +81,13 @@ describe("task store and transport split", () => {
 		expect("createOrReuseDispatchedTask" in transport).toBe(false);
 	});
 
-	test("wolfpack compatibility is store configuration plus wolfpack transport", async () => {
-		const store = createFilesystemTaskStore({ tasksDir: WOLFPACK_TASKS_DIR });
-		const { task } = await store.createOrReuseDispatchedTask({
-			projectDir,
-			parentSession: "parent",
-			targetSession: "worker",
-			taskText: "inspect auth",
-			assignment: { instructions: "inspect auth" },
-			timeoutMs: 30_000,
-		});
+	test("default communication layer uses generic storage with the included transport", () => {
+		const layer = createDefaultTaskCommunicationLayer({
+			exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+		} as unknown as ExtensionAPI);
 
-		expect(task.assignmentRef).toBe(`file://.wolfpack/tasks/${task.id}/assignment.json`);
+		expect(layer.store.tasksDir).toBe(".pi/tasks");
+		expect(layer.transport.name).toBe("wolfpack");
 	});
 
 	test("wolfpack session identity is transport-specific", () => {

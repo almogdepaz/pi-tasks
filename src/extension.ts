@@ -6,7 +6,7 @@ import { Type } from "typebox";
 import { buildBackgroundTaskNotificationPrompt, selectUnpromptedTerminalTasks } from "./auto-notify";
 import type { TaskCommunicationLayer } from "./task-communication";
 import { createFilesystemTaskStore } from "./stores/filesystem";
-import { createWolfpackTaskTransport, WOLFPACK_TASKS_DIR } from "./transports/wolfpack";
+import { createWolfpackTaskTransport } from "./transports/wolfpack";
 import { buildAssignment, compactTaskResult } from "./protocol";
 import type { AgentTaskRecord, TaskResultPayload, TerminalTaskStatus } from "./types";
 import { DEFAULT_TIMEOUT_MS, TASK_PROTOCOL_VERSION } from "./types";
@@ -66,7 +66,7 @@ const DoneParams = Type.Object({
 
 export function createDefaultTaskCommunicationLayer(pi: ExtensionAPI): TaskCommunicationLayer {
 	return {
-		store: createFilesystemTaskStore({ tasksDir: WOLFPACK_TASKS_DIR }),
+		store: createFilesystemTaskStore(),
 		transport: createWolfpackTaskTransport({
 			exec: (command, args, options) => pi.exec(command, [...args], options),
 		}),

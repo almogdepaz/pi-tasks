@@ -19,8 +19,8 @@ const baseTask: AgentTaskRecord = {
 	timeoutAt: "2026-07-19T00:30:00.000Z",
 	timeoutMs: 30_000,
 	idempotencyKey: undefined,
-	assignmentRef: "file://.wolfpack/tasks/task_abc/assignment.json",
-	resultRef: "file://.wolfpack/tasks/task_abc/result.json",
+	assignmentRef: "file://.pi/tasks/task_abc/assignment.json",
+	resultRef: "file://.pi/tasks/task_abc/result.json",
 	parentAckAt: undefined,
 	targetTaskProtocol: "pi.agentTask.v1",
 	error: undefined,
@@ -52,7 +52,7 @@ describe("protocol helpers", () => {
 			taskId: "task_abc",
 			status: "completed",
 			summary: "done",
-			artifacts: ["file://.wolfpack/tasks/task_abc/result.json"],
+			artifacts: ["file://.pi/tasks/task_abc/result.json"],
 			error: null,
 		});
 	});

@@ -20,7 +20,7 @@ success state:
 1. the public tool names stay `agent_task_*` for now to preserve installed prompt/tool behavior.
 2. wolfpack remains the default transport in this repo, but not the architectural center.
 3. the first split should avoid publishing/package renames unless explicitly requested.
-4. filesystem storage is generic shared task state; the path should move from hardcoded `.wolfpack/tasks` toward configurable store-owned storage.
+4. filesystem storage is generic shared task state; the default path should be `.pi/tasks`, not transport-owned storage.
 5. dispatch is separate from storage: transports may deliver via wolfpack cli, http, local inbox polling, etc.
 6. target sessions still complete through `agent_task_done`, independent of how assignments were delivered.
 
@@ -98,7 +98,7 @@ wolfpack-specific code owns:
 1. add tests that encode store/transport separation
    - protocol assignment envelope no longer says wolfpack except adapter wrapper tests
    - extension can be constructed around a fake store/transport pair
-   - filesystem root can be configured away from `.wolfpack/tasks`
+   - filesystem root defaults to `.pi/tasks` and remains configurable
 
 2. extract generic protocol names
    - rename wolfpack assignment envelope type to generic task assignment v1
@@ -111,7 +111,7 @@ wolfpack-specific code owns:
 4. move current store into filesystem store
    - `src/stores/filesystem.ts`
    - configurable root path
-   - preserve existing `.wolfpack/tasks` default for wolfpack composition
+   - do not make wolfpack transport own or imply a storage path
 
 5. add wolfpack transport
    - `src/transports/wolfpack.ts`
@@ -142,8 +142,8 @@ wolfpack-specific code owns:
 ## decisions
 
 1. assignment envelope changed to `pi.task.assignment.v1`.
-2. generic filesystem storage defaults to `.pi/tasks`; the default wolfpack composition preserves `.wolfpack/tasks`.
-3. composition is internal factory-based for v1: default extension uses filesystem store + wolfpack transport, and downstream packages can call `registerAgentTaskTools` with another store/transport pair.
+2. generic filesystem storage defaults to `.pi/tasks`; wolfpack is transport-only and does not own storage.
+3. composition is internal factory-based for v1: default extension uses generic filesystem store + wolfpack transport, and downstream packages can call `registerAgentTaskTools` with another store/transport pair.
 
 ## implementation status
 

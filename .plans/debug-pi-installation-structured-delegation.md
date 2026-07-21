@@ -16,6 +16,6 @@ make wolfpack/pi structured subagent delegation work as intended: parent opens a
 - [x] install/configure plugin at the correct scope if missing
 - [x] open a fresh wolfpack parent session
 - [x] instruct parent to spawn a child and use structured task delegation
-- [x] verify `.wolfpack/tasks/<taskId>` and `agent_task_done` result
+- [x] verify task storage and `agent_task_done` result
 - [x] fix any plugin issues found
 - [x] run relevant tests/typecheck

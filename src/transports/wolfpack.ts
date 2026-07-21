@@ -1,7 +1,5 @@
 import type { DispatchTaskInput, DispatchTaskResult, TaskCommandExecutor, TaskTransport } from "../task-communication";
 
-export const WOLFPACK_TASKS_DIR = ".wolfpack/tasks";
-
 export interface WolfpackTaskTransportOptions {
 	readonly exec: TaskCommandExecutor;
 }

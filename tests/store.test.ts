@@ -19,7 +19,7 @@ import type { TaskResultPayload } from "../src/types";
 let projectDir: string;
 
 beforeEach(async () => {
-	projectDir = await mkdtemp(join(tmpdir(), "wolfpack-pi-tasks-"));
+	projectDir = await mkdtemp(join(tmpdir(), "pi-tasks-"));
 });
 
 afterEach(async () => {
@@ -42,7 +42,7 @@ describe("task store", () => {
 		expect(saved.status).toBe("dispatched");
 		expect(saved.parentSession).toBe("parent");
 		expect(saved.targetSession).toBe("worker");
-		expect(saved.assignmentRef).toBe(`file://.wolfpack/tasks/${task.id}/assignment.json`);
+		expect(saved.assignmentRef).toBe(`file://.pi/tasks/${task.id}/assignment.json`);
 	});
 
 	test("reuses idempotent dispatched tasks instead of creating duplicates", async () => {

@@ -1,20 +1,20 @@
 ---
 name: wolfpack-pi-task-delegation
-description: Use this whenever the user asks to open, spawn, create, or use a Wolfpack/Pi subagent to do work, delegate work to another session, or check delegated task results. This skill connects existing Wolfpack session-control knowledge with the wolfpack-pi-tasks structured tools so agents spawn/select sessions, send work with agent_task_send, and avoid terminal-output completion polling.
+description: Use this whenever the user asks to open, spawn, create, or use a Wolfpack/Pi subagent to do work, delegate work to another session, or check delegated task results. This skill connects existing Wolfpack session-control knowledge with the agent_task communication tools so agents spawn/select sessions, send work with agent_task_send, and avoid terminal-output completion polling.
 ---
 
 # Wolfpack Pi Task Delegation
 
-This skill is only about structured task delegation. It does not replace the
-existing `wolfpack-tailnet-control` skill; use that skill/instructions for the
-Wolfpack mechanics of opening, selecting, inspecting, or controlling sessions.
+This skill is the Wolfpack transport guidance for the task communication layer. It does not replace `wolfpack-tailnet-control`; use that
+skill/instructions for opening, selecting, inspecting, or controlling Wolfpack
+sessions.
 
 ## Goal
 
 When the user says something like “open a subagent and do X”, create or select a
-Wolfpack/Pi session using existing Wolfpack control, then delegate X with the
-structured task tools from this package. Keep normal Wolfpack terminal sessions
-visible and steerable, but treat task state as the protocol.
+Wolfpack/Pi session using existing Wolfpack control, then send X through the
+structured `agent_task_*` task communication tools. Keep Wolfpack terminals
+visible and steerable, but treat task state/results as the protocol.
 
 ## Workflow
 
@@ -23,7 +23,7 @@ visible and steerable, but treat task state as the protocol.
    session. Prefer the canonical CLI path:
 
    ```bash
-   wolfpack agent spawn <project> --prompt 'you are a wolfpack task worker. wait for structured agent_task assignments; finish assigned work only with agent_task_done.' --json
+   wolfpack agent spawn <project> --prompt 'you are a task worker. wait for structured pi.task.assignment.v1 assignments; finish assigned work only with agent_task_done.' --json
    ```
 
    `wolfpack session open <project> --prompt ... --json` is a deprecated alias;

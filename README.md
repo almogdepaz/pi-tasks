@@ -1,126 +1,91 @@
-# wolfpack-pi-tasks
+# pi-tasks
 
-Structured task delegation for Pi agents running inside Wolfpack sessions.
+Task communication for Pi agents, with Wolfpack as the default v1 transport.
 
 ## goal
 
-Wolfpack already gives you controllable terminal sessions. This plugin keeps
-that model, but stops using terminal prose as the completion/result protocol.
+This package defines a durable task protocol for agent-to-agent work handoff:
 
-The goal is that you can say things like:
+1. create a structured assignment
+2. persist task state in a generic store
+3. dispatch the assignment through a transport
+4. let the sender continue without blocking
+5. record structured status/results independently of terminal prose
+6. let the assignee finish with `agent_task_done`
 
-> open a subagent and inspect the auth middleware
+It is not a subagent spawner. Subagents, Wolfpack sessions, HTTP workers, or any
+other task runner can sit behind the same communication contract.
 
-…and the parent agent can:
+## architecture
 
-1. open/select a Wolfpack subagent session using existing Wolfpack controls
-2. send the work as a structured task
-3. keep working without blocking
-4. check structured task state/results later
-5. avoid polling terminal text to guess whether the subagent is done
+The package is split into:
 
-## what this plugin does
+- protocol/types: assignment/result/event/status contracts
+- store: durable task lifecycle (`create`, `read`, `wait`, `inbox`, `ack`, `cancel`, `complete`)
+- transport: session identity + assignment delivery
+- Pi extension: registers the `agent_task_*` tools over a composed store+transport layer
 
-- adds Pi tools for structured task delegation between Wolfpack sessions
-- stores task state in the project-local `.wolfpack/tasks/` directory
-- dispatches assignments through the existing Wolfpack CLI terminal input transport
-- requires the target agent to finish via `agent_task_done`
-- returns `terminate: true` from `agent_task_done`, so the target stops after submitting the result
-- shows background inbox/status UI notifications without injecting task results into model context
-- ships a skill so natural-language requests like “open a subagent and do x” route through this protocol
+For v1, selection is internal factory-based. The default extension composes:
 
-## how it works
+- `createFilesystemTaskStore({ tasksDir: ".wolfpack/tasks" })`
+- `createWolfpackTaskTransport({ exec: pi.exec })`
 
-Task state is file-backed under the active project:
+Other packages can import `registerAgentTaskTools` and provide:
+
+```ts
+{
+  store: createFilesystemTaskStore({ tasksDir: ".pi/tasks" }),
+  transport: myTransport,
+}
+```
+
+## task storage
+
+Generic filesystem storage defaults to `.pi/tasks/`. The default Wolfpack
+composition preserves the existing project-local path:
 
 ```text
 .wolfpack/tasks/<taskId>/
-├── task.json        # current task metadata/status
-├── assignment.json  # structured assignment sent to the target
-├── events.jsonl     # append-only task event log
-└── result.json      # terminal result, once completed/failed/cancelled/etc.
+├── task.json
+├── assignment.json
+├── events.jsonl
+└── result.json
 ```
 
-The parent sends work with `agent_task_send`. The tool creates a task directory,
-writes the structured assignment, then delivers that assignment through the v1
-Wolfpack terminal input transport with:
+## wolfpack default transport
+
+The parent sends work with `agent_task_send`. The tool creates a task record,
+builds a `pi.task.assignment.v1` assignment, then the Wolfpack transport dispatches:
 
 ```bash
 wolfpack session send <target-session> <assignment>
 ```
 
-The target session receives the assignment in its normal terminal and completes
-only by calling `agent_task_done`. Completion/result state is recorded in
-`result.json`, not inferred from terminal prose.
+The target session completes only by calling `agent_task_done`. Completion/result
+state is recorded in `result.json`, not inferred from terminal output.
 
-## natural-language delegation
+Every participating Pi session needs this package loaded. If the target session
+does not load it, the task remains non-terminal until timeout or cancellation.
 
-This package includes the `wolfpack-pi-task-delegation` skill.
+## supporting another transport
 
-With the package installed, the agent should handle prompts like:
+Most integrations only need a `TaskTransport`:
 
-- “open a subagent and inspect x”
-- “spawn a worker to fix y”
-- “delegate this to another Wolfpack session”
-- “check on the subagent”
+- `getCurrentSessionName(env)` — identify this running agent/session
+- `dispatchTask(input)` — deliver assignment text to a target
 
-The skill does **not** duplicate Wolfpack session-control knowledge. It tells the
-agent to use the existing `wolfpack-tailnet-control` skill for opening/selecting
-sessions, then use this plugin’s structured task tools for the actual work and
-result tracking.
-
-## install
-
-Install the package into Pi:
-
-```bash
-pi install -l ../wolfpack-pi-tasks
-```
-
-Every participating Pi session needs this package loaded. That includes spawned
-subagent sessions. If the target session does not load the plugin, the task will
-remain non-terminal until timeout or cancellation.
-
-Temporary one-off run:
-
-```bash
-pi -e ../wolfpack-pi-tasks/src/extension.ts
-```
+Use the shared filesystem store unless you need centralized/remote persistence.
+Only implement a new `TaskStore` when task state should live somewhere else
+(server, redis, database, etc.).
 
 ## tools
 
-### `agent_task_send`
-
-Send a task to another Wolfpack session name or stable session id and return immediately.
-
-Use when delegating work without waiting for completion.
-
-### `agent_task_status`
-
-Read compact structured status for a task.
-
-### `agent_task_wait`
-
-Wait for a task to become terminal.
-
-Use only when the user wants the result now; otherwise prefer nonblocking send
-plus later inbox/status checks.
-
-### `agent_task_inbox`
-
-List terminal tasks for the current parent session. Can acknowledge results after
-reading them.
-
-### `agent_task_cancel`
-
-Cancel a non-terminal task in the shared task store.
-
-### `agent_task_done`
-
-Target-side completion tool. The target agent should call this exactly once as
-its final action for an assigned task.
-
-It records structured completion and terminates the target turn.
+- `agent_task_send` — create a task and dispatch it through the configured transport
+- `agent_task_status` — read compact structured task status
+- `agent_task_wait` — wait for a terminal status when the user wants the result now
+- `agent_task_inbox` — list terminal tasks for the current parent session
+- `agent_task_cancel` — cancel a non-terminal task
+- `agent_task_done` — assignee-side structured completion tool
 
 ## statuses
 
@@ -135,22 +100,21 @@ Tasks can be:
 - `timed_out`
 - `rejected`
 
-Terminal statuses are first-writer-wins. Once a task is completed, failed,
-cancelled, timed out, or rejected, conflicting later completions are rejected.
+Terminal statuses are first-writer-wins.
 
-## constraints
+## install
 
-This is intentionally plugin-only v1:
+Install the package into Pi:
 
-- no Wolfpack server changes
-- no new Wolfpack task API
-- no capability registry
-- no terminal/prose polling for completion
-- local/shared filesystem coordination only
+```bash
+pi install -l ../pi-tasks
+```
 
-Because dispatch uses existing Wolfpack session input, the plugin cannot prove
-that the target session loaded the plugin. Missing target-side plugin support is
-handled by timeout/cancel, not by capability negotiation.
+Temporary one-off run:
+
+```bash
+pi -e ../pi-tasks/src/extension.ts
+```
 
 ## development
 

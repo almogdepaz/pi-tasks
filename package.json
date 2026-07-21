@@ -1,5 +1,5 @@
 {
-  "name": "wolfpack-pi-tasks",
+  "name": "pi-tasks",
   "module": "src/extension.ts",
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

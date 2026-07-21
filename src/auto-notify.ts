@@ -14,7 +14,7 @@ export function buildBackgroundTaskNotificationPrompt(tasks: readonly AgentTaskR
 	});
 
 	return [
-		"background wolfpack task results are ready for this parent session.",
+		"background task results are ready for this parent session.",
 		"call `agent_task_inbox` with `{ ack: true }` now to read and acknowledge the structured results.",
 		"summarize the completed task results to the user concisely.",
 		"do not call agent_task_wait; these tasks already reached a terminal state.",

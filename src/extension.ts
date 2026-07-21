@@ -4,26 +4,19 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 import { buildBackgroundTaskNotificationPrompt, selectUnpromptedTerminalTasks } from "./auto-notify";
-import { buildAssignment, compactTaskResult, getCurrentSessionName } from "./protocol";
-import {
-	ackTask,
-	cancelTask,
-	completeTask,
-	createOrReuseDispatchedTask,
-	expireTaskIfOverdue,
-	listInbox,
-	readTask,
-	readTaskResult,
-	waitForTask,
-} from "./store";
-import { DEFAULT_TIMEOUT_MS, TASK_PROTOCOL_VERSION, type TaskResultPayload, type TerminalTaskStatus } from "./types";
+import type { TaskCommunicationLayer } from "./task-communication";
+import { createFilesystemTaskStore } from "./stores/filesystem";
+import { createWolfpackTaskTransport, WOLFPACK_TASKS_DIR } from "./transports/wolfpack";
+import { buildAssignment, compactTaskResult } from "./protocol";
+import type { AgentTaskRecord, TaskResultPayload, TerminalTaskStatus } from "./types";
+import { DEFAULT_TIMEOUT_MS, TASK_PROTOCOL_VERSION } from "./types";
 
 const WAIT_POLL_MS = 250;
 const BACKGROUND_POLL_MS = 5000;
 
 const SendParams = Type.Object({
-	to: Type.String({ description: "Target Wolfpack session name or stable sessionId" }),
-	task: Type.String({ description: "Task instructions to send to the target session" }),
+	to: Type.String({ description: "Target session, worker, or transport-specific address" }),
+	task: Type.String({ description: "Task instructions to send to the target" }),
 	timeoutMs: Type.Optional(Type.Integer({ minimum: 1000, maximum: 86_400_000 })),
 	idempotencyKey: Type.Optional(Type.String()),
 });
@@ -71,13 +64,23 @@ const DoneParams = Type.Object({
 	),
 });
 
-export default function wolfpackPiTasks(pi: ExtensionAPI) {
+export function createDefaultTaskCommunicationLayer(pi: ExtensionAPI): TaskCommunicationLayer {
+	return {
+		store: createFilesystemTaskStore({ tasksDir: WOLFPACK_TASKS_DIR }),
+		transport: createWolfpackTaskTransport({
+			exec: (command, args, options) => pi.exec(command, [...args], options),
+		}),
+	};
+}
+
+export function registerAgentTaskTools(pi: ExtensionAPI, communication: TaskCommunicationLayer): void {
+	const { store, transport } = communication;
 	let backgroundTimer: ReturnType<typeof setInterval> | undefined;
 	const notifiedTaskIds = new Set<string>();
 	const autoPromptedTaskIds = new Set<string>();
 
 	pi.on("session_start", async (_event, ctx) => {
-		const sessionName = getCurrentSessionName(process.env);
+		const sessionName = transport.getCurrentSessionName(process.env);
 		ctx.ui.setStatus("wolfpack-tasks", ctx.ui.theme.fg("dim", `tasks: ${sessionName}`));
 
 		backgroundTimer = setInterval(() => {
@@ -90,7 +93,7 @@ export default function wolfpackPiTasks(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
-		const sessionName = getCurrentSessionName(process.env);
+		const sessionName = transport.getCurrentSessionName(process.env);
 		setTimeout(() => {
 			void refreshInboxStatus(ctx.cwd, sessionName, ctx).catch(() => undefined);
 		}, 0);
@@ -104,7 +107,7 @@ export default function wolfpackPiTasks(pi: ExtensionAPI) {
 	});
 
 	async function refreshInboxStatus(projectDir: string, sessionName: string, ctx: ExtensionContext): Promise<void> {
-		const inbox = await listInbox(projectDir, sessionName, { includeAcknowledged: false });
+		const inbox = await store.listInbox(projectDir, sessionName, { includeAcknowledged: false });
 		const count = inbox.length;
 		ctx.ui.setStatus("wolfpack-tasks", ctx.ui.theme.fg(count > 0 ? "accent" : "dim", `tasks: ${count} inbox`));
 		for (const task of inbox) {
@@ -115,7 +118,7 @@ export default function wolfpackPiTasks(pi: ExtensionAPI) {
 		triggerIdleInboxPrompt(inbox, ctx);
 	}
 
-	function triggerIdleInboxPrompt(inbox: Awaited<ReturnType<typeof listInbox>>, ctx: ExtensionContext): void {
+	function triggerIdleInboxPrompt(inbox: readonly AgentTaskRecord[], ctx: ExtensionContext): void {
 		if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
 
 		const tasksToPrompt = selectUnpromptedTerminalTasks(inbox, autoPromptedTaskIds);
@@ -134,17 +137,17 @@ export default function wolfpackPiTasks(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "agent_task_send",
 		label: "Send Agent Task",
-		description: "Send a structured task to another Wolfpack Pi session and return immediately without waiting.",
-		promptSnippet: "Send nonblocking structured tasks to other Wolfpack Pi sessions",
+		description: "Send a structured task to another agent/session/worker and return immediately without waiting.",
+		promptSnippet: "Send nonblocking structured tasks to other agents/sessions/workers",
 		promptGuidelines: [
-			"Use agent_task_send instead of natural-language polling when delegating work to another Wolfpack Pi session.",
+			"Use agent_task_send instead of natural-language polling when delegating work to another agent/session/worker",
 			"After agent_task_send returns, keep working unless the user explicitly asks to wait for the task.",
 		],
 		parameters: SendParams,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const parentSession = getCurrentSessionName(process.env);
+			const parentSession = transport.getCurrentSessionName(process.env);
 
-			const createdTask = await createOrReuseDispatchedTask({
+			const createdTask = await store.createOrReuseDispatchedTask({
 				projectDir: ctx.cwd,
 				parentSession,
 				targetSession: params.to,
@@ -156,21 +159,21 @@ export default function wolfpackPiTasks(pi: ExtensionAPI) {
 			});
 			const task = createdTask.task;
 			if (!createdTask.created) {
-				return taskToolResult(compactTaskResult(task, await readTaskResult(ctx.cwd, task.id)));
+				return taskToolResult(compactTaskResult(task, await store.readTaskResult(ctx.cwd, task.id)));
 			}
 
 			const assignment = buildAssignment({ taskId: task.id, fromSession: parentSession, instructions: params.task });
-			const dispatch = await pi.exec("wolfpack", ["session", "send", params.to, assignment], { signal });
-			if (dispatch.code !== 0) {
-				const rejected = await completeTask(ctx.cwd, task.id, "rejected", {
-					summary: `dispatch failed: ${dispatch.stderr || dispatch.stdout || "wolfpack session send failed"}`,
+			const dispatch = await transport.dispatchTask({ projectDir: ctx.cwd, task, target: params.to, assignment, signal });
+			if (!dispatch.ok) {
+				const rejected = await store.completeTask(ctx.cwd, task.id, "rejected", {
+					summary: `dispatch failed: ${dispatch.message}`,
 					error: {
 						code: "dispatch_failed",
-						message: dispatch.stderr || dispatch.stdout || "wolfpack session send failed",
-						retryable: true,
+						message: dispatch.message,
+						retryable: dispatch.retryable,
 					},
 				});
-				return taskToolResult(compactTaskResult(rejected, await readTaskResult(ctx.cwd, task.id)));
+				return taskToolResult(compactTaskResult(rejected, await store.readTaskResult(ctx.cwd, task.id)));
 			}
 
 			return taskToolResult({
@@ -193,8 +196,8 @@ export default function wolfpackPiTasks(pi: ExtensionAPI) {
 		description: "Read compact structured status for a task.",
 		parameters: TaskIdParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const task = await expireTaskIfOverdue(ctx.cwd, params.taskId);
-			return taskToolResult(compactTaskResult(task, await readTaskResult(ctx.cwd, params.taskId)));
+			const task = await store.expireTaskIfOverdue(ctx.cwd, params.taskId);
+			return taskToolResult(compactTaskResult(task, await store.readTaskResult(ctx.cwd, params.taskId)));
 		},
 	});
 
@@ -205,15 +208,15 @@ export default function wolfpackPiTasks(pi: ExtensionAPI) {
 		parameters: WaitParams,
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
 			const waitMs = params.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-			const sessionName = getCurrentSessionName(process.env);
+			const sessionName = transport.getCurrentSessionName(process.env);
 			const progressTimer = setInterval(() => {
 				onUpdate?.({ content: [{ type: "text", text: `waiting for ${params.taskId}...` }], details: {} });
 			}, 2000);
 			try {
-				const task = await waitForTask(ctx.cwd, params.taskId, { timeoutMs: waitMs, pollMs: WAIT_POLL_MS, ackParentSession: sessionName });
-				return taskToolResult(compactTaskResult(task, await readTaskResult(ctx.cwd, params.taskId)));
+				const task = await store.waitForTask(ctx.cwd, params.taskId, { timeoutMs: waitMs, pollMs: WAIT_POLL_MS, ackParentSession: sessionName });
+				return taskToolResult(compactTaskResult(task, await store.readTaskResult(ctx.cwd, params.taskId)));
 			} catch (error) {
-				const task = await readTask(ctx.cwd, params.taskId);
+				const task = await store.readTask(ctx.cwd, params.taskId);
 				return taskToolResult({
 					schemaVersion: 1,
 					taskId: task.id,
@@ -234,13 +237,13 @@ export default function wolfpackPiTasks(pi: ExtensionAPI) {
 		description: "List terminal tasks for this parent session. Results are only shown to the model when this tool is called.",
 		parameters: InboxParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const sessionName = getCurrentSessionName(process.env);
-			const tasks = await listInbox(ctx.cwd, sessionName, { includeAcknowledged: params.includeAcknowledged ?? false });
+			const sessionName = transport.getCurrentSessionName(process.env);
+			const tasks = await store.listInbox(ctx.cwd, sessionName, { includeAcknowledged: params.includeAcknowledged ?? false });
 			const compact = [];
 			for (const task of tasks) {
-				compact.push(compactTaskResult(task, await readTaskResult(ctx.cwd, task.id)));
+				compact.push(compactTaskResult(task, await store.readTaskResult(ctx.cwd, task.id)));
 				if (params.ack) {
-					await ackTask(ctx.cwd, task.id, sessionName);
+					await store.ackTask(ctx.cwd, task.id, sessionName);
 				}
 			}
 			return taskToolResult({ tasks: compact });
@@ -253,18 +256,18 @@ export default function wolfpackPiTasks(pi: ExtensionAPI) {
 		description: "Cancel a non-terminal task in the shared task store.",
 		parameters: CancelParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const task = await cancelTask(ctx.cwd, params.taskId, params.reason);
-			return taskToolResult(compactTaskResult(task, await readTaskResult(ctx.cwd, params.taskId)));
+			const task = await store.cancelTask(ctx.cwd, params.taskId, params.reason);
+			return taskToolResult(compactTaskResult(task, await store.readTaskResult(ctx.cwd, params.taskId)));
 		},
 	});
 
 	pi.registerTool({
 		name: "agent_task_done",
 		label: "Complete Agent Task",
-		description: "Finish an assigned Wolfpack task with structured status. Use exactly once as the final action for assigned tasks.",
-		promptSnippet: "Complete an assigned Wolfpack task with a terminating structured result",
+		description: "Finish an assigned task with structured status. Use exactly once as the final action for assigned tasks.",
+		promptSnippet: "Complete an assigned task with a terminating structured result",
 		promptGuidelines: [
-			"Use agent_task_done exactly once as the final action for wolfpack.agent_task.assignment.v1 tasks.",
+			"Use agent_task_done exactly once as the final action for pi.task.assignment.v1 tasks.",
 			"After calling agent_task_done, do not emit another assistant response in prose.",
 		],
 		parameters: DoneParams,
@@ -276,13 +279,17 @@ export default function wolfpackPiTasks(pi: ExtensionAPI) {
 				...(params.error && { error: params.error }),
 				...(params.artifacts && { artifacts: params.artifacts }),
 			};
-			const task = await completeTask(ctx.cwd, params.taskId, status, payload);
+			const task = await store.completeTask(ctx.cwd, params.taskId, status, payload);
 			return {
-				...taskToolResult(compactTaskResult(task, await readTaskResult(ctx.cwd, params.taskId))),
+				...taskToolResult(compactTaskResult(task, await store.readTaskResult(ctx.cwd, params.taskId))),
 				terminate: true,
 			};
 		},
 	});
+}
+
+export default function piTasks(pi: ExtensionAPI): void {
+	registerAgentTaskTools(pi, createDefaultTaskCommunicationLayer(pi));
 }
 
 function taskToolResult(details: unknown): AgentToolResult<unknown> {

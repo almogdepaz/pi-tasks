@@ -40,7 +40,7 @@ describe("background task auto notification", () => {
 	test("builds an idle parent prompt that consumes inbox through the structured tool", () => {
 		const prompt = buildBackgroundTaskNotificationPrompt([task("task_one", "review done"), task("task_two", "tests done")]);
 
-		expect(prompt).toContain("background wolfpack task results are ready");
+		expect(prompt).toContain("background task results are ready");
 		expect(prompt).toContain("agent_task_inbox");
 		expect(prompt).toContain("ack: true");
 		expect(prompt).toContain("task_one");

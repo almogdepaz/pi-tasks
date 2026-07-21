@@ -1,4 +1,11 @@
-import { SUMMARY_MAX_CHARS, TASK_PROTOCOL_VERSION, type AgentTaskRecord, type StoredTaskResult, type TaskError } from "./types";
+import {
+	SUMMARY_MAX_CHARS,
+	TASK_ASSIGNMENT_TYPE,
+	TASK_PROTOCOL_VERSION,
+	type AgentTaskRecord,
+	type StoredTaskResult,
+	type TaskError,
+} from "./types";
 
 export interface AssignmentInput {
 	readonly taskId: string;
@@ -7,7 +14,7 @@ export interface AssignmentInput {
 }
 
 export interface AssignmentEnvelope {
-	readonly type: "wolfpack.agent_task.assignment.v1";
+	readonly type: typeof TASK_ASSIGNMENT_TYPE;
 	readonly taskId: string;
 	readonly fromSession: string;
 	readonly instructions: string;
@@ -31,7 +38,7 @@ export interface CompactTaskResult {
 
 export function buildAssignment(input: AssignmentInput): string {
 	const envelope: AssignmentEnvelope = {
-		type: "wolfpack.agent_task.assignment.v1",
+		type: TASK_ASSIGNMENT_TYPE,
 		taskId: input.taskId,
 		fromSession: input.fromSession,
 		instructions: input.instructions,
@@ -45,7 +52,7 @@ export function buildAssignment(input: AssignmentInput): string {
 	};
 
 	return [
-		"wolfpack structured task assignment:",
+		"structured task assignment:",
 		"```json",
 		JSON.stringify(envelope, null, 2),
 		"```",
@@ -64,6 +71,3 @@ export function compactTaskResult(task: AgentTaskRecord, result: StoredTaskResul
 	};
 }
 
-export function getCurrentSessionName(env: Record<string, string | undefined>): string {
-	return env.WOLFPACK_SESSION_NAME || "unknown-session";
-}

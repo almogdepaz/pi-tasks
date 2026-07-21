@@ -1,4 +1,5 @@
 export const TASK_PROTOCOL_VERSION = "pi.agentTask.v1";
+export const TASK_ASSIGNMENT_TYPE = "pi.task.assignment.v1";
 export const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
 export const MIN_TIMEOUT_MS = 1000;
 export const MAX_TIMEOUT_MS = 24 * 60 * 60 * 1000;
@@ -99,6 +100,7 @@ export interface CreateDispatchedTaskInput {
 	readonly timeoutMs: number;
 	readonly idempotencyKey?: string;
 	readonly targetTaskProtocol?: typeof TASK_PROTOCOL_VERSION;
+	readonly tasksDir?: string;
 }
 
 export interface ListInboxOptions {

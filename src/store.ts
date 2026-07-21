@@ -21,7 +21,15 @@ import {
 	type WaitForTaskOptions,
 } from "./types";
 
-const TASK_DIR = ".wolfpack/tasks";
+export const DEFAULT_TASKS_DIR = ".pi/tasks";
+
+export interface TaskStoreScope {
+	readonly projectDir: string;
+	readonly tasksDir?: string;
+}
+
+export type TaskStoreLocation = string | TaskStoreScope;
+
 const LOCK_RETRY_MS = 25;
 const LOCK_TIMEOUT_MS = 5000;
 
@@ -32,12 +40,24 @@ export interface CreateOrReuseDispatchedTaskResult {
 	readonly created: boolean;
 }
 
-export function getTasksRoot(projectDir: string): string {
-	return join(projectDir, TASK_DIR);
+export function getTasksRoot(location: TaskStoreLocation): string {
+	return join(getProjectDir(location), getTasksDir(location));
 }
 
-export function getTaskDir(projectDir: string, taskId: string): string {
-	return join(getTasksRoot(projectDir), taskId);
+export function getTaskDir(location: TaskStoreLocation, taskId: string): string {
+	return join(getTasksRoot(location), taskId);
+}
+
+function getProjectDir(location: TaskStoreLocation): string {
+	return typeof location === "string" ? location : location.projectDir;
+}
+
+function getTasksDir(location: TaskStoreLocation): string {
+	return typeof location === "string" ? DEFAULT_TASKS_DIR : location.tasksDir ?? DEFAULT_TASKS_DIR;
+}
+
+function taskRef(location: TaskStoreLocation, taskId: string, fileName: string): string {
+	return `file://${getTasksDir(location)}/${taskId}/${fileName}`;
 }
 
 export function isTerminalStatus(status: TaskStatus): status is TerminalTaskStatus {
@@ -52,14 +72,19 @@ export function normalizeTimeoutMs(timeoutMs: number | undefined): number {
 	return value;
 }
 
+function inputLocation(input: CreateDispatchedTaskInput): TaskStoreScope {
+	return { projectDir: input.projectDir, tasksDir: input.tasksDir };
+}
+
 export async function createOrReuseDispatchedTask(input: CreateDispatchedTaskInput): Promise<CreateOrReuseDispatchedTaskResult> {
 	const idempotencyKey = input.idempotencyKey;
 	if (!idempotencyKey) {
 		return { task: await createDispatchedTask(input), created: true };
 	}
 
-	return withIdempotencyLock(input.projectDir, input.parentSession, idempotencyKey, async () => {
-		const existing = await findTaskByIdempotencyKey(input.projectDir, input.parentSession, idempotencyKey);
+	const location = inputLocation(input);
+	return withIdempotencyLock(location, input.parentSession, idempotencyKey, async () => {
+		const existing = await findTaskByIdempotencyKey(location, input.parentSession, idempotencyKey);
 		if (existing) {
 			return { task: existing, created: false };
 		}
@@ -72,7 +97,8 @@ export async function createDispatchedTask(input: CreateDispatchedTaskInput): Pr
 	const id = `task_${randomUUID().replace(/-/g, "")}`;
 	const now = new Date().toISOString();
 	const timeoutAt = new Date(Date.parse(now) + timeoutMs).toISOString();
-	const dir = getTaskDir(input.projectDir, id);
+	const location = inputLocation(input);
+	const dir = getTaskDir(location, id);
 	await mkdir(dir, { recursive: true });
 
 	const assignment = typeof input.assignment === "function" ? input.assignment(id) : withTaskId(input.assignment, id);
@@ -94,7 +120,7 @@ export async function createDispatchedTask(input: CreateDispatchedTaskInput): Pr
 		timeoutAt,
 		timeoutMs,
 		idempotencyKey: input.idempotencyKey,
-		assignmentRef: `file://.wolfpack/tasks/${id}/assignment.json`,
+		assignmentRef: taskRef(location, id, "assignment.json"),
 		resultRef: undefined,
 		parentAckAt: undefined,
 		targetTaskProtocol: input.targetTaskProtocol,
@@ -102,34 +128,34 @@ export async function createDispatchedTask(input: CreateDispatchedTaskInput): Pr
 	};
 
 	await writeJsonAtomic(join(dir, "task.json"), task);
-	await appendTaskEvent(input.projectDir, id, "task.created", "store", { parentSession: input.parentSession });
-	await appendTaskEvent(input.projectDir, id, "task.dispatched", "store", { targetSession: input.targetSession });
+	await appendTaskEvent(location, id, "task.created", "store", { parentSession: input.parentSession });
+	await appendTaskEvent(location, id, "task.dispatched", "store", { targetSession: input.targetSession });
 	return task;
 }
 
-export async function readTask(projectDir: string, taskId: string): Promise<AgentTaskRecord> {
-	return readJson<AgentTaskRecord>(join(getTaskDir(projectDir, taskId), "task.json"));
+export async function readTask(location: TaskStoreLocation, taskId: string): Promise<AgentTaskRecord> {
+	return readJson<AgentTaskRecord>(join(getTaskDir(location, taskId), "task.json"));
 }
 
-export async function readTaskResult(projectDir: string, taskId: string): Promise<StoredTaskResult | undefined> {
-	return readExistingResult(projectDir, taskId);
+export async function readTaskResult(location: TaskStoreLocation, taskId: string): Promise<StoredTaskResult | undefined> {
+	return readExistingResult(location, taskId);
 }
 
-export async function expireTaskIfOverdue(projectDir: string, taskId: string): Promise<AgentTaskRecord> {
-	const current = await readTask(projectDir, taskId);
+export async function expireTaskIfOverdue(location: TaskStoreLocation, taskId: string): Promise<AgentTaskRecord> {
+	const current = await readTask(location, taskId);
 	if (isTerminalStatus(current.status) || Date.now() < Date.parse(current.timeoutAt)) {
 		return current;
 	}
-	return writeTerminalTask(projectDir, taskId, "timed_out", {
+	return writeTerminalTask(location, taskId, "timed_out", {
 		summary: "task timed out",
 		error: { code: "timed_out", message: "task timed out", retryable: true },
 	});
 }
 
-export async function appendProgress(projectDir: string, taskId: string, message: string): Promise<AgentTaskRecord> {
+export async function appendProgress(location: TaskStoreLocation, taskId: string, message: string): Promise<AgentTaskRecord> {
 	const progress = limitString(message, PROGRESS_MAX_CHARS, "progress");
-	return withTaskLock(projectDir, taskId, async () => {
-		const current = await readTask(projectDir, taskId);
+	return withTaskLock(location, taskId, async () => {
+		const current = await readTask(location, taskId);
 		if (isTerminalStatus(current.status)) {
 			return current;
 		}
@@ -139,34 +165,34 @@ export async function appendProgress(projectDir: string, taskId: string, message
 			runningAt: current.runningAt ?? now,
 			updatedAt: now,
 		});
-		await writeTask(projectDir, next);
+		await writeTask(location, next);
 		if (current.status === "dispatched") {
-			await appendTaskEventUnlocked(projectDir, taskId, "task.running", "target-tool", {});
+			await appendTaskEventUnlocked(location, taskId, "task.running", "target-tool", {});
 		}
-		await appendTaskEventUnlocked(projectDir, taskId, "task.progress", "target-tool", { message: progress });
+		await appendTaskEventUnlocked(location, taskId, "task.progress", "target-tool", { message: progress });
 		return next;
 	});
 }
 
 export async function completeTask(
-	projectDir: string,
+	location: TaskStoreLocation,
 	taskId: string,
 	status: TerminalTaskStatus,
 	payload: TaskResultPayload,
 ): Promise<AgentTaskRecord> {
-	return writeTerminalTask(projectDir, taskId, status, payload);
+	return writeTerminalTask(location, taskId, status, payload);
 }
 
-export async function cancelTask(projectDir: string, taskId: string, reason: string | undefined): Promise<AgentTaskRecord> {
-	return writeTerminalTask(projectDir, taskId, "cancelled", {
+export async function cancelTask(location: TaskStoreLocation, taskId: string, reason: string | undefined): Promise<AgentTaskRecord> {
+	return writeTerminalTask(location, taskId, "cancelled", {
 		summary: reason ?? "cancelled",
 		error: { code: "cancelled", message: reason ?? "cancelled", retryable: false },
 	});
 }
 
-export async function ackTask(projectDir: string, taskId: string, parentSession: string): Promise<AgentTaskRecord> {
-	return withTaskLock(projectDir, taskId, async () => {
-		const current = await readTask(projectDir, taskId);
+export async function ackTask(location: TaskStoreLocation, taskId: string, parentSession: string): Promise<AgentTaskRecord> {
+	return withTaskLock(location, taskId, async () => {
+		const current = await readTask(location, taskId);
 		if (current.parentSession !== parentSession) {
 			throw new Error("task parent mismatch");
 		}
@@ -178,18 +204,18 @@ export async function ackTask(projectDir: string, taskId: string, parentSession:
 		}
 		const now = new Date().toISOString();
 		const next = updateTask(current, { parentAckAt: now, updatedAt: now });
-		await writeTask(projectDir, next);
-		await appendTaskEventUnlocked(projectDir, taskId, "task.acknowledged", "parent-tool", { parentSession });
+		await writeTask(location, next);
+		await appendTaskEventUnlocked(location, taskId, "task.acknowledged", "parent-tool", { parentSession });
 		return next;
 	});
 }
 
 export async function listInbox(
-	projectDir: string,
+	location: TaskStoreLocation,
 	parentSession: string,
 	options: ListInboxOptions,
 ): Promise<readonly AgentTaskRecord[]> {
-	const root = getTasksRoot(projectDir);
+	const root = getTasksRoot(location);
 	let entries: string[];
 	try {
 		entries = await readdir(root);
@@ -201,7 +227,7 @@ export async function listInbox(
 	for (const entry of entries) {
 		if (!entry.startsWith("task_")) continue;
 		try {
-			const task = await expireTaskIfOverdue(projectDir, entry);
+			const task = await expireTaskIfOverdue(location, entry);
 			if (task.parentSession !== parentSession) continue;
 			if (!isTerminalStatus(task.status)) continue;
 			if (!options.includeAcknowledged && task.parentAckAt) continue;
@@ -215,15 +241,15 @@ export async function listInbox(
 }
 
 export async function waitForTask(
-	projectDir: string,
+	location: TaskStoreLocation,
 	taskId: string,
 	options: WaitForTaskOptions,
 ): Promise<AgentTaskRecord> {
 	const deadline = Date.now() + options.timeoutMs;
 	while (Date.now() <= deadline) {
-		const task = await expireTaskIfOverdue(projectDir, taskId);
+		const task = await expireTaskIfOverdue(location, taskId);
 		if (isTerminalStatus(task.status)) {
-			return options.ackParentSession ? ackTask(projectDir, taskId, options.ackParentSession) : task;
+			return options.ackParentSession ? ackTask(location, taskId, options.ackParentSession) : task;
 		}
 		await sleep(options.pollMs);
 	}
@@ -231,13 +257,13 @@ export async function waitForTask(
 }
 
 async function writeTerminalTask(
-	projectDir: string,
+	location: TaskStoreLocation,
 	taskId: string,
 	status: TerminalTaskStatus,
 	payload: TaskResultPayload,
 ): Promise<AgentTaskRecord> {
-	return withTaskLock(projectDir, taskId, async () => {
-		const current = await readTask(projectDir, taskId);
+	return withTaskLock(location, taskId, async () => {
+		const current = await readTask(location, taskId);
 		const now = new Date().toISOString();
 		const cleanPayload = normalizeResultPayload(payload);
 		const result: StoredTaskResult = {
@@ -249,23 +275,23 @@ async function writeTerminalTask(
 		};
 
 		if (isTerminalStatus(current.status)) {
-			const existing = await readExistingResult(projectDir, taskId);
+			const existing = await readExistingResult(location, taskId);
 			if (current.status === status && existing && terminalPayloadKey(existing) === terminalPayloadKey(result)) {
 				return current;
 			}
 			throw new Error("terminal task conflict");
 		}
 
-		await writeJsonAtomic(join(getTaskDir(projectDir, taskId), "result.json"), result);
+		await writeJsonAtomic(join(getTaskDir(location, taskId), "result.json"), result);
 		const next = updateTask(current, {
 			status,
 			updatedAt: now,
 			completedAt: now,
-			resultRef: `file://.wolfpack/tasks/${taskId}/result.json`,
+			resultRef: taskRef(location, taskId, "result.json"),
 			error: cleanPayload.error,
 		});
-		await writeTask(projectDir, next);
-		await appendTaskEventUnlocked(projectDir, taskId, `task.${status}` as TaskEventType, "target-tool", {
+		await writeTask(location, next);
+		await appendTaskEventUnlocked(location, taskId, `task.${status}` as TaskEventType, "target-tool", {
 			summary: cleanPayload.summary,
 			error: cleanPayload.error,
 		});
@@ -273,9 +299,9 @@ async function writeTerminalTask(
 	});
 }
 
-async function readExistingResult(projectDir: string, taskId: string): Promise<StoredTaskResult | undefined> {
+async function readExistingResult(location: TaskStoreLocation, taskId: string): Promise<StoredTaskResult | undefined> {
 	try {
-		return await readJson<StoredTaskResult>(join(getTaskDir(projectDir, taskId), "result.json"));
+		return await readJson<StoredTaskResult>(join(getTaskDir(location, taskId), "result.json"));
 	} catch {
 		return undefined;
 	}
@@ -294,30 +320,30 @@ function updateTask(current: AgentTaskRecord, patch: Partial<AgentTaskRecord>): 
 	return { ...current, ...patch };
 }
 
-async function writeTask(projectDir: string, task: AgentTaskRecord): Promise<void> {
-	await writeJsonAtomic(join(getTaskDir(projectDir, task.id), "task.json"), task);
+async function writeTask(location: TaskStoreLocation, task: AgentTaskRecord): Promise<void> {
+	await writeJsonAtomic(join(getTaskDir(location, task.id), "task.json"), task);
 }
 
 async function appendTaskEvent(
-	projectDir: string,
+	location: TaskStoreLocation,
 	taskId: string,
 	type: TaskEventType,
 	source: TaskEvent["source"],
 	payload: unknown,
 ): Promise<void> {
-	await withTaskLock(projectDir, taskId, async () => {
-		await appendTaskEventUnlocked(projectDir, taskId, type, source, payload);
+	await withTaskLock(location, taskId, async () => {
+		await appendTaskEventUnlocked(location, taskId, type, source, payload);
 	});
 }
 
 async function appendTaskEventUnlocked(
-	projectDir: string,
+	location: TaskStoreLocation,
 	taskId: string,
 	type: TaskEventType,
 	source: TaskEvent["source"],
 	payload: unknown,
 ): Promise<void> {
-	const eventsPath = join(getTaskDir(projectDir, taskId), "events.jsonl");
+	const eventsPath = join(getTaskDir(location, taskId), "events.jsonl");
 	const seq = (await readLastEventSeq(eventsPath)) + 1;
 	const event: TaskEvent = {
 		schemaVersion: 1,
@@ -345,11 +371,11 @@ async function readLastEventSeq(eventsPath: string): Promise<number> {
 }
 
 async function findTaskByIdempotencyKey(
-	projectDir: string,
+	location: TaskStoreLocation,
 	parentSession: string,
 	idempotencyKey: string,
 ): Promise<AgentTaskRecord | undefined> {
-	const root = getTasksRoot(projectDir);
+	const root = getTasksRoot(location);
 	let entries: string[];
 	try {
 		entries = await readdir(root);
@@ -360,7 +386,7 @@ async function findTaskByIdempotencyKey(
 	for (const entry of entries) {
 		if (!entry.startsWith("task_")) continue;
 		try {
-			const task = await readTask(projectDir, entry);
+			const task = await readTask(location, entry);
 			if (task.parentSession === parentSession && task.idempotencyKey === idempotencyKey) {
 				return task;
 			}
@@ -372,19 +398,19 @@ async function findTaskByIdempotencyKey(
 }
 
 async function withIdempotencyLock<T>(
-	projectDir: string,
+	location: TaskStoreLocation,
 	parentSession: string,
 	idempotencyKey: string,
 	fn: () => Promise<T>,
 ): Promise<T> {
 	const lockName = createHash("sha256").update(`${parentSession}\0${idempotencyKey}`).digest("hex");
-	const lockPath = join(getTasksRoot(projectDir), `.idempotency-${lockName}.lock`);
-	await mkdir(getTasksRoot(projectDir), { recursive: true });
+	const lockPath = join(getTasksRoot(location), `.idempotency-${lockName}.lock`);
+	await mkdir(getTasksRoot(location), { recursive: true });
 	return withLockPath(lockPath, fn);
 }
 
-async function withTaskLock<T>(projectDir: string, taskId: string, fn: () => Promise<T>): Promise<T> {
-	const lockPath = join(getTaskDir(projectDir, taskId), ".lock");
+async function withTaskLock<T>(location: TaskStoreLocation, taskId: string, fn: () => Promise<T>): Promise<T> {
+	const lockPath = join(getTaskDir(location, taskId), ".lock");
 	return withLockPath(lockPath, fn);
 }
 

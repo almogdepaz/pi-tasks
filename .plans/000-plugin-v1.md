@@ -1,4 +1,4 @@
-# wolfpack pi tasks plugin v1
+# pi-tasks plugin v1
 
 status: implemented
 
@@ -7,7 +7,7 @@ status: implemented
 status: done
 
 success:
-- package exists under `../wolfpack-pi-tasks`
+- package exists under `../pi-tasks`
 - bun test/typecheck scripts exist
 - pi manifest points at extension entrypoint
 

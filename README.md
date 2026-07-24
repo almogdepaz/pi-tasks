@@ -559,6 +559,34 @@ Verification counts come **only** from structured
 truth from task/result prose. Missing or malformed artifacts produce structured
 `diagnostics` and do not stop analysis of other valid task directories.
 
+## task board
+
+Print a compact issue/root-cause board from the same structured artifacts:
+
+```bash
+bun run task-metrics /path/to/project/.pi/tasks --board
+```
+
+Or call the production API:
+
+```ts
+import { buildTaskBoard } from "@sgtbeatdown/pi-tasks/src/task-board";
+
+const board = await buildTaskBoard("/path/to/project/.pi/tasks");
+```
+
+The JSON groups complete `phaseId`/`issueId`/`rootCause` tuples, puts groups
+with active tasks first, then sorts by latest update/completion and identifiers.
+It includes task/status counts, structured verification/blocker/risk counts,
+and repeated-issue/shared-root-cause indicators. Output defaults to 10 groups
+and 20 task ids per group.
+
+Legacy tasks with missing grouping metadata are never hidden or assigned inferred
+metadata. `totalTaskRecords`, `groupedTaskCount`, and `ungroupedTaskCount`
+reconcile coverage; `ungrouped` contains status counts, missing-field reason
+counts, and up to 20 task ids. Missing/malformed artifacts remain in structured
+`diagnostics`.
+
 ## architecture
 
 `pi-tasks` separates storage from delivery:
@@ -616,6 +644,10 @@ registerAgentTaskTools(pi, {
   - `runTaskPreflight`
 - `src/metrics.ts`
   - `analyzeTaskStoreMetrics`
+- `src/task-board.ts`
+  - `buildTaskBoard`
+- `src/task-artifacts.ts`
+  - `readTaskStoreArtifacts`
 - `src/store.ts`
   - low-level filesystem store functions, if you need finer control than
     `createFilesystemTaskStore`
@@ -634,5 +666,5 @@ bun run typecheck
 - no runtime transport selector yet; compose a store/transport in an extension
 - default extension uses the generic filesystem store plus the included Wolfpack transport
 - Wolfpack preflight depends on the structured `wolfpack session status <target> --json` contract
-- task board/issue-state output is postponed; postmortem metrics expose reusable raw grouping counts
+- the task board is a bounded read-only summary, not a shared registry or project-management system
 - local development install is `pi install /Users/home/Dev/wolfpack-pi-tasks`; published releases can use `pi install npm:@sgtbeatdown/pi-tasks`

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { analyzeTaskStoreMetrics } from "../src/metrics";
+import { buildTaskBoard } from "../src/task-board";
 
 const tempRoots: string[] = [];
 
@@ -234,5 +235,242 @@ describe("task-store postmortem metrics", () => {
 		expect(exitCode).toBe(1);
 		expect(stdout).toBe("");
 		expect(stderr).toContain("usage: bun run task-metrics <tasksRoot>");
+	});
+});
+
+describe("task board", () => {
+	test("groups repeated issue tasks and marks ping-pong candidates", async () => {
+		const root = await createTasksRoot();
+		await writeTaskArtifacts(root, {
+			id: "task_alpha",
+			status: "completed",
+			updatedAt: "2026-07-24T10:00:00.000Z",
+			completedAt: "2026-07-24T10:00:00.000Z",
+			metadata: { phaseId: "phase-4", issueId: "issue-auth", rootCause: "validation" },
+		});
+		await writeTaskArtifacts(root, {
+			id: "task_beta",
+			status: "running",
+			updatedAt: "2026-07-24T11:00:00.000Z",
+			metadata: { phaseId: "phase-4", issueId: "issue-auth", rootCause: "validation" },
+		});
+
+		const board = await buildTaskBoard(root);
+		const group = board.groups[0];
+
+		expect(group).toMatchObject({
+			phaseId: "phase-4",
+			issueId: "issue-auth",
+			rootCause: "validation",
+			taskCount: 2,
+			statusCounts: { completed: 1, running: 1 },
+			latestUpdatedAt: "2026-07-24T11:00:00.000Z",
+			latestCompletedAt: "2026-07-24T10:00:00.000Z",
+			loopIndicators: {
+				issueTaskCount: 2,
+				repeatedIssue: true,
+				possiblePingPong: true,
+				splitWorkCandidate: true,
+			},
+		});
+		expect(group?.tasks).toEqual([
+			{ taskId: "task_alpha", status: "completed" },
+			{ taskId: "task_beta", status: "running" },
+		]);
+	});
+
+	test("marks issue groups that share a root cause", async () => {
+		const root = await createTasksRoot();
+		await writeTaskArtifacts(root, {
+			id: "task_auth",
+			status: "completed",
+			updatedAt: "2026-07-24T10:00:00.000Z",
+			metadata: { phaseId: "phase-4", issueId: "issue-auth", rootCause: "validation" },
+		});
+		await writeTaskArtifacts(root, {
+			id: "task_profile",
+			status: "failed",
+			updatedAt: "2026-07-24T11:00:00.000Z",
+			metadata: { phaseId: "phase-4", issueId: "issue-profile", rootCause: "validation" },
+		});
+
+		const board = await buildTaskBoard(root);
+
+		expect(board.groups.map((group) => group.issueId)).toEqual(["issue-profile", "issue-auth"]);
+		for (const group of board.groups) {
+			expect(group.loopIndicators).toMatchObject({
+				rootCauseTaskCount: 2,
+				rootCauseIssueCount: 2,
+				sharedRootCause: true,
+				splitWorkCandidate: true,
+			});
+		}
+	});
+
+	test("counts verification, blockers, and risks only from structured result fields", async () => {
+		const root = await createTasksRoot();
+		await writeTaskArtifacts(
+			root,
+			{
+				id: "task_structured",
+				status: "completed",
+				updatedAt: "2026-07-24T10:00:00.000Z",
+				metadata: { phaseId: "phase-4", issueId: "issue-structured", rootCause: "contract" },
+				taskText: "verification failed; blockers: ten; risks: many",
+			},
+			{
+				result: {
+					taskId: "task_structured",
+					status: "completed",
+					completedAt: "2026-07-24T10:01:00.000Z",
+					summary: "verification failed with blocker and risk prose",
+					verification: [{ status: "failed" }],
+					blockers: [{ evidence: "top-level decoy" }],
+					risks: ["top-level decoy"],
+					result: {
+						verification: [
+							{ command: "bun test", status: "passed" },
+							{ command: "bun run typecheck", status: "not_run" },
+						],
+						blockers: [{ evidence: "real blocker" }],
+						risks: ["real risk", "second risk"],
+					},
+				},
+			},
+		);
+
+		const board = await buildTaskBoard(root);
+
+		expect(board.groups[0]).toMatchObject({
+			verification: { entryCount: 2, statusCounts: { not_run: 1, passed: 1 } },
+			blockerCount: 1,
+			riskCount: 2,
+			latestCompletedAt: "2026-07-24T10:01:00.000Z",
+		});
+	});
+
+	test("bounds groups by default and sorts active, recent, then identifiers", async () => {
+		const root = await createTasksRoot();
+		for (let index = 0; index < 12; index += 1) {
+			const suffix = String(index).padStart(2, "0");
+			await writeTaskArtifacts(root, {
+				id: `task_${suffix}`,
+				status: index === 11 ? "running" : "completed",
+				updatedAt: `2026-07-24T${suffix}:00:00.000Z`,
+				metadata: { phaseId: "phase-4", issueId: `issue-${suffix}`, rootCause: `root-${suffix}` },
+			});
+		}
+
+		const first = await buildTaskBoard(root);
+		const second = await buildTaskBoard(root);
+
+		expect(first.totalGroupCount).toBe(12);
+		expect(first.groups).toHaveLength(10);
+		expect(first.omittedGroupCount).toBe(2);
+		expect(first.groups[0]?.issueId).toBe("issue-11");
+		expect(first.groups.slice(1).map((group) => group.issueId)).toEqual([
+			"issue-10",
+			"issue-09",
+			"issue-08",
+			"issue-07",
+			"issue-06",
+			"issue-05",
+			"issue-04",
+			"issue-03",
+			"issue-02",
+		]);
+		expect(second.groups).toEqual(first.groups);
+	});
+
+	test("reports legacy tasks as bounded ungrouped coverage", async () => {
+		const root = await createTasksRoot();
+		await writeTaskArtifacts(root, {
+			id: "task_grouped",
+			status: "running",
+			updatedAt: "2026-07-24T12:00:00.000Z",
+			metadata: { phaseId: "phase-4", issueId: "issue-new", rootCause: "contract" },
+		});
+		await writeTaskArtifacts(root, {
+			id: "task_legacy_all",
+			status: "completed",
+			updatedAt: "2026-07-24T10:00:00.000Z",
+		});
+		await writeTaskArtifacts(root, {
+			id: "task_legacy_partial",
+			status: "failed",
+			updatedAt: "2026-07-24T11:00:00.000Z",
+			metadata: { issueId: "issue-old" },
+		});
+
+		const board = await buildTaskBoard(root, { maxUngroupedTasks: 1 });
+
+		expect(board).toMatchObject({
+			totalTaskRecords: 3,
+			groupedTaskCount: 1,
+			ungroupedTaskCount: 2,
+			ungrouped: {
+				taskCount: 2,
+				statusCounts: { completed: 1, failed: 1 },
+				omittedTaskCount: 1,
+				reasonCounts: { missingIssueId: 1, missingPhaseId: 2, missingRootCause: 2 },
+			},
+		});
+		expect(board.ungrouped.tasks).toEqual([{ taskId: "task_legacy_all", status: "completed" }]);
+		expect(board.groupedTaskCount + board.ungrouped.taskCount).toBe(board.totalTaskRecords);
+	});
+
+	test("inherits artifact diagnostics without crashing board generation", async () => {
+		const root = await createTasksRoot();
+		await writeTaskArtifacts(root, {
+			id: "task_valid",
+			status: "running",
+			updatedAt: "2026-07-24T10:00:00.000Z",
+			metadata: { phaseId: "phase-4", issueId: "issue-valid", rootCause: "io" },
+		});
+		const malformedTaskDir = join(root, "task_bad_task");
+		await mkdir(malformedTaskDir);
+		await writeFile(join(malformedTaskDir, "task.json"), "{bad", "utf8");
+		const malformedResultDir = join(root, "task_bad_result");
+		await mkdir(malformedResultDir);
+		await writeJson(join(malformedResultDir, "task.json"), {
+			id: "task_bad_result",
+			status: "failed",
+			metadata: { phaseId: "phase-4", issueId: "issue-result", rootCause: "io" },
+		});
+		await writeFile(join(malformedResultDir, "result.json"), "[bad", "utf8");
+		await mkdir(join(root, "task_missing_task"));
+
+		const board = await buildTaskBoard(root);
+		const diagnosticCodes = board.diagnostics.map((diagnostic) => diagnostic.code);
+
+		expect(board.totalGroupCount).toBe(2);
+		expect(diagnosticCodes).toContain("malformed_task_json");
+		expect(diagnosticCodes).toContain("missing_task_json");
+		expect(diagnosticCodes).toContain("missing_result_json");
+		expect(diagnosticCodes).toContain("malformed_result_json");
+	});
+
+	test("prints board JSON through the metrics CLI mode", async () => {
+		const root = await createTasksRoot();
+		await writeTaskArtifacts(root, {
+			id: "task_board_cli",
+			status: "running",
+			updatedAt: "2026-07-24T10:00:00.000Z",
+			metadata: { phaseId: "phase-4", issueId: "issue-cli", rootCause: "cli" },
+		});
+
+		const process = Bun.spawn(["bun", "run", "task-metrics", root, "--board"], {
+			cwd: new URL("..", import.meta.url).pathname,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [exitCode, stdout] = await Promise.all([process.exited, new Response(process.stdout).text()]);
+		const output = JSON.parse(stdout) as Record<string, unknown>;
+
+		expect(exitCode).toBe(0);
+		expect(output).toMatchObject({ schemaVersion: 1, tasksRoot: root, totalTaskRecords: 1, totalGroupCount: 1 });
+		expect(output.groups).toEqual([
+			expect.objectContaining({ phaseId: "phase-4", issueId: "issue-cli", rootCause: "cli", taskCount: 1 }),
+		]);
 	});
 });

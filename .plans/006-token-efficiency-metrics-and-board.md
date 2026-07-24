@@ -1,6 +1,6 @@
 # plan 006: token-efficiency metrics and task board
 
-status: phase 2 metrics implemented and verified; phase 4 board postponed
+status: phase 2 metrics and phase 4 board implemented and verified
 created: 2026-07-24
 updated: 2026-07-24
 
@@ -23,4 +23,16 @@ verification: `bun test` — 52 pass, 0 fail; `bun run typecheck` — exit 0; `g
 
 ## phase 4: task board
 
-postponed. reuse phase 2 grouping primitives for issue/root-cause board output, with dedicated grouping and board-output tests before implementation.
+- [x] reuse structured task-artifact reading for metrics and board output
+- [x] group complete `phaseId`/`issueId`/`rootCause` tuples with task and status counts
+- [x] include latest timestamps and structured verification/blocker/risk counts
+- [x] mark repeated issues and shared root causes as coordination candidates
+- [x] bound group/task output and sort active, recent, then identifiers
+- [x] expose legacy/missing-metadata tasks through reconciled `ungrouped` coverage
+- [x] add `task-metrics <tasksRoot> --board` JSON mode and README usage
+- [x] add phase 4 grouping, structured-field, sorting, diagnostics, legacy coverage, and CLI tests
+- [x] verify with `bun test`, `bun run typecheck`, `git diff --check`, and a live task store
+
+verification: `bun test` — 59 pass, 0 fail; `bun run typecheck` — exit 0; `git diff --check` — exit 0. live `/Users/home/Dev/looper-ai/.pi/tasks` — 77 records, 1 grouped, 76 ungrouped, 0 diagnostics, with coverage totals reconciled.
+
+postponed: shared/global registry and full project-management behavior.

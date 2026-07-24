@@ -1,5 +1,5 @@
-import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { readTaskStoreArtifacts } from "./task-artifacts";
+import type { TaskStoreArtifactRecord, TaskStoreDiagnostic } from "./task-artifacts";
 
 const LARGEST_LIST_LIMIT = 10;
 
@@ -8,12 +8,7 @@ export interface TaskMetricCount {
 	readonly charCount: number;
 }
 
-export interface TaskMetricsDiagnostic {
-	readonly severity: "warning" | "error";
-	readonly code: string;
-	readonly path: string;
-	readonly message: string;
-}
+export type TaskMetricsDiagnostic = TaskStoreDiagnostic;
 
 export interface TaskGroupingMetrics {
 	readonly byPhaseId: Readonly<Record<string, number>>;
@@ -52,10 +47,6 @@ export interface TaskStoreMetricsReport {
 	readonly diagnostics: readonly TaskMetricsDiagnostic[];
 }
 
-type JsonReadResult =
-	| { readonly ok: true; readonly value: unknown }
-	| { readonly ok: false; readonly missing: boolean; readonly message: string };
-
 interface MutableTotals {
 	totalTaskRecords: number;
 	preflightRejectedCount: number;
@@ -68,7 +59,8 @@ interface MutableTotals {
 }
 
 export async function analyzeTaskStoreMetrics(tasksRoot: string): Promise<TaskStoreMetricsReport> {
-	const diagnostics: TaskMetricsDiagnostic[] = [];
+	const artifactRead = await readTaskStoreArtifacts(tasksRoot);
+	const diagnostics: TaskMetricsDiagnostic[] = [...artifactRead.diagnostics];
 	const taskPrompts: TaskMetricCount[] = [];
 	const results: TaskMetricCount[] = [];
 	const statusCounts: Record<string, number> = {};
@@ -89,45 +81,28 @@ export async function analyzeTaskStoreMetrics(tasksRoot: string): Promise<TaskSt
 		totalSerializedResultPayloadChars: 0,
 		verificationEntryCount: 0,
 	};
+	const analysis: TaskAnalysis = {
+		totals,
+		statusCounts,
+		failedChecksByName,
+		unavailableChecksByName,
+		byPhaseId,
+		byIssueId,
+		byRootCause,
+		commandCounts,
+		verificationStatusCounts,
+		taskPrompts,
+		results,
+	};
 
-	let entries;
-	try {
-		entries = await readdir(tasksRoot, { withFileTypes: true });
-	} catch (error) {
-		diagnostics.push({
-			severity: "error",
-			code: "tasks_root_unreadable",
-			path: tasksRoot,
-			message: errorMessage(error),
-		});
-		return buildReport(tasksRoot, totals, statusCounts, failedChecksByName, unavailableChecksByName, byPhaseId, byIssueId, byRootCause, commandCounts, verificationStatusCounts, taskPrompts, results, diagnostics);
-	}
-
-	for (const entry of entries.filter((candidate) => candidate.isDirectory()).sort((left, right) => compareStrings(left.name, right.name))) {
-		await analyzeTaskDirectory({
-			tasksRoot,
-			taskDirectoryName: entry.name,
-			totals,
-			statusCounts,
-			failedChecksByName,
-			unavailableChecksByName,
-			byPhaseId,
-			byIssueId,
-			byRootCause,
-			commandCounts,
-			verificationStatusCounts,
-			taskPrompts,
-			results,
-			diagnostics,
-		});
+	for (const record of artifactRead.records) {
+		analyzeTaskArtifact(record, analysis);
 	}
 
 	return buildReport(tasksRoot, totals, statusCounts, failedChecksByName, unavailableChecksByName, byPhaseId, byIssueId, byRootCause, commandCounts, verificationStatusCounts, taskPrompts, results, diagnostics);
 }
 
-interface TaskDirectoryAnalysis {
-	readonly tasksRoot: string;
-	readonly taskDirectoryName: string;
+interface TaskAnalysis {
 	readonly totals: MutableTotals;
 	readonly statusCounts: Record<string, number>;
 	readonly failedChecksByName: Record<string, number>;
@@ -139,34 +114,11 @@ interface TaskDirectoryAnalysis {
 	readonly verificationStatusCounts: Record<string, number>;
 	readonly taskPrompts: TaskMetricCount[];
 	readonly results: TaskMetricCount[];
-	readonly diagnostics: TaskMetricsDiagnostic[];
 }
 
-async function analyzeTaskDirectory(analysis: TaskDirectoryAnalysis): Promise<void> {
-	const taskPath = join(analysis.tasksRoot, analysis.taskDirectoryName, "task.json");
-	const relativeTaskPath = join(analysis.taskDirectoryName, "task.json");
-	const taskRead = await readJson(taskPath);
-	if (!taskRead.ok) {
-		analysis.diagnostics.push({
-			severity: taskRead.missing ? "warning" : "error",
-			code: taskRead.missing ? "missing_task_json" : "malformed_task_json",
-			path: relativeTaskPath,
-			message: taskRead.message,
-		});
-		return;
-	}
-	if (!isRecord(taskRead.value)) {
-		analysis.diagnostics.push({
-			severity: "error",
-			code: "malformed_task_json",
-			path: relativeTaskPath,
-			message: "task.json must contain an object",
-		});
-		return;
-	}
-
-	const task = taskRead.value;
-	const taskId = typeof task.id === "string" && task.id.length > 0 ? task.id : analysis.taskDirectoryName;
+function analyzeTaskArtifact(record: TaskStoreArtifactRecord, analysis: TaskAnalysis): void {
+	const task = record.task;
+	const taskId = typeof task.id === "string" && task.id.length > 0 ? task.id : record.taskDirectoryName;
 	analysis.totals.totalTaskRecords += 1;
 
 	const status = typeof task.status === "string" && task.status.length > 0 ? task.status : "unknown";
@@ -178,11 +130,11 @@ async function analyzeTaskDirectory(analysis: TaskDirectoryAnalysis): Promise<vo
 
 	analyzeMetadata(task.metadata, analysis);
 	analyzePreflight(task, status, analysis);
-	await analyzeAssignment(analysis);
-	await analyzeResult(analysis, taskId);
+	analyzeAssignment(record.assignment, analysis);
+	analyzeResult(record.result, taskId, analysis);
 }
 
-function analyzeMetadata(metadata: unknown, analysis: TaskDirectoryAnalysis): void {
+function analyzeMetadata(metadata: unknown, analysis: TaskAnalysis): void {
 	if (!isRecord(metadata)) {
 		return;
 	}
@@ -191,7 +143,7 @@ function analyzeMetadata(metadata: unknown, analysis: TaskDirectoryAnalysis): vo
 	incrementStringField(analysis.byRootCause, metadata.rootCause);
 }
 
-function analyzePreflight(task: Record<string, unknown>, status: string, analysis: TaskDirectoryAnalysis): void {
+function analyzePreflight(task: Record<string, unknown>, status: string, analysis: TaskAnalysis): void {
 	const preflight = isRecord(task.preflight) ? task.preflight : undefined;
 	const error = isRecord(task.error) ? task.error : undefined;
 	if (status === "rejected" && (error?.code === "preflight_failed" || preflight?.ok === false)) {
@@ -213,53 +165,27 @@ function analyzePreflight(task: Record<string, unknown>, status: string, analysi
 	}
 }
 
-async function analyzeAssignment(analysis: TaskDirectoryAnalysis): Promise<void> {
-	const relativePath = join(analysis.taskDirectoryName, "assignment.json");
-	const assignmentRead = await readJson(join(analysis.tasksRoot, relativePath));
-	if (!assignmentRead.ok) {
-		if (!assignmentRead.missing) {
-			analysis.diagnostics.push({
-				severity: "error",
-				code: "malformed_assignment_json",
-				path: relativePath,
-				message: assignmentRead.message,
-			});
-		}
+function analyzeAssignment(assignment: unknown | undefined, analysis: TaskAnalysis): void {
+	if (assignment === undefined) {
 		return;
 	}
-
-	const assignment = assignmentRead.value;
-	analysis.totals.totalAssignmentChars += typeof assignment === "string" ? assignment.length : JSON.stringify(assignment).length;
+	const serializedAssignment = JSON.stringify(assignment);
+	analysis.totals.totalAssignmentChars += typeof assignment === "string" ? assignment.length : serializedAssignment?.length ?? 0;
 	if (isRecord(assignment) && typeof assignment.instructions === "string") {
 		analysis.totals.totalInstructionChars += assignment.instructions.length;
 	}
 }
 
-async function analyzeResult(analysis: TaskDirectoryAnalysis, taskId: string): Promise<void> {
-	const relativePath = join(analysis.taskDirectoryName, "result.json");
-	const resultRead = await readJson(join(analysis.tasksRoot, relativePath));
-	if (!resultRead.ok) {
-		analysis.diagnostics.push({
-			severity: resultRead.missing ? "warning" : "error",
-			code: resultRead.missing ? "missing_result_json" : "malformed_result_json",
-			path: relativePath,
-			message: resultRead.message,
-		});
+function analyzeResult(
+	storedResult: Record<string, unknown> | undefined,
+	taskId: string,
+	analysis: TaskAnalysis,
+): void {
+	if (!storedResult) {
 		return;
 	}
-	if (!isRecord(resultRead.value)) {
-		analysis.diagnostics.push({
-			severity: "error",
-			code: "malformed_result_json",
-			path: relativePath,
-			message: "result.json must contain an object",
-		});
-		return;
-	}
-
-	const storedResult = resultRead.value;
 	const summaryChars = typeof storedResult.summary === "string" ? storedResult.summary.length : 0;
-	const payloadChars = "result" in storedResult ? JSON.stringify(storedResult.result).length : 0;
+	const payloadChars = "result" in storedResult ? (JSON.stringify(storedResult.result)?.length ?? 0) : 0;
 	analysis.totals.totalResultSummaryChars += summaryChars;
 	analysis.totals.totalSerializedResultPayloadChars += payloadChars;
 	analysis.results.push({ taskId, charCount: summaryChars + payloadChars });
@@ -333,20 +259,6 @@ function buildReport(
 	};
 }
 
-async function readJson(path: string): Promise<JsonReadResult> {
-	let text: string;
-	try {
-		text = await readFile(path, "utf8");
-	} catch (error) {
-		return { ok: false, missing: errorCode(error) === "ENOENT", message: errorMessage(error) };
-	}
-	try {
-		return { ok: true, value: JSON.parse(text) as unknown };
-	} catch (error) {
-		return { ok: false, missing: false, message: errorMessage(error) };
-	}
-}
-
 function largestFirst(values: readonly TaskMetricCount[]): readonly TaskMetricCount[] {
 	return [...values]
 		.sort((left, right) => right.charCount - left.charCount || compareStrings(left.taskId, right.taskId))
@@ -373,12 +285,4 @@ function incrementStringField(counts: Record<string, number>, value: unknown): v
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return Boolean(value && typeof value === "object" && !Array.isArray(value));
-}
-
-function errorCode(error: unknown): string | undefined {
-	return isRecord(error) && typeof error.code === "string" ? error.code : undefined;
-}
-
-function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
 }

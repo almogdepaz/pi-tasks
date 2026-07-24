@@ -213,15 +213,22 @@ describe("task store and transport split", () => {
 		expect(dispatchCount).toBe(0);
 	});
 
-	test("wolfpack transport maps session status json to preflight checks", async () => {
+	test("wolfpack transport passes only structured ready terminal status", async () => {
 		const calls: Array<{ readonly command: string; readonly args: readonly string[] }> = [];
 		const transport = createWolfpackTaskTransport({
 			exec: async (command, args) => {
 				calls.push({ command, args });
 				return {
 					code: 0,
-					stdout: JSON.stringify({ sessionId: "abc", alive: true, projectDir }),
-					stderr: "",
+					stdout: JSON.stringify({
+						ok: true,
+						selector: "worker",
+						session: "worker-canonical",
+						sessionId: "id-worker",
+						projectDir,
+						terminal: { exists: true, alive: true, status: "ready" },
+					}),
+					stderr: "ignored prose",
 				};
 			},
 		});
@@ -235,56 +242,204 @@ describe("task store and transport split", () => {
 
 		expect(result).toEqual({
 			ok: true,
-			targetSession: "worker",
+			targetSession: "worker-canonical",
 			targetProjectDir: projectDir,
 			checks: [
-				{ name: "transport_reachable", status: "passed", source: "transport" },
+				{
+					name: "transport_reachable",
+					status: "passed",
+					source: "transport",
+					message: "wolfpack session worker-canonical (id id-worker) is ready",
+				},
 				{ name: "target_project_dir", status: "passed", source: "transport" },
 			],
 		});
 		expect(calls).toEqual([{ command: "wolfpack", args: ["session", "status", "worker", "--json"] }]);
 	});
 
-	test("wolfpack transport maps structured session status failures without reading terminal prose", async () => {
+	test("wolfpack transport fails required project mismatch using target facts", async () => {
+		const requiredProjectDir = join(projectDir, "required");
+		const targetProjectDir = join(projectDir, "target");
 		const transport = createWolfpackTaskTransport({
 			exec: async () => ({
-				code: 1,
-				stdout: JSON.stringify({ statusCode: 404, message: "missing session" }),
-				stderr: "ignored prose",
+				code: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					session: "worker",
+					sessionId: "id-worker",
+					projectPath: targetProjectDir,
+					terminal: { exists: true, alive: true, status: "ready" },
+				}),
+				stderr: "",
 			}),
 		});
 
 		const result = await transport.preflightTarget?.({
 			projectDir,
 			parentSession: "parent",
-			target: "missing",
-			requirements: { requireReachable: true },
+			target: "worker",
+			requirements: { requiredProjectDir },
 		});
 
-		expect(result).toEqual({
-			ok: false,
-			targetSession: "missing",
-			checks: [{ name: "transport_reachable", status: "failed", source: "transport", message: "wolfpack session not found" }],
+		expect(result?.ok).toBe(false);
+		expect(result?.checks).toContainEqual({
+			name: "target_project_dir",
+			status: "failed",
+			source: "transport",
+			message: `expected ${requiredProjectDir}, got ${targetProjectDir}`,
 		});
 	});
 
-	test("wolfpack transport treats invalid status json as unavailable preflight", async () => {
+	test("wolfpack transport marks an omitted optional target project as unavailable", async () => {
 		const transport = createWolfpackTaskTransport({
-			exec: async () => ({ code: 0, stdout: "not json", stderr: "ignored prose" }),
+			exec: async () => ({
+				code: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					session: "worker",
+					sessionId: "id-worker",
+					terminal: { exists: true, alive: true, status: "ready" },
+				}),
+				stderr: "",
+			}),
 		});
 
-		const result = await transport.preflightTarget?.({
+		const optional = await transport.preflightTarget?.({ projectDir, parentSession: "parent", target: "worker" });
+		const required = await transport.preflightTarget?.({
 			projectDir,
 			parentSession: "parent",
 			target: "worker",
+			requirements: { requiredProjectDir: projectDir },
 		});
 
-		expect(result).toEqual({
-			ok: false,
-			targetSession: "worker",
-			checks: [{ name: "transport_reachable", status: "unavailable", source: "transport", message: "wolfpack status returned invalid json" }],
+		expect(optional?.ok).toBe(true);
+		expect(optional?.checks).toContainEqual({
+			name: "target_project_dir",
+			status: "unavailable",
+			source: "transport",
+			message: "wolfpack status did not include target project path",
+		});
+		expect(required?.ok).toBe(false);
+		expect(required?.checks).toContainEqual({
+			name: "target_project_dir",
+			status: "failed",
+			source: "transport",
+			message: "target projectDir is unavailable",
 		});
 	});
+
+	for (const failure of [
+		{ code: "SESSION_DEAD", target: "dead", message: "wolfpack session is dead" },
+		{ code: "SESSION_NOT_FOUND", target: "missing", message: "wolfpack session not found" },
+		{ code: "AMBIGUOUS_SELECTOR", target: "ambiguous", message: "wolfpack session selector is ambiguous" },
+	] as const) {
+		test(`wolfpack ${failure.code} fails preflight and prevents dispatch`, async () => {
+			let dispatchCount = 0;
+			const transport = createWolfpackTaskTransport({
+				exec: async (_command, args) => {
+					if (args[1] === "send") {
+						dispatchCount += 1;
+						return { code: 0, stdout: "", stderr: "" };
+					}
+					return {
+						code: 1,
+						stdout: JSON.stringify({
+							ok: false,
+							selector: failure.target,
+							error: { code: failure.code, message: "x".repeat(10_000) },
+						}),
+						stderr: "ignored terminal prose",
+					};
+				},
+			});
+			const tools = registerToolsForTest({ store: createFilesystemTaskStore(), transport });
+			const send = tools.agent_task_send;
+			if (!send) throw new Error("agent_task_send not registered");
+
+			const response = await send.execute(
+				"call_1",
+				{ to: failure.target, task: "inspect auth", preflight: { requireReachable: true } },
+				new AbortController().signal,
+				undefined,
+				{ cwd: projectDir },
+			);
+			const details = response.details as {
+				readonly status: string;
+				readonly preflight: { readonly checks: readonly unknown[] };
+			};
+
+			expect(details.status).toBe("rejected");
+			expect(details.preflight.checks).toContainEqual({
+				name: "transport_reachable",
+				status: "failed",
+				source: "transport",
+				message: failure.message,
+			});
+			expect(dispatchCount).toBe(0);
+		});
+	}
+
+	for (const unavailable of [
+		{
+			name: "backend unavailable",
+			exec: async () => ({
+				code: 1,
+				stdout: JSON.stringify({ ok: false, error: { code: "BACKEND_UNAVAILABLE", message: "x".repeat(10_000) } }),
+				stderr: "ignored terminal prose",
+			}),
+			message: "wolfpack backend unavailable",
+		},
+		{
+			name: "invalid json",
+			exec: async () => ({ code: 0, stdout: "not json", stderr: "ignored terminal prose" }),
+			message: "wolfpack status returned invalid json",
+		},
+		{
+			name: "missing terminal liveness",
+			exec: async () => ({
+				code: 0,
+				stdout: JSON.stringify({ ok: true, session: "worker", sessionId: "id-worker", alive: true }),
+				stderr: "ignored terminal prose",
+			}),
+			message: "wolfpack status did not include valid terminal liveness",
+		},
+		{
+			name: "command error",
+			exec: async (): Promise<never> => {
+				throw new Error("unbounded command prose ".repeat(1_000));
+			},
+			message: "wolfpack status command failed",
+		},
+	] as const) {
+		test(`wolfpack ${unavailable.name} is compact and follows required reachability`, async () => {
+			const transport = createWolfpackTaskTransport({ exec: unavailable.exec });
+			const optional = await transport.preflightTarget?.({ projectDir, parentSession: "parent", target: "worker" });
+			const required = await transport.preflightTarget?.({
+				projectDir,
+				parentSession: "parent",
+				target: "worker",
+				requirements: { requireReachable: true },
+			});
+
+			expect(optional?.ok).toBe(true);
+			expect(optional?.targetSession).toBe("worker");
+			expect(optional?.checks[0]).toEqual({
+				name: "transport_reachable",
+				status: "unavailable",
+				source: "transport",
+				message: unavailable.message,
+			});
+			expect(required?.ok).toBe(false);
+			expect(required?.targetSession).toBe("worker");
+			expect(required?.checks[0]).toEqual({
+				name: "transport_reachable",
+				status: "failed",
+				source: "transport",
+				message: unavailable.message,
+			});
+			expect(unavailable.message.length).toBeLessThan(80);
+		});
+	}
 
 	test("wolfpack session identity is transport-specific", () => {
 		expect(getCurrentWolfpackSessionName({ WOLFPACK_SESSION_NAME: "parent" })).toBe("parent");

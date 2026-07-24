@@ -397,11 +397,14 @@ uses structured Wolfpack status only:
 wolfpack session status <target-session> --json
 ```
 
-Alive sessions map to a passed `transport_reachable` check. Structured 404, 409,
-and 410 status results fail reachability; 503 and invalid JSON are reported as
-unavailable. If `preflight.requiredProjectDir` is supplied, the returned target
-`projectDir` is compared with resolved paths. Terminal output/prose is never used
-as the source of truth.
+Only structured status with `terminal.exists === true`, `terminal.alive === true`,
+and `terminal.status === "ready"` passes `transport_reachable`. Structured
+`SESSION_NOT_FOUND`, `AMBIGUOUS_SELECTOR`, and `SESSION_DEAD` errors fail
+reachability. `BACKEND_UNAVAILABLE`, invalid JSON, and command errors are
+unavailable unless `preflight.requireReachable` is true. If
+`preflight.requiredProjectDir` is supplied, the returned target `projectDir` or
+`projectPath` is compared with resolved paths; missing target project facts fail
+that required check. Terminal output/prose is never used as the source of truth.
 
 If you are using Wolfpack, install this extension in every participating Pi
 session and target a session name/id with `agent_task_send`.

@@ -11,6 +11,7 @@ updated: 2026-07-24
 - 2026-07-24: implemented v1 slice: metadata/context refs, structured result validation helper, optional transport preflight hook, automatic send preflight, active `issueId` conflict checks, README/skill updates.
 - 2026-07-24: corrected v1 behavior: non-idempotent preflight failures are ephemeral; idempotent preflight failures create/reuse durable rejected records; required project checks use target project facts from transport preflight, not parent cwd; Wolfpack preflight maps `wolfpack session status <target> --json` structured output.
 - 2026-07-24: verified with `bun test` (31 pass) and `bun run typecheck`.
+- 2026-07-24: updated the Wolfpack transport adapter to the deployed PR219 contract: strict structured `terminal.exists/alive/status` readiness, canonical session/id evidence, `projectDir`/`projectPath` checks, bounded structured failures, and optional-vs-required availability semantics. Fake-exec regressions cover ready, dead, missing, ambiguous, project mismatch/missing, backend unavailable, invalid JSON, missing terminal liveness, and command errors. Live `wolfpack session status wolfpack-pi-tasks --json` returned the PR219 fields including canonical identity, both project paths, and `terminal: { exists: true, alive: true, status: "ready" }`; invoking the transport adapter against that live command produced passed `transport_reachable` and `target_project_dir` checks. Verified with `bun test` (45 pass) and `bun run typecheck`.
 
 ## goal
 

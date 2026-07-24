@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 
 const packageJsonPath = new URL("../package.json", import.meta.url);
+const readmePath = new URL("../README.md", import.meta.url);
 const skillPath = new URL("../skills/wolfpack-pi-task-delegation/SKILL.md", import.meta.url);
 
 describe("package skill wiring", () => {
@@ -59,5 +60,45 @@ describe("package skill wiring", () => {
 		expect(skill).toContain("agent_task_done");
 		expect(skill).toContain("agent_task_inbox");
 		expect(skill).not.toContain("poll terminal output for completion");
+	});
+
+	test("delegation docs fail fast across unsupported task boundaries", async () => {
+		const readme = (await readFile(readmePath, "utf8")).replace(/\s+/g, " ");
+
+		expect(readme).toContain("fail fast and instruct setup before dispatch");
+		expect(readme).toContain("Do not use cross-repo `agent_task_send` with the filesystem store");
+		expect(readme).toContain("fallback instruction channel, not a task completion protocol");
+		expect(readme).toContain("`summary` at or below 1200 characters");
+	});
+
+	test("delegation skill enforces token-efficient task boundaries", async () => {
+		const skill = await readFile(skillPath, "utf8");
+		const normalizedSkill = skill.replace(/\s+/g, " ");
+
+		for (const field of [
+			"phaseId",
+			"issueId",
+			"role",
+			"verificationTier",
+			"rootCause",
+			"changedFiles",
+			"verification",
+			"blockers",
+			"risks",
+			"next",
+		]) {
+			expect(normalizedSkill).toContain(`\`${field}\``);
+		}
+		expect(normalizedSkill).toContain("compact and action-oriented");
+		expect(normalizedSkill).toContain("1200 characters");
+		expect(normalizedSkill).toContain("Batch findings that share a root cause");
+		expect(normalizedSkill).toContain("requireReachable: true");
+		expect(normalizedSkill).toContain("requiredProjectDir");
+		expect(normalizedSkill).toContain("shared task store");
+		expect(normalizedSkill).toContain("wolfpack session send");
+		expect(normalizedSkill).toContain("fallback instruction channel");
+		expect(normalizedSkill).toContain("not a task completion protocol");
+		expect(normalizedSkill).toContain("fail before dispatch");
+		expect(normalizedSkill).toContain("Do not use symlinks");
 	});
 });

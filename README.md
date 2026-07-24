@@ -94,9 +94,10 @@ pi -e /Users/home/Dev/wolfpack-pi-tasks
 pi -e npm:@sgtbeatdown/pi-tasks
 ```
 
-Every participating Pi session must load this extension. If a target Pi session
-does not have `agent_task_done`, the sender can still create/dispatch the task,
-but it will remain non-terminal until timeout or cancellation.
+Every participating Pi session must load this extension. Before sending, verify
+the target has `agent_task_done` and can reach the same task store. If not, fail
+fast and instruct setup before dispatch; do not create a task that can only time
+out.
 
 ## quick start: local/custom transport
 
@@ -263,7 +264,7 @@ From the parent Pi session, call:
 {
   "to": "%12",
   "task": "inspect the auth middleware and report risks",
-  "metadata": { "issueId": "auth-review", "role": "reviewer", "verificationTier": "focused" },
+  "metadata": { "phaseId": "phase-1", "issueId": "auth-review", "role": "reviewer", "verificationTier": "focused" },
   "contextRefs": [{ "path": ".plans/current.md", "required": false, "purpose": "scope" }],
   "timeoutMs": 1800000
 }
@@ -407,7 +408,11 @@ unavailable unless `preflight.requireReachable` is true. If
 that required check. Terminal output/prose is never used as the source of truth.
 
 If you are using Wolfpack, install this extension in every participating Pi
-session and target a session name/id with `agent_task_send`.
+session and target a session name/id with `agent_task_send`. Do not use
+cross-repo `agent_task_send` with the filesystem store because separate project
+roots do not share task state. Until a shared/global store exists, direct
+`wolfpack session send` is only a fallback instruction channel, not a task
+completion protocol. Do not use symlinks to imitate shared task storage.
 
 If you are not using Wolfpack, register the tools with your own `{ store,
 transport }` composition.
@@ -443,6 +448,11 @@ Assigned Pi agents must call `agent_task_done` as their final action:
   }
 }
 ```
+
+Keep `summary` at or below 1200 characters. Put compact machine-readable details
+under `result`, using `issueId`, `verdict`, `changedFiles`, `verification`,
+`blockers`, `risks`, and `next` when useful. Verification entries should include
+the exact command, status, exit code, and short summary where applicable.
 
 Non-Pi workers should complete through an equivalent store/server API with the
 same terminal status and payload semantics.

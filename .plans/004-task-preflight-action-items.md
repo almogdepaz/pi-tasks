@@ -57,14 +57,15 @@ The solution is to stop treating agent delegation like terminal chat and make it
 2. pi-tasks: dispatch preflight
    - add optional `TaskTransport.preflightTarget`
    - make `agent_task_send` run final preflight before dispatch
-   - check target syntax/reachability, required context refs, active task conflicts, required project/model when authoritative facts exist
-   - wire wolfpack transport to wolfpack liveness api when available
+   - check target syntax/reachability, required context refs, active task conflicts, required target project/model when authoritative facts exist
+   - wire wolfpack transport to `wolfpack session status <target> --json`
 
 3. preflight failure behavior
-   - v1 creates/returns a durable terminal `rejected` task for preflight failures
+   - v1 returns an ephemeral rejected tool result for non-idempotent preflight failures
+   - v1 creates/reuses a durable terminal `rejected` task only when `idempotencyKey` is supplied
    - set `error.code = "preflight_failed"`
-   - save preflight checks on `task.json`
-   - do not write assignment or dispatch text on preflight failure (`assignmentRef` stays undefined)
+   - save preflight checks on durable `task.json`
+   - do not write assignment or dispatch text on preflight failure (`assignmentRef` stays undefined for durable records)
 
 4. protocol/store metadata
    - add optional `phaseId`, `issueId`, `role`, `verificationTier`, `rootCause`

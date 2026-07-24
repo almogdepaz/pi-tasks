@@ -71,6 +71,7 @@ export interface TaskPreflightResult {
 	readonly ok: boolean;
 	readonly checks: readonly TaskPreflightCheck[];
 	readonly targetSession: string;
+	readonly targetProjectDir?: string;
 }
 
 export interface TaskVerificationEvidence {

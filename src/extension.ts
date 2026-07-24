@@ -195,6 +195,19 @@ export function registerAgentTaskTools(pi: ExtensionAPI, communication: TaskComm
 				signal,
 			});
 			if (!preflight.ok) {
+				const error = { code: "preflight_failed", message: summarizePreflightFailure(preflight), retryable: true };
+				if (!params.idempotencyKey) {
+					return taskToolResult({
+						schemaVersion: 1,
+						status: "rejected",
+						summary: "preflight failed",
+						artifacts: [],
+						onCompletePrompt: params.onCompletePrompt,
+						preflight,
+						error,
+					});
+				}
+
 				const rejected = await store.createOrReusePreflightRejectedTask({
 					projectDir: ctx.cwd,
 					parentSession,
@@ -208,7 +221,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, communication: TaskComm
 					contextRefs: params.contextRefs,
 					preflight,
 					summary: "preflight failed",
-					error: { code: "preflight_failed", message: summarizePreflightFailure(preflight), retryable: true },
+					error,
 				});
 				return taskToolResult(compactTaskResult(rejected.task, await store.readTaskResult(ctx.cwd, rejected.task.id)));
 			}

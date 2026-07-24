@@ -39,17 +39,20 @@ visible and steerable, but treat task state/results as the protocol.
    `role`, `verificationTier`, and `rootCause` when known) instead of encoding
    these fields in prose. Use `contextRefs` for existing plan/issue/verification
    files instead of copying long context into `task`. If readiness matters, set
-   `preflight`; note that Wolfpack liveness is unavailable until its transport
-   exposes stable preflight JSON, and `requireReachable: true` may reject before
-   delivery. If the parent must do something specific when the result arrives,
+   `preflight`; Wolfpack readiness uses structured `wolfpack session status
+   <target> --json` facts and never terminal prose. `requireReachable: true` or
+   a mismatched `requiredProjectDir` may reject before delivery. If the parent
+   must do something specific when the result arrives,
    set `onCompletePrompt` with that parent-side follow-up. Example: “review the
    worker’s implementation diff before reporting completion.” Do not put
    parent-review instructions in the worker task unless the worker must do them.
 
 4. Return immediately with the task id and target session unless the user asked
-   to wait. Continue local work if there is other useful work to do. When the
-   task finishes, the idle inbox notification will remind the parent of any
-   sender-defined `onCompletePrompt`.
+   to wait. If preflight fails without `idempotencyKey`, the tool result is
+   ephemeral and has no task id because no task directory was created. Continue
+   local work if there is other useful work to do. When the task finishes, the
+   idle inbox notification will remind the parent of any sender-defined
+   `onCompletePrompt`.
 
 5. Use structured task tools for follow-up:
    - `agent_task_status` for one task

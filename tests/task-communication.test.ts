@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -121,7 +121,7 @@ describe("task store and transport split", () => {
 		expect(layer.transport.name).toBe("wolfpack");
 	});
 
-	test("agent_task_send rejects failed preflight without dispatching assignment text", async () => {
+	test("agent_task_send returns ephemeral failed preflight result without idempotency key", async () => {
 		let dispatchCount = 0;
 		const store = createFilesystemTaskStore({ tasksDir: ".pi/tasks" });
 		const tools = registerToolsForTest({
@@ -150,14 +150,140 @@ describe("task store and transport split", () => {
 			undefined,
 			{ cwd: projectDir },
 		);
-		const details = response.details as { readonly taskId: string; readonly status: string; readonly error: { readonly code: string } | null };
-		const task = await store.readTask(projectDir, details.taskId);
+		const details = response.details as {
+			readonly taskId?: string;
+			readonly status: string;
+			readonly error: { readonly code: string } | null;
+			readonly preflight: { readonly checks: readonly unknown[] };
+		};
 
+		expect(details.taskId).toBeUndefined();
 		expect(details.status).toBe("rejected");
 		expect(details.error?.code).toBe("preflight_failed");
-		expect(task.assignmentRef).toBeUndefined();
-		expect(task.preflight?.checks).toContainEqual({ name: "reachable", status: "failed", source: "transport", message: "dead session" });
+		expect(details.preflight.checks).toContainEqual({ name: "reachable", status: "failed", source: "transport", message: "dead session" });
+		await expect(readdir(join(projectDir, ".pi/tasks"))).rejects.toThrow();
 		expect(dispatchCount).toBe(0);
+	});
+
+	test("agent_task_send creates and reuses durable rejected preflight records when idempotency key is supplied", async () => {
+		let dispatchCount = 0;
+		const store = createFilesystemTaskStore({ tasksDir: ".pi/tasks" });
+		const tools = registerToolsForTest({
+			store,
+			transport: {
+				name: "fake",
+				getCurrentSessionName: () => "parent",
+				preflightTarget: async () => ({
+					ok: false,
+					targetSession: "worker",
+					checks: [{ name: "reachable", status: "failed", source: "transport", message: "dead session" }],
+				}),
+				dispatchTask: async () => {
+					dispatchCount += 1;
+					return { ok: true };
+				},
+			},
+		});
+
+		const send = tools.agent_task_send;
+		if (!send) throw new Error("agent_task_send not registered");
+		const first = await send.execute(
+			"call_1",
+			{ to: "worker", task: "inspect auth", preflight: { requireReachable: true }, idempotencyKey: "same" },
+			new AbortController().signal,
+			undefined,
+			{ cwd: projectDir },
+		);
+		const second = await send.execute(
+			"call_2",
+			{ to: "worker", task: "inspect auth again", preflight: { requireReachable: true }, idempotencyKey: "same" },
+			new AbortController().signal,
+			undefined,
+			{ cwd: projectDir },
+		);
+		const firstDetails = first.details as { readonly taskId: string; readonly status: string; readonly error: { readonly code: string } | null };
+		const secondDetails = second.details as { readonly taskId: string; readonly status: string; readonly error: { readonly code: string } | null };
+		const task = await store.readTask(projectDir, firstDetails.taskId);
+
+		expect(firstDetails.taskId).toBe(secondDetails.taskId);
+		expect(firstDetails.status).toBe("rejected");
+		expect(secondDetails.error?.code).toBe("preflight_failed");
+		expect(task.assignmentRef).toBeUndefined();
+		expect(task.taskText).toBe("inspect auth");
+		expect(dispatchCount).toBe(0);
+	});
+
+	test("wolfpack transport maps session status json to preflight checks", async () => {
+		const calls: Array<{ readonly command: string; readonly args: readonly string[] }> = [];
+		const transport = createWolfpackTaskTransport({
+			exec: async (command, args) => {
+				calls.push({ command, args });
+				return {
+					code: 0,
+					stdout: JSON.stringify({ sessionId: "abc", alive: true, projectDir }),
+					stderr: "",
+				};
+			},
+		});
+
+		const result = await transport.preflightTarget?.({
+			projectDir,
+			parentSession: "parent",
+			target: "worker",
+			requirements: { requireReachable: true, requiredProjectDir: projectDir },
+		});
+
+		expect(result).toEqual({
+			ok: true,
+			targetSession: "worker",
+			targetProjectDir: projectDir,
+			checks: [
+				{ name: "transport_reachable", status: "passed", source: "transport" },
+				{ name: "target_project_dir", status: "passed", source: "transport" },
+			],
+		});
+		expect(calls).toEqual([{ command: "wolfpack", args: ["session", "status", "worker", "--json"] }]);
+	});
+
+	test("wolfpack transport maps structured session status failures without reading terminal prose", async () => {
+		const transport = createWolfpackTaskTransport({
+			exec: async () => ({
+				code: 1,
+				stdout: JSON.stringify({ statusCode: 404, message: "missing session" }),
+				stderr: "ignored prose",
+			}),
+		});
+
+		const result = await transport.preflightTarget?.({
+			projectDir,
+			parentSession: "parent",
+			target: "missing",
+			requirements: { requireReachable: true },
+		});
+
+		expect(result).toEqual({
+			ok: false,
+			targetSession: "missing",
+			checks: [{ name: "transport_reachable", status: "failed", source: "transport", message: "wolfpack session not found" }],
+		});
+	});
+
+	test("wolfpack transport treats invalid status json as unavailable preflight", async () => {
+		const transport = createWolfpackTaskTransport({
+			exec: async () => ({ code: 0, stdout: "not json", stderr: "ignored prose" }),
+		});
+
+		const result = await transport.preflightTarget?.({
+			projectDir,
+			parentSession: "parent",
+			target: "worker",
+		});
+
+		expect(result).toEqual({
+			ok: false,
+			targetSession: "worker",
+			checks: [{ name: "transport_reachable", status: "unavailable", source: "transport", message: "wolfpack status returned invalid json" }],
+		});
 	});
 
 	test("wolfpack session identity is transport-specific", () => {

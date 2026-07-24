@@ -81,6 +81,82 @@ describe("task preflight", () => {
 		expect(result.checks.find((check) => check.name === "context_ref:missing.md")?.status).toBe("skipped");
 	});
 
+	test("does not pass requiredProjectDir by comparing the parent cwd", async () => {
+		const result = await runTaskPreflight({
+			projectDir,
+			parentSession: "parent",
+			target: "worker",
+			store: createFilesystemTaskStore(),
+			transport: inertTransport,
+			requirements: { requiredProjectDir: projectDir },
+		});
+
+		expect(result.ok).toBe(false);
+		expect(result.checks).toContainEqual({
+			name: "target_project_dir",
+			status: "failed",
+			source: "transport",
+			message: "target projectDir is unavailable",
+		});
+	});
+
+	test("fails requiredProjectDir when transport target facts point at another project", async () => {
+		const transport: TaskTransport = {
+			name: "fake",
+			getCurrentSessionName: () => "parent",
+			dispatchTask: async () => ({ ok: true }),
+			preflightTarget: async () => ({
+				ok: true,
+				targetSession: "worker",
+				targetProjectDir: join(projectDir, "other"),
+				checks: [{ name: "transport_reachable", status: "passed", source: "transport" }],
+			}),
+		};
+
+		const result = await runTaskPreflight({
+			projectDir,
+			parentSession: "parent",
+			target: "worker",
+			store: createFilesystemTaskStore(),
+			transport,
+			requirements: { requiredProjectDir: projectDir },
+		});
+
+		expect(result.ok).toBe(false);
+		expect(result.checks).toContainEqual({
+			name: "target_project_dir",
+			status: "failed",
+			source: "transport",
+			message: `expected ${projectDir}, got ${join(projectDir, "other")}`,
+		});
+	});
+
+	test("passes requiredProjectDir when transport target facts match", async () => {
+		const transport: TaskTransport = {
+			name: "fake",
+			getCurrentSessionName: () => "parent",
+			dispatchTask: async () => ({ ok: true }),
+			preflightTarget: async () => ({
+				ok: true,
+				targetSession: "worker",
+				targetProjectDir: projectDir,
+				checks: [{ name: "transport_reachable", status: "passed", source: "transport" }],
+			}),
+		};
+
+		const result = await runTaskPreflight({
+			projectDir,
+			parentSession: "parent",
+			target: "worker",
+			store: createFilesystemTaskStore(),
+			transport,
+			requirements: { requiredProjectDir: projectDir },
+		});
+
+		expect(result.ok).toBe(true);
+		expect(result.checks).toContainEqual({ name: "target_project_dir", status: "passed", source: "transport" });
+	});
+
 	test("fails preflight when another active task targets the same issue on the same session", async () => {
 		const store = createFilesystemTaskStore();
 		const { task } = await store.createOrReuseDispatchedTask({

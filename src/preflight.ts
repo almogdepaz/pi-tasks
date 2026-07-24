@@ -19,17 +19,21 @@ export interface RunTaskPreflightInput {
 export async function runTaskPreflight(input: RunTaskPreflightInput): Promise<TaskPreflightResult> {
 	const checks: TaskPreflightCheck[] = [];
 	checks.push(checkTargetSyntax(input.target));
-	checks.push(checkRequiredProjectDir(input.projectDir, input.requirements?.requiredProjectDir));
 	checks.push(await checkActiveIssueConflict(input.store, input.projectDir, input.target, input.metadata?.issueId));
 	checks.push(...(await checkContextRefs(input.projectDir, input.contextRefs)));
 	checks.push(checkRequiredModel(input.requirements?.requiredModel));
 	checks.push(checkRequireIdle(input.requirements?.requireIdle));
-	checks.push(...(await checkTransportPreflight(input)));
+	const transportPreflight = await checkTransportPreflight(input);
+	checks.push(...transportPreflight.checks);
+	if (!transportPreflight.checks.some((check) => check.name === "target_project_dir")) {
+		checks.push(checkRequiredTargetProjectDir(input.requirements?.requiredProjectDir, transportPreflight.targetProjectDir));
+	}
 
 	return {
 		ok: checks.every((check) => check.status !== "failed"),
 		checks,
 		targetSession: input.target,
+		...(transportPreflight.targetProjectDir && { targetProjectDir: transportPreflight.targetProjectDir }),
 	};
 }
 
@@ -40,18 +44,26 @@ function checkTargetSyntax(target: string): TaskPreflightCheck {
 	return { name: "target_syntax", status: "passed", source: "protocol" };
 }
 
-function checkRequiredProjectDir(projectDir: string, requiredProjectDir: string | undefined): TaskPreflightCheck {
+export function checkRequiredTargetProjectDir(requiredProjectDir: string | undefined, targetProjectDir: string | undefined): TaskPreflightCheck {
 	if (!requiredProjectDir) {
-		return { name: "required_project_dir", status: "skipped", source: "protocol" };
+		return { name: "target_project_dir", status: "skipped", source: "transport" };
 	}
-	if (resolve(projectDir) === resolve(requiredProjectDir)) {
-		return { name: "required_project_dir", status: "passed", source: "protocol" };
+	if (!targetProjectDir) {
+		return {
+			name: "target_project_dir",
+			status: "failed",
+			source: "transport",
+			message: "target projectDir is unavailable",
+		};
+	}
+	if (resolve(targetProjectDir) === resolve(requiredProjectDir)) {
+		return { name: "target_project_dir", status: "passed", source: "transport" };
 	}
 	return {
-		name: "required_project_dir",
+		name: "target_project_dir",
 		status: "failed",
-		source: "protocol",
-		message: `expected ${resolve(requiredProjectDir)}, got ${resolve(projectDir)}`,
+		source: "transport",
+		message: `expected ${resolve(requiredProjectDir)}, got ${resolve(targetProjectDir)}`,
 	};
 }
 
@@ -138,16 +150,20 @@ function checkRequireIdle(requireIdle: boolean | undefined): TaskPreflightCheck 
 	};
 }
 
-async function checkTransportPreflight(input: RunTaskPreflightInput): Promise<readonly TaskPreflightCheck[]> {
+async function checkTransportPreflight(input: RunTaskPreflightInput): Promise<TaskPreflightResult> {
 	if (!input.transport.preflightTarget) {
-		return [
-			{
-				name: "transport_reachable",
-				status: input.requirements?.requireReachable ? "failed" : "unavailable",
-				source: "transport",
-				message: "transport does not expose target preflight",
-			},
-		];
+		return {
+			ok: !input.requirements?.requireReachable,
+			targetSession: input.target,
+			checks: [
+				{
+					name: "transport_reachable",
+					status: input.requirements?.requireReachable ? "failed" : "unavailable",
+					source: "transport",
+					message: "transport does not expose target preflight",
+				},
+			],
+		};
 	}
 
 	const result = await input.transport.preflightTarget({
@@ -160,14 +176,14 @@ async function checkTransportPreflight(input: RunTaskPreflightInput): Promise<re
 		signal: input.signal,
 	});
 
-	if (result.ok) {
-		return result.checks;
+	if (result.ok || result.checks.some((check) => check.status === "failed")) {
+		return result;
 	}
-	if (result.checks.some((check) => check.status === "failed")) {
-		return result.checks;
-	}
-	return [
-		...result.checks,
-		{ name: "transport_preflight", status: "failed", source: "transport", message: "transport preflight failed" },
-	];
+	return {
+		...result,
+		checks: [
+			...result.checks,
+			{ name: "transport_preflight", status: "failed", source: "transport", message: "transport preflight failed" },
+		],
+	};
 }

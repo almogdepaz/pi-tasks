@@ -8,7 +8,8 @@ updated: 2026-07-24
 
 - 2026-07-24: implementation started; architecture decisions requested from `looper-ai` via task `task_1c6e11d2dba340a7bfe0c79d2b207c1f`.
 - 2026-07-24: `looper-ai` decisions: durable rejected records for created/idempotent preflight failures; context selectors opaque with path readability validation only; required model exact string but target model check deferred until Pi exposes it; verification evidence manual via `agent_task_done.result`; task board postponed post-v1.
-- 2026-07-24: implemented v1 slice: metadata/context refs, structured result validation helper, optional transport preflight hook, automatic send preflight with durable rejected records, active `issueId` conflict checks, README/skill updates.
+- 2026-07-24: implemented v1 slice: metadata/context refs, structured result validation helper, optional transport preflight hook, automatic send preflight, active `issueId` conflict checks, README/skill updates.
+- 2026-07-24: corrected v1 behavior: non-idempotent preflight failures are ephemeral; idempotent preflight failures create/reuse durable rejected records; required project checks use target project facts from transport preflight, not parent cwd; Wolfpack preflight maps `wolfpack session status <target> --json` structured output.
 - 2026-07-24: verified with `bun test` (31 pass) and `bun run typecheck`.
 
 ## goal
@@ -75,7 +76,7 @@ Checks are composed from protocol-level facts and optional transport facts:
 5. target is reachable/alive if the transport supports liveness
 6. transport-specific readiness passes
 
-If required preflight fails, `agent_task_send` returns a rejected preflight result without delivering assignment text. V1 creates a durable terminal `rejected` task record with `error.code = "preflight_failed"`, saved preflight checks, and no `assignmentRef`.
+If required preflight fails, `agent_task_send` returns a rejected preflight result without delivering assignment text. V1 returns an ephemeral rejected tool result for non-idempotent sends. When `idempotencyKey` is supplied, V1 creates or reuses a durable terminal `rejected` task record with `error.code = "preflight_failed"`, saved preflight checks, and no `assignmentRef`.
 
 ### protocol shape
 
@@ -291,7 +292,7 @@ agent_task_send
 1. [x] add protocol/store tests for metadata + context refs + compact result validation helpers
 2. [x] add optional `TaskTransport.preflightTarget` with fake transport tests
 3. [x] add automatic preflight inside `agent_task_send`
-4. [ ] add Wolfpack transport preflight adapter once Wolfpack exposes stable JSON facts
+4. [x] add Wolfpack transport preflight adapter once Wolfpack exposes stable JSON facts
 5. [ ] add task board compact summaries (post-v1)
 6. [ ] add postmortem report generator (post-v1)
 7. [x] update README and delegation skill
@@ -303,7 +304,10 @@ agent_task_send
 - [x] store tests for metadata persistence and idempotency
 - [x] protocol tests for assignment envelope compatibility
 - [x] extension tests for `agent_task_send` preflight rejection without dispatch
+- [x] extension tests for ephemeral vs idempotent durable preflight rejection
 - [x] fake transport tests for liveness unavailable vs failed
+- [x] fake transport tests for required target project matching from transport facts
+- [x] Wolfpack transport preflight mapping tests
 - [x] result validation tests for compact structured payloads
 - [ ] postmortem fixture tests over recorded task directories (post-v1)
 - [x] `bun test`
@@ -311,7 +315,7 @@ agent_task_send
 
 ## decisions
 
-1. pure preflight failure creates a durable rejected task record for created/idempotent cases, with `error.code = "preflight_failed"` and no `assignmentRef`.
+1. pure preflight failure is ephemeral unless `idempotencyKey` is supplied; idempotent preflight failure creates/reuses a durable rejected task record with `error.code = "preflight_failed"` and no `assignmentRef`.
 2. `contextRefs.selector` is opaque in this implementation; preflight validates project-local path readability only.
 3. `requiredModel` is exact string only, but active target model inspection is deferred until Pi exposes it; current check reports `unavailable`.
 4. verification evidence is collected manually through `agent_task_done.result.verification`.

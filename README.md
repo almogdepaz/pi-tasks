@@ -390,10 +390,18 @@ wolfpack session send <target-session> <assignment>
 ```
 
 It does not own storage. The default exported extension uses the generic
-filesystem store at `.pi/tasks/` plus the included Wolfpack transport. Until
-Wolfpack exposes stable target preflight JSON, its liveness check is reported as
-`unavailable` unless the caller explicitly sets `preflight.requireReachable`, in
-which case dispatch is rejected before assignment delivery.
+filesystem store at `.pi/tasks/` plus the included Wolfpack transport. Preflight
+uses structured Wolfpack status only:
+
+```bash
+wolfpack session status <target-session> --json
+```
+
+Alive sessions map to a passed `transport_reachable` check. Structured 404, 409,
+and 410 status results fail reachability; 503 and invalid JSON are reported as
+unavailable. If `preflight.requiredProjectDir` is supplied, the returned target
+`projectDir` is compared with resolved paths. Terminal output/prose is never used
+as the source of truth.
 
 If you are using Wolfpack, install this extension in every participating Pi
 session and target a session name/id with `agent_task_send`.
@@ -455,10 +463,13 @@ Terminal completion is first-writer-wins.
 - required `contextRefs` must be project-local and readable
 - `requiredModel` and `requireIdle` currently report `unavailable` because Pi does not expose target facts yet
 - transports may implement `preflightTarget`; otherwise liveness is `unavailable`, or `failed` when `preflight.requireReachable` is true
+- `preflight.requiredProjectDir` checks target project facts returned by transport preflight, not the parent cwd
 
-Failed preflight creates a durable terminal `rejected` task with
-`error.code = "preflight_failed"`, `preflight` checks saved on `task.json`, and no
-`assignmentRef`; assignment text is not delivered.
+Failed preflight without `idempotencyKey` returns an ephemeral rejected tool
+result: no task directory is created and assignment text is not delivered. Failed
+preflight with `idempotencyKey` creates or reuses a durable terminal `rejected`
+task with `error.code = "preflight_failed"`, saved `preflight` checks, no
+`assignmentRef`, and no delivered assignment text.
 
 `contextRefs.selector` is stored and sent as opaque metadata in v1. The sender
 validates only path containment/readability, not line ranges, headings, or JSON
@@ -499,8 +510,9 @@ Filesystem layout for dispatched tasks:
 └── result.json
 ```
 
-Preflight-rejected tasks omit `assignment.json` and have `assignmentRef:
-undefined` because no assignment was delivered.
+Durable idempotent preflight-rejected tasks omit `assignment.json` and have
+`assignmentRef: undefined` because no assignment was delivered. Non-idempotent
+preflight failures are ephemeral and create no task directory.
 
 Generic filesystem storage defaults to `.pi/tasks/` when used directly.
 
@@ -576,6 +588,6 @@ bun run typecheck
 - no built-in HTTP/Redis transport yet
 - no runtime transport selector yet; compose a store/transport in an extension
 - default extension uses the generic filesystem store plus the included Wolfpack transport
-- Wolfpack transport liveness preflight is unavailable until Wolfpack exposes stable target facts
+- Wolfpack preflight depends on the structured `wolfpack session status <target> --json` contract
 - task board and postmortem metrics are postponed post-v1
 - local development install is `pi install /Users/home/Dev/wolfpack-pi-tasks`; published releases can use `pi install npm:@sgtbeatdown/pi-tasks`

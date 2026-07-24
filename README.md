@@ -529,6 +529,36 @@ preflight failures are ephemeral and create no task directory.
 
 Generic filesystem storage defaults to `.pi/tasks/` when used directly.
 
+## postmortem metrics
+
+Analyze an existing filesystem task-store root without reading terminal output:
+
+```bash
+bun run task-metrics /path/to/project/.pi/tasks
+```
+
+The command prints a deterministic JSON report. The production API is also
+available directly:
+
+```ts
+import { analyzeTaskStoreMetrics } from "@sgtbeatdown/pi-tasks/src/metrics";
+
+const report = await analyzeTaskStoreMetrics("/path/to/project/.pi/tasks");
+```
+
+The report includes status counts; durable preflight rejections; failed and
+unavailable preflight checks by check name; grouping counts for `phaseId`,
+`issueId`, and `rootCause`; and `loopsPerIssueId` as the raw task count for each
+issue. Character totals measure `taskText`, parsed `assignment.json` values,
+object-form `instructions`, result summaries, and compact `JSON.stringify` sizes
+for the value under `result.result`. A largest-first prompt/result list is capped
+at 10 entries; each result size is its summary plus serialized structured payload.
+
+Verification counts come **only** from structured
+`result.result.verification[]` entries. The report does not infer verification
+truth from task/result prose. Missing or malformed artifacts produce structured
+`diagnostics` and do not stop analysis of other valid task directories.
+
 ## architecture
 
 `pi-tasks` separates storage from delivery:
@@ -584,6 +614,8 @@ registerAgentTaskTools(pi, {
   - `validateStructuredTaskResult`
 - `src/preflight.ts`
   - `runTaskPreflight`
+- `src/metrics.ts`
+  - `analyzeTaskStoreMetrics`
 - `src/store.ts`
   - low-level filesystem store functions, if you need finer control than
     `createFilesystemTaskStore`
@@ -602,5 +634,5 @@ bun run typecheck
 - no runtime transport selector yet; compose a store/transport in an extension
 - default extension uses the generic filesystem store plus the included Wolfpack transport
 - Wolfpack preflight depends on the structured `wolfpack session status <target> --json` contract
-- task board and postmortem metrics are postponed post-v1
+- task board/issue-state output is postponed; postmortem metrics expose reusable raw grouping counts
 - local development install is `pi install /Users/home/Dev/wolfpack-pi-tasks`; published releases can use `pi install npm:@sgtbeatdown/pi-tasks`

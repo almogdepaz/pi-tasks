@@ -23,13 +23,15 @@ describe("package skill wiring", () => {
 		expect(packageJson.files).toContain("skills");
 	});
 
-	test("package exposes extension and skill resources", async () => {
+	test("package exposes extension, skill resources, and metrics CLI", async () => {
 		const packageJson = JSON.parse(await readFile(packageJsonPath, "utf8")) as {
 			readonly pi?: { readonly extensions?: readonly string[]; readonly skills?: readonly string[] };
+			readonly scripts?: Record<string, string>;
 		};
 
 		expect(packageJson.pi?.extensions).toContain("./src/extension.ts");
 		expect(packageJson.pi?.skills).toContain("./skills");
+		expect(packageJson.scripts?.["task-metrics"]).toBe("bun src/metrics-cli.ts");
 	});
 
 	test("pi core packages are peers instead of bundled runtime dependencies", async () => {

@@ -46,6 +46,7 @@
   },
   "scripts": {
     "test": "bun test",
+    "task-metrics": "bun src/metrics-cli.ts",
     "typecheck": "tsc --noEmit"
   },
   "type": "module"

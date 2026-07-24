@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { buildBackgroundTaskNotificationPrompt, selectUnpromptedTerminalTasks } from "../src/auto-notify";
 import type { AgentTaskRecord } from "../src/types";
 
-function task(id: string, summary = "done"): AgentTaskRecord {
+function task(id: string, summary = "done", onCompletePrompt?: string): AgentTaskRecord {
 	return {
 		schemaVersion: 1,
 		id,
@@ -24,6 +24,10 @@ function task(id: string, summary = "done"): AgentTaskRecord {
 		resultRef: `file://.pi/tasks/${id}/result.json`,
 		parentAckAt: undefined,
 		targetTaskProtocol: "pi.agentTask.v1",
+		onCompletePrompt,
+		metadata: undefined,
+		contextRefs: undefined,
+		preflight: undefined,
 		error: undefined,
 	};
 }
@@ -46,5 +50,15 @@ describe("background task auto notification", () => {
 		expect(prompt).toContain("task_one");
 		expect(prompt).toContain("task_two");
 		expect(prompt).toContain("do not call agent_task_wait");
+	});
+
+	test("includes sender-defined parent follow-up prompts in idle notifications", () => {
+		const prompt = buildBackgroundTaskNotificationPrompt([
+			task("task_impl", "implementation", "review the subagent's diff before reporting completion"),
+		]);
+
+		expect(prompt).toContain("sender-defined follow-up prompts");
+		expect(prompt).toContain("task_impl");
+		expect(prompt).toContain("review the subagent's diff before reporting completion");
 	});
 });

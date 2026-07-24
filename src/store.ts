@@ -6,10 +6,12 @@ import {
 	DEFAULT_TIMEOUT_MS,
 	MAX_TIMEOUT_MS,
 	MIN_TIMEOUT_MS,
+	ON_COMPLETE_PROMPT_MAX_CHARS,
 	PROGRESS_MAX_CHARS,
 	SUMMARY_MAX_CHARS,
 	type AgentTaskRecord,
 	type CreateDispatchedTaskInput,
+	type CreateRejectedTaskInput,
 	type ListInboxOptions,
 	type StoredTaskResult,
 	type TaskError,
@@ -36,6 +38,11 @@ const LOCK_TIMEOUT_MS = 5000;
 const TERMINAL_STATUSES = new Set<TaskStatus>(["completed", "failed", "cancelled", "timed_out", "rejected"]);
 
 export interface CreateOrReuseDispatchedTaskResult {
+	readonly task: AgentTaskRecord;
+	readonly created: boolean;
+}
+
+export interface CreateOrReuseRejectedTaskResult {
 	readonly task: AgentTaskRecord;
 	readonly created: boolean;
 }
@@ -76,6 +83,10 @@ function inputLocation(input: CreateDispatchedTaskInput): TaskStoreScope {
 	return { projectDir: input.projectDir, tasksDir: input.tasksDir };
 }
 
+function rejectedInputLocation(input: CreateRejectedTaskInput): TaskStoreScope {
+	return { projectDir: input.projectDir, tasksDir: input.tasksDir };
+}
+
 export async function createOrReuseDispatchedTask(input: CreateDispatchedTaskInput): Promise<CreateOrReuseDispatchedTaskResult> {
 	const idempotencyKey = input.idempotencyKey;
 	if (!idempotencyKey) {
@@ -89,6 +100,22 @@ export async function createOrReuseDispatchedTask(input: CreateDispatchedTaskInp
 			return { task: existing, created: false };
 		}
 		return { task: await createDispatchedTask(input), created: true };
+	});
+}
+
+export async function createOrReusePreflightRejectedTask(input: CreateRejectedTaskInput): Promise<CreateOrReuseRejectedTaskResult> {
+	const idempotencyKey = input.idempotencyKey;
+	if (!idempotencyKey) {
+		return { task: await createPreflightRejectedTask(input), created: true };
+	}
+
+	const location = rejectedInputLocation(input);
+	return withIdempotencyLock(location, input.parentSession, idempotencyKey, async () => {
+		const existing = await findTaskByIdempotencyKey(location, input.parentSession, idempotencyKey);
+		if (existing) {
+			return { task: existing, created: false };
+		}
+		return { task: await createPreflightRejectedTask(input), created: true };
 	});
 }
 
@@ -124,12 +151,72 @@ export async function createDispatchedTask(input: CreateDispatchedTaskInput): Pr
 		resultRef: undefined,
 		parentAckAt: undefined,
 		targetTaskProtocol: input.targetTaskProtocol,
+		onCompletePrompt: input.onCompletePrompt
+			? limitString(input.onCompletePrompt, ON_COMPLETE_PROMPT_MAX_CHARS, "onCompletePrompt")
+			: undefined,
+		metadata: input.metadata,
+		contextRefs: input.contextRefs,
+		preflight: input.preflight,
 		error: undefined,
 	};
 
 	await writeJsonAtomic(join(dir, "task.json"), task);
 	await appendTaskEvent(location, id, "task.created", "store", { parentSession: input.parentSession });
 	await appendTaskEvent(location, id, "task.dispatched", "store", { targetSession: input.targetSession });
+	return task;
+}
+
+export async function createPreflightRejectedTask(input: CreateRejectedTaskInput): Promise<AgentTaskRecord> {
+	const timeoutMs = normalizeTimeoutMs(input.timeoutMs);
+	const id = `task_${randomUUID().replace(/-/g, "")}`;
+	const now = new Date().toISOString();
+	const timeoutAt = new Date(Date.parse(now) + timeoutMs).toISOString();
+	const location = rejectedInputLocation(input);
+	const dir = getTaskDir(location, id);
+	await mkdir(dir, { recursive: true });
+
+	const result: StoredTaskResult = {
+		schemaVersion: 1,
+		taskId: id,
+		status: "rejected",
+		completedAt: now,
+		summary: limitString(input.summary, SUMMARY_MAX_CHARS, "summary"),
+		error: input.error,
+	};
+	await writeJsonAtomic(join(dir, "result.json"), result);
+
+	const task: AgentTaskRecord = {
+		schemaVersion: 1,
+		id,
+		projectDir: input.projectDir,
+		parentSession: input.parentSession,
+		targetSession: input.targetSession,
+		taskText: input.taskText,
+		status: "rejected",
+		createdAt: now,
+		updatedAt: now,
+		dispatchedAt: undefined,
+		runningAt: undefined,
+		completedAt: now,
+		timeoutAt,
+		timeoutMs,
+		idempotencyKey: input.idempotencyKey,
+		assignmentRef: undefined,
+		resultRef: taskRef(location, id, "result.json"),
+		parentAckAt: undefined,
+		targetTaskProtocol: input.targetTaskProtocol,
+		onCompletePrompt: input.onCompletePrompt
+			? limitString(input.onCompletePrompt, ON_COMPLETE_PROMPT_MAX_CHARS, "onCompletePrompt")
+			: undefined,
+		metadata: input.metadata,
+		contextRefs: input.contextRefs,
+		preflight: input.preflight,
+		error: input.error,
+	};
+
+	await writeJsonAtomic(join(dir, "task.json"), task);
+	await appendTaskEvent(location, id, "task.created", "store", { parentSession: input.parentSession });
+	await appendTaskEvent(location, id, "task.rejected", "store", { summary: result.summary, error: input.error });
 	return task;
 }
 
@@ -238,6 +325,33 @@ export async function listInbox(
 	}
 
 	return tasks.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
+}
+
+export async function findActiveTaskByIssueId(
+	location: TaskStoreLocation,
+	targetSession: string,
+	issueId: string,
+): Promise<AgentTaskRecord | undefined> {
+	const root = getTasksRoot(location);
+	let entries: string[];
+	try {
+		entries = await readdir(root);
+	} catch {
+		return undefined;
+	}
+
+	for (const entry of entries) {
+		if (!entry.startsWith("task_")) continue;
+		try {
+			const task = await expireTaskIfOverdue(location, entry);
+			if (task.targetSession === targetSession && task.metadata?.issueId === issueId && !isTerminalStatus(task.status)) {
+				return task;
+			}
+		} catch {
+			// Ignore partial/corrupt task directories; direct status reads surface errors.
+		}
+	}
+	return undefined;
 }
 
 export async function waitForTask(

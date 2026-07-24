@@ -75,15 +75,22 @@ protocol once the agents exist.
 
 ## install
 
-Install locally into Pi:
+Install the current local checkout during development:
+
+```bash
+pi install /Users/home/Dev/wolfpack-pi-tasks
+```
+
+Install from npm when using a published release:
 
 ```bash
 pi install npm:@sgtbeatdown/pi-tasks
 ```
 
-Temporary one-off run:
+Temporary one-off run from a local checkout or npm package:
 
 ```bash
+pi -e /Users/home/Dev/wolfpack-pi-tasks
 pi -e npm:@sgtbeatdown/pi-tasks
 ```
 
@@ -133,13 +140,27 @@ Then call `agent_task_send` from the parent session:
 {
   "to": "worker-a",
   "task": "inspect the auth middleware and report risks",
-  "timeoutMs": 1800000
+  "metadata": {
+    "phaseId": "phase-1",
+    "issueId": "auth-boundary",
+    "role": "reviewer",
+    "verificationTier": "focused"
+  },
+  "contextRefs": [
+    { "path": ".plans/current.md", "selector": "L10-L40", "required": true, "purpose": "scope" }
+  ],
+  "preflight": { "requireReachable": false },
+  "timeoutMs": 1800000,
+  "onCompletePrompt": "review the worker's findings before reporting back to the user"
 }
 ```
 
-The parent should keep working and later use `agent_task_status`,
-`agent_task_wait`, or `agent_task_inbox`. Do **not** infer completion from
-terminal output.
+The parent should keep working. When the task reaches a terminal state, the
+extension updates the inbox status and, at an idle/no-pending-message boundary,
+injects a reminder to call `agent_task_inbox({ ack: true })`. If
+`onCompletePrompt` was set, that sender-defined parent-side reminder is included
+in the idle notification and compact inbox/status result. Do **not** infer
+completion from terminal output.
 
 ## tmux recipe: already-open pi agents
 
@@ -242,6 +263,8 @@ From the parent Pi session, call:
 {
   "to": "%12",
   "task": "inspect the auth middleware and report risks",
+  "metadata": { "issueId": "auth-review", "role": "reviewer", "verificationTier": "focused" },
+  "contextRefs": [{ "path": ".plans/current.md", "required": false, "purpose": "scope" }],
   "timeoutMs": 1800000
 }
 ```
@@ -367,7 +390,10 @@ wolfpack session send <target-session> <assignment>
 ```
 
 It does not own storage. The default exported extension uses the generic
-filesystem store at `.pi/tasks/` plus the included Wolfpack transport.
+filesystem store at `.pi/tasks/` plus the included Wolfpack transport. Until
+Wolfpack exposes stable target preflight JSON, its liveness check is reported as
+`unavailable` unless the caller explicitly sets `preflight.requireReachable`, in
+which case dispatch is rejected before assignment delivery.
 
 If you are using Wolfpack, install this extension in every participating Pi
 session and target a session name/id with `agent_task_send`.
@@ -379,10 +405,10 @@ transport }` composition.
 
 | tool | purpose |
 | --- | --- |
-| `agent_task_send` | create a task and dispatch it through the configured transport |
-| `agent_task_status` | read compact structured status for one task |
-| `agent_task_wait` | wait in tool code for a terminal result when the user wants it now |
-| `agent_task_inbox` | list terminal tasks for the current parent session |
+| `agent_task_send` | preflight, create, and dispatch a task through the configured transport; optionally set workflow `metadata`, `contextRefs`, `preflight`, and `onCompletePrompt` |
+| `agent_task_status` | read compact structured status for one task, including any sender-defined `onCompletePrompt` |
+| `agent_task_wait` | wait in tool code for a terminal result when the user explicitly wants it now |
+| `agent_task_inbox` | list terminal tasks for the current parent session, including any sender-defined `onCompletePrompt` |
 | `agent_task_cancel` | cancel a non-terminal task |
 | `agent_task_done` | assignee-side structured completion; terminates the target response |
 
@@ -396,7 +422,13 @@ Assigned Pi agents must call `agent_task_done` as their final action:
   "status": "completed",
   "summary": "inspected auth middleware; no bypass found",
   "result": {
-    "filesReviewed": ["src/auth.ts"]
+    "issueId": "auth-boundary",
+    "verdict": "completed",
+    "changedFiles": [],
+    "verification": [
+      { "command": "bun test tests/auth.test.ts", "status": "passed", "exitCode": 0, "summary": "focused auth tests" }
+    ],
+    "next": "ready for parent review"
   }
 }
 ```
@@ -414,6 +446,24 @@ Valid terminal statuses:
 
 Terminal completion is first-writer-wins.
 
+### preflight and workflow fields
+
+`agent_task_send` runs protocol/store preflight before assignment delivery:
+
+- empty target strings fail immediately
+- `metadata.issueId` blocks duplicate active tasks for the same target + issue
+- required `contextRefs` must be project-local and readable
+- `requiredModel` and `requireIdle` currently report `unavailable` because Pi does not expose target facts yet
+- transports may implement `preflightTarget`; otherwise liveness is `unavailable`, or `failed` when `preflight.requireReachable` is true
+
+Failed preflight creates a durable terminal `rejected` task with
+`error.code = "preflight_failed"`, `preflight` checks saved on `task.json`, and no
+`assignmentRef`; assignment text is not delivered.
+
+`contextRefs.selector` is stored and sent as opaque metadata in v1. The sender
+validates only path containment/readability, not line ranges, headings, or JSON
+pointers.
+
 ## task protocol
 
 Assignments are delivered as human-readable text plus a structured envelope with:
@@ -422,6 +472,8 @@ Assignments are delivered as human-readable text plus a structured envelope with
 - `taskId`
 - `fromSession`
 - `instructions`
+- optional workflow `metadata`
+- optional bounded `contextRefs` that the assignee can read explicitly
 - protocol requirements telling the assignee to use `agent_task_done`
 
 Task state includes:
@@ -432,9 +484,12 @@ Task state includes:
 - terminal status
 - assignment/result refs
 - event history
+- optional preflight checks/result
+- optional workflow metadata and context refs
+- optional sender-defined `onCompletePrompt` for parent follow-up
 - optional result payload/artifacts/error
 
-Filesystem layout:
+Filesystem layout for dispatched tasks:
 
 ```text
 <tasksDir>/<taskId>/
@@ -443,6 +498,9 @@ Filesystem layout:
 ├── events.jsonl
 └── result.json
 ```
+
+Preflight-rejected tasks omit `assignment.json` and have `assignmentRef:
+undefined` because no assignment was delivered.
 
 Generic filesystem storage defaults to `.pi/tasks/` when used directly.
 
@@ -453,11 +511,13 @@ Generic filesystem storage defaults to `.pi/tasks/` when used directly.
 ```ts
 interface TaskStore {
   createOrReuseDispatchedTask(...): Promise<...>;
+  createOrReusePreflightRejectedTask(...): Promise<...>;
   readTask(...): Promise<...>;
   readTaskResult(...): Promise<...>;
   expireTaskIfOverdue(...): Promise<...>;
   waitForTask(...): Promise<...>;
   listInbox(...): Promise<...>;
+  findActiveTaskByIssueId(...): Promise<...>;
   ackTask(...): Promise<...>;
   cancelTask(...): Promise<...>;
   completeTask(...): Promise<...>;
@@ -465,6 +525,7 @@ interface TaskStore {
 
 interface TaskTransport {
   getCurrentSessionName(env): string;
+  preflightTarget?(input): Promise<TaskPreflightResult>;
   dispatchTask(input): Promise<DispatchTaskResult>;
 }
 ```
@@ -487,6 +548,7 @@ registerAgentTaskTools(pi, {
   - `TaskStore`
   - `TaskTransport`
   - `TaskCommunicationLayer`
+  - `PreflightTargetInput`
 - `src/stores/filesystem.ts`
   - `createFilesystemTaskStore`
 - `src/transports/wolfpack.ts`
@@ -494,6 +556,9 @@ registerAgentTaskTools(pi, {
 - `src/protocol.ts`
   - `buildAssignment`
   - `compactTaskResult`
+  - `validateStructuredTaskResult`
+- `src/preflight.ts`
+  - `runTaskPreflight`
 - `src/store.ts`
   - low-level filesystem store functions, if you need finer control than
     `createFilesystemTaskStore`
@@ -511,4 +576,6 @@ bun run typecheck
 - no built-in HTTP/Redis transport yet
 - no runtime transport selector yet; compose a store/transport in an extension
 - default extension uses the generic filesystem store plus the included Wolfpack transport
-- package is source-first; install with `pi install npm:@sgtbeatdown/pi-tasks`
+- Wolfpack transport liveness preflight is unavailable until Wolfpack exposes stable target facts
+- task board and postmortem metrics are postponed post-v1
+- local development install is `pi install /Users/home/Dev/wolfpack-pi-tasks`; published releases can use `pi install npm:@sgtbeatdown/pi-tasks`

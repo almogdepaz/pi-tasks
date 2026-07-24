@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -43,6 +43,43 @@ describe("task store", () => {
 		expect(saved.parentSession).toBe("parent");
 		expect(saved.targetSession).toBe("worker");
 		expect(saved.assignmentRef).toBe(`file://.pi/tasks/${task.id}/assignment.json`);
+	});
+
+	test("persists workflow metadata and context refs outside task text", async () => {
+		const task = await createDispatchedTask({
+			projectDir,
+			parentSession: "parent",
+			targetSession: "worker",
+			taskText: "inspect auth",
+			assignment: { taskId: "placeholder", instructions: "inspect auth" },
+			timeoutMs: 30_000,
+			metadata: { phaseId: "phase-1", issueId: "auth-boundary", role: "reviewer", verificationTier: "focused" },
+			contextRefs: [{ path: ".plans/current.md", selector: "L10-L20", required: true, purpose: "scope" }],
+		});
+
+		const saved = await readTask(projectDir, task.id);
+
+		expect(saved.taskText).toBe("inspect auth");
+		expect(saved.metadata).toEqual({ phaseId: "phase-1", issueId: "auth-boundary", role: "reviewer", verificationTier: "focused" });
+		expect(saved.contextRefs).toEqual([{ path: ".plans/current.md", selector: "L10-L20", required: true, purpose: "scope" }]);
+	});
+
+	test("persists sender-defined parent follow-up prompt without changing assignment text", async () => {
+		const task = await createDispatchedTask({
+			projectDir,
+			parentSession: "parent",
+			targetSession: "worker",
+			taskText: "implement feature",
+			assignment: { taskId: "placeholder", instructions: "implement feature" },
+			timeoutMs: 30_000,
+			onCompletePrompt: "review the worker diff before reporting completion",
+		});
+
+		const saved = await readTask(projectDir, task.id);
+		const assignmentText = await readFile(join(projectDir, ".pi/tasks", task.id, "assignment.json"), "utf8");
+
+		expect(saved.onCompletePrompt).toBe("review the worker diff before reporting completion");
+		expect(assignmentText).not.toContain("review the worker diff");
 	});
 
 	test("reuses idempotent dispatched tasks instead of creating duplicates", async () => {

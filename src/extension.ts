@@ -8,15 +8,47 @@ import type { TaskCommunicationLayer } from "./task-communication";
 import { createFilesystemTaskStore } from "./stores/filesystem";
 import { createWolfpackTaskTransport } from "./transports/wolfpack";
 import { buildAssignment, compactTaskResult } from "./protocol";
+import { runTaskPreflight } from "./preflight";
 import type { AgentTaskRecord, TaskResultPayload, TerminalTaskStatus } from "./types";
-import { DEFAULT_TIMEOUT_MS, TASK_PROTOCOL_VERSION } from "./types";
+import { DEFAULT_TIMEOUT_MS, ON_COMPLETE_PROMPT_MAX_CHARS, TASK_PROTOCOL_VERSION } from "./types";
 
 const WAIT_POLL_MS = 250;
 const BACKGROUND_POLL_MS = 5000;
 
+const WorkflowMetadataParams = Type.Object({
+	phaseId: Type.Optional(Type.String()),
+	issueId: Type.Optional(Type.String()),
+	role: Type.Optional(Type.String()),
+	verificationTier: Type.Optional(Type.String()),
+	rootCause: Type.Optional(Type.String()),
+});
+
+const ContextRefParams = Type.Object({
+	path: Type.String(),
+	selector: Type.Optional(Type.String()),
+	required: Type.Optional(Type.Boolean()),
+	purpose: Type.Optional(Type.String()),
+});
+
+const PreflightParams = Type.Object({
+	requiredProjectDir: Type.Optional(Type.String()),
+	requiredModel: Type.Optional(Type.String()),
+	requireIdle: Type.Optional(Type.Boolean()),
+	requireReachable: Type.Optional(Type.Boolean()),
+});
+
 const SendParams = Type.Object({
 	to: Type.String({ description: "Target session, worker, or transport-specific address" }),
 	task: Type.String({ description: "Task instructions to send to the target" }),
+	metadata: Type.Optional(WorkflowMetadataParams),
+	contextRefs: Type.Optional(Type.Array(ContextRefParams)),
+	preflight: Type.Optional(PreflightParams),
+	onCompletePrompt: Type.Optional(
+		Type.String({
+			description: "Parent-side prompt to inject when this task completes and the parent chat is idle",
+			maxLength: ON_COMPLETE_PROMPT_MAX_CHARS,
+		}),
+	),
 	timeoutMs: Type.Optional(Type.Integer({ minimum: 1000, maximum: 86_400_000 })),
 	idempotencyKey: Type.Optional(Type.String()),
 });
@@ -51,7 +83,11 @@ const DoneParams = Type.Object({
 			retryable: Type.Boolean(),
 		}),
 	),
-	result: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+	result: Type.Optional(
+		Type.Record(Type.String(), Type.Unknown(), {
+			description: "Optional compact structured payload: issueId, verdict, changedFiles, verification, blockers, risks, next",
+		}),
+	),
 	artifacts: Type.Optional(
 		Type.Array(
 			Type.Object({
@@ -142,27 +178,74 @@ export function registerAgentTaskTools(pi: ExtensionAPI, communication: TaskComm
 		promptGuidelines: [
 			"Use agent_task_send instead of natural-language polling when delegating work to another agent/session/worker",
 			"After agent_task_send returns, keep working unless the user explicitly asks to wait for the task.",
+			"Set onCompletePrompt when the parent should do specific follow-up after the task result arrives, such as reviewing implementation work.",
 		],
 		parameters: SendParams,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const parentSession = transport.getCurrentSessionName(process.env);
+			const preflight = await runTaskPreflight({
+				projectDir: ctx.cwd,
+				parentSession,
+				target: params.to,
+				store,
+				transport,
+				requirements: params.preflight,
+				metadata: params.metadata,
+				contextRefs: params.contextRefs,
+				signal,
+			});
+			if (!preflight.ok) {
+				const rejected = await store.createOrReusePreflightRejectedTask({
+					projectDir: ctx.cwd,
+					parentSession,
+					targetSession: params.to,
+					taskText: params.task,
+					timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+					idempotencyKey: params.idempotencyKey,
+					targetTaskProtocol: TASK_PROTOCOL_VERSION,
+					onCompletePrompt: params.onCompletePrompt,
+					metadata: params.metadata,
+					contextRefs: params.contextRefs,
+					preflight,
+					summary: "preflight failed",
+					error: { code: "preflight_failed", message: summarizePreflightFailure(preflight), retryable: true },
+				});
+				return taskToolResult(compactTaskResult(rejected.task, await store.readTaskResult(ctx.cwd, rejected.task.id)));
+			}
 
 			const createdTask = await store.createOrReuseDispatchedTask({
 				projectDir: ctx.cwd,
 				parentSession,
 				targetSession: params.to,
 				taskText: params.task,
-				assignment: (taskId: string) => buildAssignment({ taskId, fromSession: parentSession, instructions: params.task }),
+				assignment: (taskId: string) =>
+					buildAssignment({
+						taskId,
+						fromSession: parentSession,
+						instructions: params.task,
+						metadata: params.metadata,
+						contextRefs: params.contextRefs,
+					}),
 				timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
 				idempotencyKey: params.idempotencyKey,
 				targetTaskProtocol: TASK_PROTOCOL_VERSION,
+				onCompletePrompt: params.onCompletePrompt,
+				metadata: params.metadata,
+				contextRefs: params.contextRefs,
+				preflight,
 			});
 			const task = createdTask.task;
 			if (!createdTask.created) {
 				return taskToolResult(compactTaskResult(task, await store.readTaskResult(ctx.cwd, task.id)));
 			}
 
-			const assignment = buildAssignment({ taskId: task.id, fromSession: parentSession, instructions: params.task });
+			const assignment = buildAssignment({
+				taskId: task.id,
+				fromSession: parentSession,
+				instructions: params.task,
+				metadata: params.metadata,
+				contextRefs: params.contextRefs,
+			});
 			const dispatch = await transport.dispatchTask({ projectDir: ctx.cwd, task, target: params.to, assignment, signal });
 			if (!dispatch.ok) {
 				const rejected = await store.completeTask(ctx.cwd, task.id, "rejected", {
@@ -290,6 +373,13 @@ export function registerAgentTaskTools(pi: ExtensionAPI, communication: TaskComm
 
 export default function piTasks(pi: ExtensionAPI): void {
 	registerAgentTaskTools(pi, createDefaultTaskCommunicationLayer(pi));
+}
+
+function summarizePreflightFailure(preflight: { readonly checks: readonly { readonly name: string; readonly status: string; readonly message?: string }[] }): string {
+	return preflight.checks
+		.filter((check) => check.status === "failed")
+		.map((check) => `${check.name}: ${check.message ?? "failed"}`)
+		.join("; ") || "preflight failed";
 }
 
 function taskToolResult(details: unknown): AgentToolResult<unknown> {

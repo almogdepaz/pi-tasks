@@ -35,9 +35,21 @@ visible and steerable, but treat task state/results as the protocol.
 
 3. Send the real work with `agent_task_send` to the selected/spawned session.
    The task text should be the user’s requested work, not the bootstrap prompt.
+   For non-trivial work, include structured `metadata` (`phaseId`, `issueId`,
+   `role`, `verificationTier`, and `rootCause` when known) instead of encoding
+   these fields in prose. Use `contextRefs` for existing plan/issue/verification
+   files instead of copying long context into `task`. If readiness matters, set
+   `preflight`; note that Wolfpack liveness is unavailable until its transport
+   exposes stable preflight JSON, and `requireReachable: true` may reject before
+   delivery. If the parent must do something specific when the result arrives,
+   set `onCompletePrompt` with that parent-side follow-up. Example: “review the
+   worker’s implementation diff before reporting completion.” Do not put
+   parent-review instructions in the worker task unless the worker must do them.
 
 4. Return immediately with the task id and target session unless the user asked
-   to wait. Continue local work if there is other useful work to do.
+   to wait. Continue local work if there is other useful work to do. When the
+   task finishes, the idle inbox notification will remind the parent of any
+   sender-defined `onCompletePrompt`.
 
 5. Use structured task tools for follow-up:
    - `agent_task_status` for one task
@@ -45,9 +57,12 @@ visible and steerable, but treat task state/results as the protocol.
    - `agent_task_inbox` to check completed delegated work
    - `agent_task_cancel` to cancel non-terminal tasks
 
-6. In target sessions, finish assigned tasks with `agent_task_done`. After
-   `agent_task_done`, do not send extra prose; the tool result is the completion
-   channel.
+6. In target sessions, finish assigned tasks with `agent_task_done`. Keep the
+   required `summary` compact and put machine-readable details under `result`:
+   `issueId`, `verdict`, `changedFiles`, `verification`, `blockers`, `risks`, and
+   `next` where applicable. Verification evidence is manual for now: include the
+   exact command, status, exit code, and short summary. After `agent_task_done`,
+   do not send extra prose; the tool result is the completion channel.
 
 ## Do Not
 
@@ -55,6 +70,8 @@ visible and steerable, but treat task state/results as the protocol.
 - Do not ask the target to report completion in prose.
 - Do not use `wolfpack session wait` for task completion; it waits for literal
   terminal text and is the wrong protocol for this package.
+- Do not copy whole plan files into task prompts when `contextRefs` can point at
+  the source file.
 - Do not duplicate Wolfpack session-control rules here. If session control is
   ambiguous, consult/use `wolfpack-tailnet-control`.
 
@@ -64,9 +81,15 @@ User: “open a subagent and inspect the auth middleware”
 
 Expected approach:
 1. Spawn a Wolfpack child session with the existing Wolfpack control workflow.
-2. Call `agent_task_send` with the spawned session as `to` and “inspect the auth
-   middleware” as `task`.
-3. Tell the user the task id and that you’ll check structured results later.
+2. Call `agent_task_send` with the spawned session as `to`, “inspect the auth
+   middleware” as `task`, plus `metadata` such as `{ "issueId": "auth-review",
+   "role": "reviewer", "verificationTier": "focused" }`.
+3. Prefer `contextRefs` like `{ "path": ".plans/current.md", "required": true
+   }` over pasted plan text.
+4. If follow-up is needed, set `onCompletePrompt`, e.g. “review the worker’s
+   findings before reporting back.”
+5. Tell the user the task id and that structured results will arrive through the
+   async inbox notification.
 
 User: “check on the subagent”
 

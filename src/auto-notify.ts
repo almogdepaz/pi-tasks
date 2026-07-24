@@ -12,6 +12,9 @@ export function buildBackgroundTaskNotificationPrompt(tasks: readonly AgentTaskR
 		const summary = task.error?.message ?? task.status;
 		return `- ${task.id}: status=${task.status}, target=${task.targetSession}, summary=${summary}`;
 	});
+	const onCompletePromptLines = tasks
+		.filter((task) => Boolean(task.onCompletePrompt))
+		.map((task) => `- ${task.id}: ${task.onCompletePrompt}`);
 
 	return [
 		"background task results are ready for this parent session.",
@@ -20,5 +23,12 @@ export function buildBackgroundTaskNotificationPrompt(tasks: readonly AgentTaskR
 		"do not call agent_task_wait; these tasks already reached a terminal state.",
 		"tasks:",
 		...taskLines,
+		...(onCompletePromptLines.length > 0
+			? [
+					"sender-defined follow-up prompts:",
+					"treat these as parent-side instructions set when the task was dispatched, not worker output.",
+					...onCompletePromptLines,
+				]
+			: []),
 	].join("\n");
 }

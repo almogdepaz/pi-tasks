@@ -5,9 +5,10 @@ import { tmpdir } from "node:os";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { createDefaultTaskCommunicationLayer } from "../src/extension";
+import { createDefaultTaskCommunicationLayer, registerAgentTaskTools } from "../src/extension";
 import { createFilesystemTaskStore } from "../src/stores/filesystem";
 import { createWolfpackTaskTransport, getCurrentWolfpackSessionName } from "../src/transports/wolfpack";
+import type { TaskCommunicationLayer } from "../src/task-communication";
 
 let projectDir: string;
 
@@ -18,6 +19,32 @@ beforeEach(async () => {
 afterEach(async () => {
 	await rm(projectDir, { recursive: true, force: true });
 });
+
+interface RegisteredTool {
+	readonly name: string;
+	readonly execute: (
+		toolCallId: string,
+		params: Record<string, unknown>,
+		signal: AbortSignal,
+		onUpdate: undefined,
+		ctx: { readonly cwd: string },
+	) => Promise<{ readonly details: unknown }>;
+}
+
+function registerToolsForTest(communication: TaskCommunicationLayer): Record<string, RegisteredTool> {
+	const tools: Record<string, RegisteredTool> = {};
+	registerAgentTaskTools(
+		{
+			on: () => undefined,
+			registerTool: (tool: unknown) => {
+				const registered = tool as RegisteredTool;
+				tools[registered.name] = registered;
+			},
+		} as unknown as ExtensionAPI,
+		communication,
+	);
+	return tools;
+}
 
 describe("task store and transport split", () => {
 	test("filesystem store is generic storage without dispatch or identity", async () => {
@@ -69,6 +96,10 @@ describe("task store and transport split", () => {
 				resultRef: undefined,
 				parentAckAt: undefined,
 				targetTaskProtocol: "pi.agentTask.v1",
+				onCompletePrompt: undefined,
+				metadata: undefined,
+				contextRefs: undefined,
+				preflight: undefined,
 				error: undefined,
 			},
 			target: "worker",
@@ -88,6 +119,45 @@ describe("task store and transport split", () => {
 
 		expect(layer.store.tasksDir).toBe(".pi/tasks");
 		expect(layer.transport.name).toBe("wolfpack");
+	});
+
+	test("agent_task_send rejects failed preflight without dispatching assignment text", async () => {
+		let dispatchCount = 0;
+		const store = createFilesystemTaskStore({ tasksDir: ".pi/tasks" });
+		const tools = registerToolsForTest({
+			store,
+			transport: {
+				name: "fake",
+				getCurrentSessionName: () => "parent",
+				preflightTarget: async () => ({
+					ok: false,
+					targetSession: "worker",
+					checks: [{ name: "reachable", status: "failed", source: "transport", message: "dead session" }],
+				}),
+				dispatchTask: async () => {
+					dispatchCount += 1;
+					return { ok: true };
+				},
+			},
+		});
+
+		const send = tools.agent_task_send;
+		if (!send) throw new Error("agent_task_send not registered");
+		const response = await send.execute(
+			"call_1",
+			{ to: "worker", task: "inspect auth", preflight: { requireReachable: true } },
+			new AbortController().signal,
+			undefined,
+			{ cwd: projectDir },
+		);
+		const details = response.details as { readonly taskId: string; readonly status: string; readonly error: { readonly code: string } | null };
+		const task = await store.readTask(projectDir, details.taskId);
+
+		expect(details.status).toBe("rejected");
+		expect(details.error?.code).toBe("preflight_failed");
+		expect(task.assignmentRef).toBeUndefined();
+		expect(task.preflight?.checks).toContainEqual({ name: "reachable", status: "failed", source: "transport", message: "dead session" });
+		expect(dispatchCount).toBe(0);
 	});
 
 	test("wolfpack session identity is transport-specific", () => {

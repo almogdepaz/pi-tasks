@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 const packageJsonPath = new URL("../package.json", import.meta.url);
 const readmePath = new URL("../README.md", import.meta.url);
 const skillPath = new URL("../skills/wolfpack-pi-task-delegation/SKILL.md", import.meta.url);
+const extensionPath = new URL("../src/extension.ts", import.meta.url);
 
 describe("package skill wiring", () => {
 	test("package metadata is publishable as a pi package", async () => {
@@ -71,6 +72,17 @@ describe("package skill wiring", () => {
 		expect(readme).toContain("Do not use cross-repo `agent_task_send` with the filesystem store");
 		expect(readme).toContain("fallback instruction channel, not a task completion protocol");
 		expect(readme).toContain("`summary` at or below 1200 characters");
+	});
+
+	test("delegation guidance prohibits implicit blocking waits", async () => {
+		const skill = await readFile(skillPath, "utf8");
+		const extension = await readFile(extensionPath, "utf8");
+		const readme = await readFile(readmePath, "utf8");
+		const normalized = `${skill}\n${extension}\n${readme}`.replace(/\s+/g, " ");
+
+		expect(normalized).toContain("Do not call `agent_task_wait` after dispatch");
+		expect(normalized).toContain("only when the current user message explicitly asks to block");
+		expect(normalized).toContain("normal delegation requests are fire-and-forget");
 	});
 
 	test("delegation skill enforces token-efficient task boundaries", async () => {

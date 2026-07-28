@@ -177,7 +177,8 @@ export function registerAgentTaskTools(pi: ExtensionAPI, communication: TaskComm
 		promptSnippet: "Send nonblocking structured tasks to other agents/sessions/workers",
 		promptGuidelines: [
 			"Use agent_task_send instead of natural-language polling when delegating work to another agent/session/worker",
-			"After agent_task_send returns, keep working unless the user explicitly asks to wait for the task.",
+			"normal delegation requests are fire-and-forget: after agent_task_send returns, report the task id/target and keep working or stop.",
+			"Do not call `agent_task_wait` after dispatch; use it only when the current user message explicitly asks to block for the result now.",
 			"Set onCompletePrompt when the parent should do specific follow-up after the task result arrives, such as reviewing implementation work.",
 		],
 		parameters: SendParams,
@@ -289,7 +290,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, communication: TaskComm
 	pi.registerTool({
 		name: "agent_task_wait",
 		label: "Wait Agent Task",
-		description: "Wait in tool code for a task to become terminal. Use only when the user wants the result now.",
+		description: "Blocking wait for a task to become terminal. Do not use after normal delegation; use only when the current user message explicitly asks to block for the result now.",
 		parameters: WaitParams,
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
 			const waitMs = params.timeoutMs ?? DEFAULT_TIMEOUT_MS;

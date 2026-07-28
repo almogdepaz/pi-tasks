@@ -156,12 +156,14 @@ Then call `agent_task_send` from the parent session:
 }
 ```
 
-The parent should keep working. When the task reaches a terminal state, the
-extension updates the inbox status and, at an idle/no-pending-message boundary,
-injects a reminder to call `agent_task_inbox({ ack: true })`. If
-`onCompletePrompt` was set, that sender-defined parent-side reminder is included
-in the idle notification and compact inbox/status result. Do **not** infer
-completion from terminal output.
+The parent should keep working. normal delegation requests are fire-and-forget.
+Do not call `agent_task_wait` after dispatch; use it only when the current user
+message explicitly asks to block for the result now. When the task reaches a
+terminal state, the extension updates the inbox status and, at an
+idle/no-pending-message boundary, injects a reminder to call
+`agent_task_inbox({ ack: true })`. If `onCompletePrompt` was set, that
+sender-defined parent-side reminder is included in the idle notification and
+compact inbox/status result. Do **not** infer completion from terminal output.
 
 ## tmux recipe: already-open pi agents
 
@@ -277,8 +279,9 @@ Expected flow:
 3. worker receives `pi.task.assignment.v1`
 4. worker does the work
 5. worker calls `agent_task_done` with that `taskId`
-6. parent reads the result via `agent_task_status`, `agent_task_wait`, or
-   `agent_task_inbox`
+6. parent reads the result later via `agent_task_status` or `agent_task_inbox`;
+   use `agent_task_wait` only when the current user message explicitly asks to
+   block
 
 ### tmux troubleshooting
 
@@ -423,7 +426,7 @@ transport }` composition.
 | --- | --- |
 | `agent_task_send` | preflight, create, and dispatch a task through the configured transport; optionally set workflow `metadata`, `contextRefs`, `preflight`, and `onCompletePrompt` |
 | `agent_task_status` | read compact structured status for one task, including any sender-defined `onCompletePrompt` |
-| `agent_task_wait` | wait in tool code for a terminal result when the user explicitly wants it now |
+| `agent_task_wait` | blocking wait for a terminal result; do not call after dispatch unless the current user message explicitly asks to block |
 | `agent_task_inbox` | list terminal tasks for the current parent session, including any sender-defined `onCompletePrompt` |
 | `agent_task_cancel` | cancel a non-terminal task |
 | `agent_task_done` | assignee-side structured completion; terminates the target response |

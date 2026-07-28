@@ -8,7 +8,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createDefaultTaskCommunicationLayer, registerAgentTaskTools } from "../src/extension";
 import { createFilesystemTaskStore } from "../src/stores/filesystem";
 import { createWolfpackTaskTransport, getCurrentWolfpackSessionName } from "../src/transports/wolfpack";
-import type { TaskCommunicationLayer } from "../src/task-communication";
+import type { DispatchTaskResult, TaskCommunicationLayer, TaskStore } from "../src/task-communication";
 
 let projectDir: string;
 
@@ -44,6 +44,20 @@ function registerToolsForTest(communication: TaskCommunicationLayer): Record<str
 		communication,
 	);
 	return tools;
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForStoredStatus(store: TaskStore, taskId: string, status: string): Promise<void> {
+	for (let attempt = 0; attempt < 20; attempt += 1) {
+		const task = await store.readTask(projectDir, taskId);
+		if (task.status === status) return;
+		await sleep(5);
+	}
+	const task = await store.readTask(projectDir, taskId);
+	throw new Error(`expected ${taskId} to reach ${status}, got ${task.status}`);
 }
 
 describe("task store and transport split", () => {
@@ -163,6 +177,95 @@ describe("task store and transport split", () => {
 		expect(details.preflight.checks).toContainEqual({ name: "reachable", status: "failed", source: "transport", message: "dead session" });
 		await expect(readdir(join(projectDir, ".pi/tasks"))).rejects.toThrow();
 		expect(dispatchCount).toBe(0);
+	});
+
+	test("agent_task_send returns before transport dispatch resolves", async () => {
+		let resolveDispatch!: (result: DispatchTaskResult) => void;
+		let markDispatchStarted!: () => void;
+		const dispatchStarted = new Promise<void>((resolve) => {
+			markDispatchStarted = resolve;
+		});
+		const dispatchGate = new Promise<DispatchTaskResult>((resolve) => {
+			resolveDispatch = resolve;
+		});
+		const store = createFilesystemTaskStore({ tasksDir: ".pi/tasks" });
+		const tools = registerToolsForTest({
+			store,
+			transport: {
+				name: "fake",
+				getCurrentSessionName: () => "parent",
+				dispatchTask: async () => {
+					markDispatchStarted();
+					return dispatchGate;
+				},
+			},
+		});
+
+		const send = tools.agent_task_send;
+		if (!send) throw new Error("agent_task_send not registered");
+		const sendResponse = send.execute(
+			"call_1",
+			{ to: "worker", task: "inspect auth" },
+			new AbortController().signal,
+			undefined,
+			{ cwd: projectDir },
+		);
+		let immediateResponse: Awaited<typeof sendResponse> | undefined;
+		void sendResponse.then((response) => {
+			immediateResponse = response;
+		});
+		await dispatchStarted;
+		await sleep(0);
+
+		if (!immediateResponse) {
+			resolveDispatch({ ok: true });
+			await sendResponse;
+			throw new Error("agent_task_send blocked on transport dispatch");
+		}
+
+		const details = immediateResponse.details as { readonly taskId: string; readonly status: string };
+		expect(details.status).toBe("dispatched");
+		expect((await store.readTask(projectDir, details.taskId)).status).toBe("dispatched");
+		resolveDispatch({ ok: true });
+	});
+
+	test("agent_task_send records background dispatch failures after returning", async () => {
+		let resolveDispatch!: (result: DispatchTaskResult) => void;
+		const dispatchGate = new Promise<DispatchTaskResult>((resolve) => {
+			resolveDispatch = resolve;
+		});
+		const store = createFilesystemTaskStore({ tasksDir: ".pi/tasks" });
+		const tools = registerToolsForTest({
+			store,
+			transport: {
+				name: "fake",
+				getCurrentSessionName: () => "parent",
+				dispatchTask: async () => dispatchGate,
+			},
+		});
+
+		const send = tools.agent_task_send;
+		if (!send) throw new Error("agent_task_send not registered");
+		const response = await send.execute(
+			"call_1",
+			{ to: "worker", task: "inspect auth" },
+			new AbortController().signal,
+			undefined,
+			{ cwd: projectDir },
+		);
+		const details = response.details as { readonly taskId: string; readonly status: string };
+
+		expect(details.status).toBe("dispatched");
+		resolveDispatch({ ok: false, message: "send command failed", retryable: true });
+		await waitForStoredStatus(store, details.taskId, "rejected");
+		expect(await store.readTask(projectDir, details.taskId)).toMatchObject({
+			status: "rejected",
+			error: { code: "dispatch_failed", message: "send command failed", retryable: true },
+		});
+		expect(await store.readTaskResult(projectDir, details.taskId)).toMatchObject({
+			status: "rejected",
+			summary: "dispatch failed: send command failed",
+		});
 	});
 
 	test("agent_task_send creates and reuses durable rejected preflight records when idempotency key is supplied", async () => {

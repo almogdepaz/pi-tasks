@@ -4,7 +4,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 import { buildBackgroundTaskNotificationPrompt, selectUnpromptedTerminalTasks } from "./auto-notify";
-import type { TaskCommunicationLayer } from "./task-communication";
+import type { DispatchTaskResult, TaskCommunicationLayer, TaskStore, TaskTransport } from "./task-communication";
 import { createFilesystemTaskStore } from "./stores/filesystem";
 import { createWolfpackTaskTransport } from "./transports/wolfpack";
 import { buildAssignment, compactTaskResult } from "./protocol";
@@ -259,18 +259,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, communication: TaskComm
 				metadata: params.metadata,
 				contextRefs: params.contextRefs,
 			});
-			const dispatch = await transport.dispatchTask({ projectDir: ctx.cwd, task, target: params.to, assignment, signal });
-			if (!dispatch.ok) {
-				const rejected = await store.completeTask(ctx.cwd, task.id, "rejected", {
-					summary: `dispatch failed: ${dispatch.message}`,
-					error: {
-						code: "dispatch_failed",
-						message: dispatch.message,
-						retryable: dispatch.retryable,
-					},
-				});
-				return taskToolResult(compactTaskResult(rejected, await store.readTaskResult(ctx.cwd, task.id)));
-			}
+			launchTaskDispatch({ projectDir: ctx.cwd, task, target: params.to, assignment, store, transport });
 
 			return taskToolResult({
 				schemaVersion: 1,
@@ -386,6 +375,52 @@ export function registerAgentTaskTools(pi: ExtensionAPI, communication: TaskComm
 
 export default function piTasks(pi: ExtensionAPI): void {
 	registerAgentTaskTools(pi, createDefaultTaskCommunicationLayer(pi));
+}
+
+interface BackgroundDispatchInput {
+	readonly projectDir: string;
+	readonly task: AgentTaskRecord;
+	readonly target: string;
+	readonly assignment: string;
+	readonly store: TaskStore;
+	readonly transport: TaskTransport;
+}
+
+function launchTaskDispatch(input: BackgroundDispatchInput): void {
+	void dispatchTaskAndRecordFailure(input).catch((error) => {
+		console.error(`agent_task_send dispatch failure could not be recorded for ${input.task.id}: ${formatErrorMessage(error)}`);
+	});
+}
+
+async function dispatchTaskAndRecordFailure(input: BackgroundDispatchInput): Promise<void> {
+	const dispatch = await runDispatch(input);
+	if (dispatch.ok) return;
+
+	await input.store.completeTask(input.projectDir, input.task.id, "rejected", {
+		summary: `dispatch failed: ${dispatch.message}`,
+		error: {
+			code: "dispatch_failed",
+			message: dispatch.message,
+			retryable: dispatch.retryable,
+		},
+	});
+}
+
+async function runDispatch(input: BackgroundDispatchInput): Promise<DispatchTaskResult> {
+	try {
+		return await input.transport.dispatchTask({
+			projectDir: input.projectDir,
+			task: input.task,
+			target: input.target,
+			assignment: input.assignment,
+		});
+	} catch (error) {
+		return { ok: false, message: formatErrorMessage(error), retryable: true };
+	}
+}
+
+function formatErrorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : "task dispatch failed";
 }
 
 function summarizePreflightFailure(preflight: { readonly checks: readonly { readonly name: string; readonly status: string; readonly message?: string }[] }): string {

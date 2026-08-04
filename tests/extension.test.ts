@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { registerAgentTaskTools } from "../src/extension";
 import { GatewayClientError } from "../src/gateway-client";
@@ -31,18 +31,78 @@ function clientFixture() {
 	return {
 		calls,
 		async send(input: unknown) { calls.push({ name: "send", input }); return { taskId: "task-1", eventId: "event-1", sequence: "1", warnings: [] }; },
-		async status() { return { task, status: "active", events: [], warnings: [] }; },
+		async status(taskId = "task-1") { return { task: { ...task, taskId }, status: "active", events: [], warnings: [] }; },
 		async sessionStatus() { return { sessionId: "receiver-id" }; },
 		async message(input: unknown) { calls.push({ name: "message", input }); return { taskId: "task-1", eventId: "event-2", sequence: "2", warnings: [] }; },
 		async complete(input: unknown) { calls.push({ name: "complete", input }); return { taskId: "task-1", eventId: "event-3", sequence: "3", warnings: [] }; },
 		async cancel(taskId: string) { calls.push({ name: "cancel", input: taskId }); return { taskId, eventId: "event-4", sequence: "4", warnings: [] }; },
-		async inbox() { return { events: [], nextCursor: "0", hasMore: false }; },
+		async inbox(): Promise<{ readonly events: readonly { readonly taskId: string }[]; readonly nextCursor: string; readonly hasMore: boolean }> { return { events: [], nextCursor: "0", hasMore: false }; },
 		async ack(taskId: string) { calls.push({ name: "ack", input: taskId }); return { taskId, eventId: "event-5", sequence: "5", warnings: [] }; },
 		async delivered() { return { taskId: "task-1", eventId: "event-1", sequence: "1", warnings: [] }; },
 	};
 }
 
 describe("gateway-backed task tools", () => {
+	test("coalesces session-start, timer, and agent-end inbox refreshes through the native extension boundary", async () => {
+		type EventHandler = (event: unknown, ctx: ExtensionContext) => unknown;
+		const handlers: Record<string, EventHandler> = {};
+		const entries: unknown[] = [];
+		const calls: string[] = [];
+		let intervalTick: (() => void) | undefined;
+		let releaseStatus: (() => void) | undefined;
+		const statusGate = new Promise<void>((resolve) => { releaseStatus = resolve; });
+		const task = {
+			taskId: "task-1", source: { machine: "machine", sessionId: "parent-id" }, target: { machine: "machine", sessionId: "receiver-id" }, task: "implement narrowly", createdAt: "2026-08-03T00:00:00.000Z", expiresAt: "2026-08-03T01:00:00.000Z",
+		};
+		const client = {
+			callerSession: "receiver",
+			async inbox() {
+				calls.push("inbox");
+				return {
+					events: [{ id: "event-1", taskId: "task-1", type: "task.created", actor: "parent", source: task.source, destination: task.target, sequence: "1", occurredAt: task.createdAt, payload: { kind: "none" } }],
+					nextCursor: "1", hasMore: false,
+				};
+			},
+			async status() { calls.push("status"); await statusGate; return { task, status: "active", events: [], warnings: [] }; },
+			async delivered() { calls.push("delivered"); return { taskId: "task-1", eventId: "event-1", sequence: "1", warnings: [] }; },
+		};
+		const ctx = {
+			isIdle: () => true,
+			hasPendingMessages: () => false,
+			sessionManager: { buildContextEntries: () => entries, getEntries: () => entries },
+			ui: { setStatus: () => undefined, theme: { fg: (_color: string, text: string) => text } },
+		} as unknown as ExtensionContext;
+		const pi = {
+			on(name: string, handler: EventHandler) { handlers[name] = handler; },
+			registerTool() {},
+			sendMessage(message: { readonly customType: string; readonly details: unknown }) {
+				calls.push("insert");
+				entries.push({ type: "custom_message", customType: message.customType, details: message.details });
+			},
+			appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); },
+		} as unknown as ExtensionAPI;
+		const nativeSetInterval = globalThis.setInterval;
+		globalThis.setInterval = ((handler: Parameters<typeof setInterval>[0]) => {
+			intervalTick = () => { handler(); };
+			return {} as ReturnType<typeof setInterval>;
+		}) as typeof setInterval;
+		try {
+			registerAgentTaskTools(pi, client as never);
+			const sessionStart = Promise.resolve(handlers.session_start?.({}, ctx));
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			expect(calls).toEqual(["inbox", "status"]);
+			intervalTick?.();
+			await handlers.agent_end?.({}, ctx);
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			expect(calls).toEqual(["inbox", "status"]);
+			releaseStatus?.();
+			await sessionStart;
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			expect(calls).toEqual(["inbox", "status", "insert", "delivered"]);
+		} finally {
+			globalThis.setInterval = nativeSetInterval;
+		}
+	});
 	test("sends the locked gateway request shape without legacy fields", async () => {
 		const client = clientFixture();
 		const tools = toolsFor(client);
@@ -82,6 +142,31 @@ describe("gateway-backed task tools", () => {
 			expect.stringContaining("receiver-project-relative regular files"),
 		]));
 		expect(JSON.stringify(done.parameters)).toContain("receiver-project-relative regular files");
+	});
+
+	test("keeps terminal inbox inspection read-only and acknowledges only one named task", async () => {
+		const client = clientFixture();
+		const active = await client.status();
+		client.inbox = async () => ({ events: [{ taskId: "task-1" }, { taskId: "task-2" }], nextCursor: "1", hasMore: false });
+		client.status = async (taskId = "task-1") => ({
+			...active,
+			task: { ...active.task, taskId },
+			status: "completed",
+			completion: { summary: `${taskId} terminal`, warnings: [] },
+		});
+		const tools = toolsFor(client);
+
+		const inbox = await tools.agent_task_inbox!.execute("call", {}, new AbortController().signal, undefined, { cwd: "/tmp/project" });
+		expect(JSON.stringify(tools.agent_task_inbox!.parameters)).not.toContain("ack");
+		expect(client.calls.filter((call) => call.name === "ack")).toEqual([]);
+		expect(inbox.details).toMatchObject({ tasks: [
+			{ task: { taskId: "task-1" }, status: "completed", completion: { summary: "task-1 terminal" } },
+			{ task: { taskId: "task-2" }, status: "completed", completion: { summary: "task-2 terminal" } },
+		] });
+
+		const acknowledged = await tools.agent_task_ack!.execute("call", { taskId: "task-1" }, new AbortController().signal, undefined, { cwd: "/tmp/project" });
+		expect(client.calls.filter((call) => call.name === "ack")).toEqual([{ name: "ack", input: "task-1" }]);
+		expect(acknowledged.details).toMatchObject({ taskId: "task-1", eventId: "event-5" });
 	});
 
 	test("terminates only receiver questions and every done response, not parent questions", async () => {

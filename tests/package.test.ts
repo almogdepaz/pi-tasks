@@ -24,7 +24,7 @@ describe("gateway package documentation", () => {
 		for (const detail of [
 			"{ machine, sessionId }",
 			"agent_task_message",
-			"agent_task_inbox({ ack: true })",
+			"agent_task_ack({ taskId })",
 			"WOLFPACK_PORT",
 			"structured custom messages",
 			"canonical HTTPS Tailnet origin",
@@ -34,6 +34,8 @@ describe("gateway package documentation", () => {
 			"specific live peer",
 			"read-only analyzers",
 		]) expect(normalized).toContain(detail);
+		expect(normalized).toContain("task-adapter-contract.md");
+		expect(normalized).not.toContain("agent_task_inbox({ ack: true })");
 		expect(normalized).not.toContain("wolfpack session send");
 		expect(normalized).not.toContain("createFilesystemTaskStore");
 	});

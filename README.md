@@ -1,6 +1,6 @@
 # pi-tasks
 
-`pi-tasks` is a Pi extension client for the Wolfpack task gateway. Wolfpack owns task state in its machine-global `~/.wolfpack/tasks` store; this package does not create task files or write assignments to terminals. Read Wolfpack's [task gateway guide](https://github.com/almogdepaz/wolfpack/blob/main/docs/task-gateway.md) for the canonical route and operational contract.
+`pi-tasks` is a Pi extension client for the Wolfpack task gateway. Wolfpack owns task state in its machine-global `~/.wolfpack/tasks` store; this package does not create task files or write assignments to terminals. Pi is one conforming adapter. Read Wolfpack's [harness-neutral task adapter contract](https://github.com/almogdepaz/wolfpack/blob/main/docs/task-adapter-contract.md) for canonical adapter behavior and its [task gateway guide](https://github.com/almogdepaz/wolfpack/blob/main/docs/task-gateway.md) for routes and operations.
 
 ## requirements and trust boundary
 
@@ -64,7 +64,8 @@ Normal delegation is fire-and-forget. Use `agent_task_wait` only when the user e
 | `agent_task_send` | create a durable gateway assignment |
 | `agent_task_status` | read task state, history, result, and warnings |
 | `agent_task_wait` | explicitly poll a task until terminal or timeout |
-| `agent_task_inbox` | read task events; `ack: true` starts terminal parent acknowledgment |
+| `agent_task_inbox` | read task events without acknowledgment |
+| `agent_task_ack` | acknowledge one independently verified terminal task |
 | `agent_task_message` | send a durable `question`, `answer`, or `information` event |
 | `agent_task_cancel` | request cancellation |
 | `agent_task_done` | receiver-only terminal completion; terminates the tool turn |
@@ -79,13 +80,13 @@ Report source modifications in `result.changedFiles`. Artifacts are receiver-pro
 
 See the canonical Wolfpack artifact contract for provenance, containment, and warning behavior.
 
-The sender gateway owns canonical event order, timeout, and terminal state. The first accepted terminal event wins. Sender timeout triggers best-effort remote cancellation; late terminals remain diagnostics. After independently verifying a terminal result, call `agent_task_inbox({ ack: true })`. Remote acknowledgment is two-phase: the receiver durably confirms pending acknowledgment before the sender records final parent acknowledgment. If that delivery fails, the task remains visible and a later explicit acknowledgment repairs it with the same event ID.
+The sender gateway owns canonical event order, timeout, and terminal state. The first accepted terminal event wins. Sender timeout triggers best-effort remote cancellation; late terminals remain diagnostics. After independently verifying one terminal result, call `agent_task_ack({ taskId })`. Remote acknowledgment is two-phase: the receiver durably confirms pending acknowledgment before the sender records final parent acknowledgment. If that delivery fails, the task remains visible and a later explicit acknowledgment repairs it with the same event ID.
 
 ## structured delivery and replay
 
 The extension polls the local gateway every five seconds and only injects events when Pi is idle with no pending messages. It uses Pi structured custom messages with `{ taskId, eventId }` details, so task context participates in the session without parsing prose.
 
-On start or resume it rebuilds incorporated IDs from those custom-message details. A session gets only missing events; a new Pi session in the same Wolfpack PTY gets complete active history. The receiver records gateway delivery only after the structured insertion exists. A restart after insertion and before acknowledgment therefore acknowledges the existing entry without duplicate injection. Gateway delivery is at-least-once; this does not claim exactly-once model execution.
+On start or resume it rebuilds incorporated IDs from the full durable session entry set, not only active prompt context. A session gets only missing events; a new Pi session in the same Wolfpack PTY gets complete active history. The receiver records gateway delivery only after the structured insertion exists. A restart after insertion and before acknowledgment therefore acknowledges the existing entry without duplicate injection. Unknown model-visible events fail closed without advancing the cursor. Gateway delivery is at-least-once; this does not claim exactly-once model execution.
 
 ## parent workflow
 

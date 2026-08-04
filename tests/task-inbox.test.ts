@@ -50,7 +50,7 @@ function harness(options: { readonly existing?: readonly string[]; readonly idle
 	const ctx = {
 		isIdle: () => options.idle ?? true,
 		hasPendingMessages: () => options.pending ?? false,
-		sessionManager: { buildContextEntries: () => entries },
+		sessionManager: { buildContextEntries: () => entries, getEntries: () => entries },
 	};
 	const pi = {
 		sendMessage(message: { readonly content: string; readonly details: { readonly taskId: string; readonly eventId: string } }) {
@@ -80,6 +80,20 @@ describe("idle gateway inbox delivery", () => {
 		expect(fixture.actions).toEqual(["insert:event-assignment", "ack:event-assignment", "insert:event-answer", "ack:event-answer"]);
 		expect(fixture.sent[0]?.content).toContain("## task assignment");
 		expect(fixture.sent[0]?.content).toContain("src/a.ts");
+	});
+
+	test("renders assignment role without rendering metadata", async () => {
+		const fixture = harness();
+		fixture.client.status = async () => ({
+			task: {
+				taskId: "task-1", source: { machine: "machine", sessionId: "parent-id" }, target: { machine: "machine", sessionId: "receiver-id" }, task: "implement narrowly", createdAt: "2026-08-03T00:00:00.000Z", expiresAt: "2026-08-03T01:00:00.000Z", role: "implementer", metadata: { issueId: "do-not-render" },
+			}, status: "active", events: [], warnings: [],
+		});
+
+		await deliverTaskInbox(fixture.pi, fixture.client, fixture.ctx, "0");
+
+		expect(fixture.sent[0]?.content).toContain("## role\nimplementer");
+		expect(fixture.sent[0]?.content).not.toContain("do-not-render");
 	});
 
 	test("reconstructs acknowledged active history for a fresh Pi session", async () => {
@@ -177,6 +191,34 @@ describe("idle gateway inbox delivery", () => {
 		expect(fixture.cursors).toHaveLength(0);
 	});
 
+	test("uses durable session entries rather than compacted active context as incorporation evidence", async () => {
+		const sent: unknown[] = [];
+		const delivered: unknown[] = [];
+		const durableEntries = [{ type: "custom_message", customType: "wolfpack-task-event", details: { taskId: "task-1", eventId: "event-assignment" } }];
+		const client = {
+			async inbox() { return { events: [assignmentEvent], nextCursor: "1", hasMore: false }; },
+			async status() { return { task: { taskId: "task-1", source: { machine: "machine", sessionId: "parent-id" }, target: { machine: "machine", sessionId: "receiver-id" }, task: "implement", createdAt: "2026-08-03T00:00:00.000Z", expiresAt: "2026-08-03T01:00:00.000Z" }, status: "active", events: [], warnings: [] }; },
+			async delivered(taskId: string, eventId: string) { delivered.push({ taskId, eventId }); },
+		};
+		const ctx = { isIdle: () => true, hasPendingMessages: () => false, sessionManager: { buildContextEntries: () => [], getEntries: () => durableEntries } };
+		const pi = { sendMessage(message: unknown) { sent.push(message); }, appendEntry() {} };
+
+		await deliverTaskInbox(pi, client, ctx, "0");
+
+		expect(sent).toHaveLength(0);
+		expect(delivered).toEqual([{ taskId: "task-1", eventId: "event-assignment" }]);
+	});
+
+	test("fails closed without advancing the cursor for unknown model-visible events", async () => {
+		const fixture = harness();
+		fixture.client.inbox = async () => ({ events: [event("task.new_contract_event", "receiver", "unknown", "1")], nextCursor: "1", hasMore: false });
+
+		await expect(deliverTaskInbox(fixture.pi, fixture.client, fixture.ctx, "0")).rejects.toThrow("unknown task inbox event type");
+
+		expect(fixture.sent).toHaveLength(0);
+		expect(fixture.cursors).toHaveLength(0);
+	});
+
 	test("skips non-model protocol events while advancing the cursor", async () => {
 		const internal = ["task.receipt_confirmed", "task.delivered", "message.delivered", "task.parent_ack_pending", "task.parent_acknowledged", "event.delivery_failed"].map((type, index) => event(type, "receiver", `internal-${index}`, String(index + 1)));
 		const model = event("task.information", "receiver", "event-information", "7", "model-relevant");
@@ -225,7 +267,7 @@ describe("idle gateway inbox delivery", () => {
 			async status() { return { task: { taskId: "task-1", source: { machine: "machine", sessionId: "parent-id" }, target: { machine: "machine", sessionId: "receiver-id" }, task: "implement", createdAt: "2026-08-03T00:00:00.000Z", expiresAt: "2026-08-03T01:00:00.000Z", onCompletePrompt: "review the receiver diff" }, status: "completed", events: [], completion: { summary: "implemented", warnings: [] }, warnings: [] }; },
 			async delivered(...args: unknown[]) { delivered.push(args); },
 		};
-		const ctx = { isIdle: () => true, hasPendingMessages: () => false, sessionManager: { buildContextEntries: () => [] } };
+		const ctx = { isIdle: () => true, hasPendingMessages: () => false, sessionManager: { buildContextEntries: () => [], getEntries: () => [] } };
 		const pi = { sendMessage(message: { readonly content: string; readonly details: unknown }) { sent.push(message); }, appendEntry() {} };
 		await deliverTaskInbox(pi, client, ctx, "0");
 		expect(sent[0]?.content).toContain("review the receiver diff");

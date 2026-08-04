@@ -52,7 +52,7 @@ const SendParams = Type.Object({
 
 const TaskIdParams = Type.Object({ taskId: Type.String({ minLength: 1 }) });
 const WaitParams = Type.Object({ taskId: Type.String({ minLength: 1 }), timeoutMs: Type.Optional(Type.Integer({ minimum: MIN_TASK_TIMEOUT_MS, maximum: MAX_TASK_TIMEOUT_MS })) });
-const InboxParams = Type.Object({ ack: Type.Optional(Type.Boolean({ default: false })), includeAcknowledged: Type.Optional(Type.Boolean({ default: false })) });
+const InboxParams = Type.Object({ includeAcknowledged: Type.Optional(Type.Boolean({ default: false })) });
 const MessageParams = Type.Object({
 	taskId: Type.String({ minLength: 1 }),
 	type: StringEnum(["question", "answer", "information"] as const),
@@ -70,25 +70,29 @@ const DoneParams = Type.Object({
 
 export function registerAgentTaskTools(pi: ExtensionAPI, client: WolfpackGatewayClient = createWolfpackGatewayClient()): void {
 	let backgroundTimer: ReturnType<typeof setInterval> | undefined;
-
-	const refreshInbox = async (ctx: ExtensionContext): Promise<void> => {
-		const cursor = restoredInboxCursor(ctx.sessionManager.getEntries());
-		await deliverTaskInbox(pi, client, ctx, cursor);
-	};
+	let inboxContext: ExtensionContext | undefined;
+	const refreshInbox = createSingleFlightInboxRefresh(async () => {
+		if (!inboxContext) return;
+		const cursor = restoredInboxCursor(inboxContext.sessionManager.getEntries());
+		await deliverTaskInbox(pi, client, inboxContext, cursor);
+	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		inboxContext = ctx;
 		ctx.ui.setStatus("wolfpack-tasks", ctx.ui.theme.fg("dim", `tasks: ${client.callerSession}`));
 		backgroundTimer = setInterval(() => {
-			void refreshInbox(ctx).catch(() => ctx.ui.setStatus("wolfpack-tasks", ctx.ui.theme.fg("warning", "tasks: unavailable")));
+			void refreshInbox().catch(() => ctx.ui.setStatus("wolfpack-tasks", ctx.ui.theme.fg("warning", "tasks: unavailable")));
 		}, BACKGROUND_POLL_MS);
-		await refreshInbox(ctx).catch(() => undefined);
+		await refreshInbox().catch(() => undefined);
 	});
 	pi.on("agent_end", async (_event, ctx) => {
-		setTimeout(() => { void refreshInbox(ctx).catch(() => undefined); }, 0);
+		inboxContext = ctx;
+		setTimeout(() => { void refreshInbox().catch(() => undefined); }, 0);
 	});
 	pi.on("session_shutdown", () => {
 		if (backgroundTimer) clearInterval(backgroundTimer);
 		backgroundTimer = undefined;
+		inboxContext = undefined;
 	});
 
 	pi.registerTool({
@@ -129,7 +133,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, client: WolfpackGateway
 	});
 
 	pi.registerTool({
-		name: "agent_task_inbox", label: "Task Inbox", description: "Read inbox task events and optionally acknowledge terminal parent tasks.", parameters: InboxParams,
+		name: "agent_task_inbox", label: "Task Inbox", description: "Read inbox task events without acknowledging them.", parameters: InboxParams,
 		async execute(_toolCallId, params, signal) {
 			try {
 				let cursor = "0";
@@ -141,9 +145,15 @@ export function registerAgentTaskTools(pi: ExtensionAPI, client: WolfpackGateway
 					cursor = page.nextCursor;
 				}
 				const tasks = await Promise.all([...taskIds].map((taskId) => client.status(taskId, signal)));
-				if (params.ack) await Promise.all(tasks.filter((task) => terminal(task.status)).map((task) => client.ack(task.task.taskId, signal)));
 				return toolResult({ tasks }, `## task inbox\n${tasks.length === 0 ? "- empty" : tasks.map((task) => `- \`${task.task.taskId}\`: ${task.status}${task.completion ? ` — ${task.completion.summary}` : ""}`).join("\n")}`);
 			} catch (error) { return clientError(error); }
+		}, renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
+	});
+
+	pi.registerTool({
+		name: "agent_task_ack", label: "Acknowledge Agent Task", description: "Acknowledge one independently verified terminal task.", parameters: TaskIdParams,
+		async execute(_toolCallId, params, signal) {
+			try { return toolResult(await client.ack(params.taskId, signal), `## task acknowledged\n- task: \`${params.taskId}\``); } catch (error) { return clientError(error); }
 		}, renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
 	});
 
@@ -177,6 +187,18 @@ export function registerAgentTaskTools(pi: ExtensionAPI, client: WolfpackGateway
 			} catch (error) { return clientError(error); }
 		}, renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
 	});
+}
+
+export function createSingleFlightInboxRefresh(refresh: () => Promise<void>): () => Promise<void> {
+	let inFlight: Promise<void> | undefined;
+	return (): Promise<void> => {
+		if (inFlight) return inFlight;
+		const current = refresh().finally(() => {
+			if (inFlight === current) inFlight = undefined;
+		});
+		inFlight = current;
+		return current;
+	};
 }
 
 export default function piTasks(pi: ExtensionAPI): void {

@@ -6,7 +6,10 @@ const TASK_CURSOR_CUSTOM_TYPE = "wolfpack-task-cursor";
 interface InboxContext {
 	readonly isIdle: () => boolean;
 	readonly hasPendingMessages: () => boolean;
-	readonly sessionManager: { readonly buildContextEntries: () => readonly unknown[] };
+	readonly sessionManager: {
+		readonly buildContextEntries: () => readonly unknown[];
+		readonly getEntries: () => readonly unknown[];
+	};
 }
 
 interface InboxPi {
@@ -27,14 +30,16 @@ interface InboxClient {
 
 export async function deliverTaskInbox(pi: InboxPi, client: InboxClient, ctx: InboxContext, initialCursor: string): Promise<string> {
 	if (!ctx.isIdle() || ctx.hasPendingMessages()) return initialCursor;
-	const entries = ctx.sessionManager.buildContextEntries();
+	const entries = ctx.sessionManager.getEntries();
 	const incorporated = incorporatedEvents(entries);
 	const includeAcknowledged = initialCursor === "0" && !hasPersistedCursor(entries);
 	let cursor = initialCursor;
 	for (;;) {
 		const page = await client.inbox(cursor, includeAcknowledged);
 		for (const event of page.events) {
-			if (!modelRelevant(event)) continue;
+			const disposition = inboxDisposition(event.type);
+			if (disposition === "internal") continue;
+			if (disposition === "unknown") throw new Error(`unknown task inbox event type: ${event.type}`);
 			if (!ctx.isIdle() || ctx.hasPendingMessages()) return cursor;
 			const eventKey = key(event.taskId, event.id);
 			const snapshot = await client.status(event.taskId);
@@ -50,7 +55,7 @@ export async function deliverTaskInbox(pi: InboxPi, client: InboxClient, ctx: In
 				display: true,
 				details: { taskId: event.taskId, eventId: event.id },
 			}, { triggerTurn: true });
-			if (!incorporatedEvents(ctx.sessionManager.buildContextEntries()).has(eventKey)) return cursor;
+			if (!incorporatedEvents(ctx.sessionManager.getEntries()).has(eventKey)) return cursor;
 			incorporated.add(eventKey);
 			if (event.destination.sessionId === snapshot.task.target.sessionId) await client.delivered(event.taskId, event.id);
 		}
@@ -65,8 +70,10 @@ function hasPersistedCursor(entries: readonly unknown[]): boolean {
 	return entries.some((entry) => isRecord(entry) && entry.type === "custom" && entry.customType === TASK_CURSOR_CUSTOM_TYPE && isRecord(entry.data) && decimal(entry.data.cursor));
 }
 
-function modelRelevant(event: TaskEvent): boolean {
-	return event.type === "task.created" || event.type === "task.question" || event.type === "task.answer" || event.type === "task.information" || terminalEvent(event.type) || event.type === "task.cancel_requested";
+function inboxDisposition(type: string): "model-visible" | "internal" | "unknown" {
+	if (type === "task.created" || type === "task.question" || type === "task.answer" || type === "task.information" || terminalEvent(type) || type === "task.cancel_requested") return "model-visible";
+	if (type === "task.received" || type === "task.receipt_confirmed" || type === "task.delivered" || type === "message.delivered" || type === "task.parent_ack_pending" || type === "task.parent_acknowledged" || type === "event.delivery_failed" || type === "task.late_terminal") return "internal";
+	return "unknown";
 }
 
 function terminalHistoryAcknowledged(snapshot: TaskStatus): boolean {
@@ -97,7 +104,7 @@ export function renderTaskEvent(event: TaskEvent, snapshot: TaskStatus): string 
 	const message = event.message ? `\n\n${event.message}` : "";
 	const completion = event.completion ?? snapshot.completion;
 	const completionText = completion ? `\n\n**summary:** ${completion.summary}` : "";
-	const parentPrompt = terminalEvent(event.type) && snapshot.task.onCompletePrompt
+	const parentPrompt = terminalEvent(event.type) && event.destination.sessionId === snapshot.task.source.sessionId && snapshot.task.onCompletePrompt
 		? `\n\n## parent follow-up\n${snapshot.task.onCompletePrompt}`
 		: "";
 	const warnings = renderWarnings(snapshot.warnings);
@@ -105,11 +112,12 @@ export function renderTaskEvent(event: TaskEvent, snapshot: TaskStatus): string 
 }
 
 function renderAssignment(header: string, assignment: TaskAssignment, warnings: readonly { readonly code: string; readonly message: string }[]): string {
+	const role = assignment.role ? `\n\n## role\n${assignment.role}` : "";
 	const context = assignment.context?.summary ? `\n\n## context\n${assignment.context.summary}` : "";
 	const refs = assignment.context?.refs?.length
 		? `\n\n## selected refs\n${assignment.context.refs.map((ref) => `- \`${ref.path}\`${ref.selector ? ` — ${ref.selector}` : ""}${ref.purpose ? ` — ${ref.purpose}` : ""}`).join("\n")}`
 		: "";
-	return `## task assignment\n${header}\n\n${assignment.task}${context}${refs}${renderWarnings(warnings)}`;
+	return `## task assignment\n${header}\n\n${assignment.task}${role}${context}${refs}${renderWarnings(warnings)}`;
 }
 
 function renderWarnings(warnings: readonly { readonly code: string; readonly message: string }[]): string {

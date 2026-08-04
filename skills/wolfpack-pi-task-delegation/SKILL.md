@@ -5,7 +5,7 @@ description: Use when opening, selecting, delegating to, checking, or cleaning u
 
 # wolfpack pi task delegation
 
-use `wolfpack-tailnet-control` for session control. this skill covers gateway task lifecycle, curated context, and parent verification. Wolfpack's [task gateway guide](https://github.com/almogdepaz/wolfpack/blob/main/docs/task-gateway.md) is the canonical route, trust, retention, and federation reference.
+use `wolfpack-tailnet-control` for session control. this skill covers gateway task lifecycle, curated context, and parent verification. Pi is one conforming adapter. Wolfpack's [harness-neutral task adapter contract](https://github.com/almogdepaz/wolfpack/blob/main/docs/task-adapter-contract.md) is the canonical adapter reference; its [task gateway guide](https://github.com/almogdepaz/wolfpack/blob/main/docs/task-gateway.md) covers routes, trust, retention, and federation.
 
 ## gateway requirements and addressing
 
@@ -23,7 +23,7 @@ use `wolfpack-tailnet-control` for session control. this skill covers gateway ta
 4. after durable receipt, keep working. Do not call `agent_task_wait` unless the user explicitly asks to block. Use `agent_task_status` or `agent_task_inbox` for structured follow-up.
 5. use `agent_task_message` for durable `question`, `answer`, or `information` flow. One question may be unresolved globally; answers link to it. A receiver question accepted by the sender ends the receiver turn; a parent question does not end the parent turn.
 6. assignees call `agent_task_done` exactly once as their final action with `completed`, `failed`, or `cancelled`, concise summary, and optional structured result/error/artifact metadata. Report source modifications in `result.changedFiles`; artifacts are receiver-project-relative regular files for a parent to inspect, not changed-file lists: `{ "result": { "changedFiles": ["src/extension.ts"] }, "artifacts": [{ "path": "verification/task-2.md" }] }`. Follow the canonical Wolfpack artifact contract for provenance, containment, and warning behavior. No prose completion afterward.
-7. parent independently verifies files, diff, tests, and artifacts before reporting success. Then use `agent_task_inbox({ ack: true })`; remote acknowledgment is two-phase and failed propagation leaves the task visible for explicit repair. Cleanup applies only to sessions this parent spawned and only after result verification and acknowledgment. Retain reusable sessions while review or correction is pending.
+7. parent independently verifies files, diff, tests, and artifacts before reporting success. Then use `agent_task_ack({ taskId })` for that one verified terminal task; remote acknowledgment is two-phase and failed propagation leaves the task visible for explicit repair. Cleanup applies only to sessions this parent spawned and only after result verification and acknowledgment. Retain reusable sessions while review or correction is pending.
 
 ## delivery and recovery
 

@@ -1,152 +1,44 @@
 ---
 name: wolfpack-pi-task-delegation
-description: Use this whenever the user asks to open, spawn, create, or use a Wolfpack/Pi subagent to do work, delegate work to another session, check delegated task results, or clean up completed child sessions. This skill connects existing Wolfpack session-control knowledge with the agent_task communication tools so agents spawn/select sessions, send work with agent_task_send, avoid terminal-output completion polling, and apply parent-owned session cleanup.
+description: Use when opening, selecting, delegating to, checking, or cleaning up a Wolfpack Pi subagent through the gateway-backed agent task tools.
 ---
 
-# Wolfpack Pi Task Delegation
+# wolfpack pi task delegation
 
-This skill is the Wolfpack transport guidance for the task communication layer. It does not replace `wolfpack-tailnet-control`; use that
-skill/instructions for opening, selecting, inspecting, or controlling Wolfpack
-sessions.
+use `wolfpack-tailnet-control` for session control. this skill covers gateway task lifecycle, curated context, and parent verification. Wolfpack's [task gateway guide](https://github.com/almogdepaz/wolfpack/blob/main/docs/task-gateway.md) is the canonical route, trust, retention, and federation reference.
 
-## Goal
+## gateway requirements and addressing
 
-When the user says something like “open a subagent and do X”, create or select a
-Wolfpack/Pi session using existing Wolfpack control, then send X through the
-structured `agent_task_*` task communication tools. Keep Wolfpack terminals
-visible and steerable, but treat task state/results as the protocol.
+- every participating Pi process needs this package and a reachable local Wolfpack v1 gateway.
+- `WOLFPACK_SESSION_NAME` is the caller selector; the local gateway resolves it to a stable broker ID. `WOLFPACK_PORT` selects the local port and defaults to `18790`.
+- address a target as `to: { machine, sessionId }`, retaining the stable broker `sessionId` from structured Wolfpack session control rather than a terminal label.
+- use `machine: "local"` for same-machine work. For remote work, use only the receiver's canonical HTTPS Tailnet origin, such as `https://worker.example.ts.net`; never a terminal name, arbitrary URL, path, query, fragment, credentials, or unexpected port.
+- v1 trusts local processes and trusted Tailnet machines. Pi calls only its local gateway; gateways use direct fetch federation. JWT federation is unsupported, so do not promise remote delivery where Wolfpack global JWT requires credentials.
 
-## Workflow
+## workflow
 
-1. If the request includes opening/spawning/creating a subagent, use the
-   existing Wolfpack control workflow (`wolfpack-tailnet-control`) to create the
-   session. Prefer the canonical CLI path:
+1. create or select an existing Pi session with canonical Wolfpack session control. Read its structured response and retain the stable broker `sessionId`.
+2. send concise opaque task instructions with `agent_task_send`. Parent normally authors optional Markdown `context.summary` and deliberately selects `context.refs` with `path`, optional `selector`, and `purpose`; refs are metadata, not copied files or transcript. Use `task-context-summary` only for recovery/reuse.
+3. include `role`, `metadata`, enforceable `preflight.requiredProject`, bounded timeout, idempotency key, and `onCompletePrompt` only when they apply. Timeout is 1000ms through 24h; default is 30 minutes. Task/context limits are 16 KiB each, assignment envelope 48 KiB, and request body 64 KiB.
+4. after durable receipt, keep working. Do not call `agent_task_wait` unless the user explicitly asks to block. Use `agent_task_status` or `agent_task_inbox` for structured follow-up.
+5. use `agent_task_message` for durable `question`, `answer`, or `information` flow. One question may be unresolved globally; answers link to it. A receiver question accepted by the sender ends the receiver turn; a parent question does not end the parent turn.
+6. assignees call `agent_task_done` exactly once as their final action with `completed`, `failed`, or `cancelled`, concise summary, and optional structured result/error/paths-only artifact metadata. No prose completion afterward.
+7. parent independently verifies files, diff, tests, and artifacts before reporting success. Then use `agent_task_inbox({ ack: true })`; remote acknowledgment is two-phase and failed propagation leaves the task visible for explicit repair. Cleanup applies only to sessions this parent spawned and only after result verification and acknowledgment. Retain reusable sessions while review or correction is pending.
 
-   ```bash
-   wolfpack agent spawn <project> --prompt 'you are a task worker. wait for structured pi.task.assignment.v1 assignments; finish assigned work only with agent_task_done.' --json
-   ```
+## delivery and recovery
 
-   `wolfpack session open <project> --prompt ... --json` is a deprecated alias;
-   use it only when that is the available command in the environment.
+`agent_task_send` returns after durable receiver-gateway receipt, not model execution. A remote initial send gets one initial attempt. The receiver stores a provisional receipt, and Pi sees the assignment only after sender receipt confirmation. Later peer events get four total attempts: initial plus retries around 1, 2, and 4 seconds with jitter. Retry exhaustion is a surfaced local delivery failure; v1 has no queue, scheduler, or offline dispatch.
 
-2. Parse the structured JSON response from Wolfpack for the created session
-   handle/name/id. Treat it as opaque. Do not infer the target from browser UI
-   labels, terminal prose, or pane previews. Before dispatch, verify the target
-   loaded the pi-tasks extension/tools and can access the same shared task store.
-   Establish tool availability during target setup; Wolfpack liveness does not
-   prove Pi tool availability. If either capability is missing, fail before
-   dispatch and instruct setup instead of sending an essay that cannot complete
-   through the protocol.
+The sender gateway owns canonical order, expiry, and terminal choice; the first accepted terminal event wins. Sender timeout causes best-effort remote cancellation. The local extension polls every five seconds and injects only while idle with no pending messages. It stores `{ taskId, eventId }` in structured custom messages, replays missing events after restart, and records delivery only after structural insertion. Do not call that exactly-once execution.
 
-3. Send the real work with `agent_task_send` to the selected/spawned session.
-   Keep task text compact and action-oriented; state the outcome, scope, and
-   constraints, but do not copy an entire implementation plan into `task`. For
-   non-trivial work, require structured `metadata` with `phaseId`, `issueId`,
-   `role`, `verificationTier`, and `rootCause` when known instead of encoding
-   these fields in prose. Use `contextRefs` for existing plans, docs, diffs, and
-   verification files instead of pasting their contents. Batch findings that
-   share a root cause into one issue/task rather than creating review ping-pong
-   with one task per finding.
+A real second peer is not currently available for live operational verification. Isolated two-server tests cover the direct peer protocol, but do not claim that a particular remote deployment is reachable.
 
-   For readiness-sensitive work, set `preflight.requireReachable: true` and set
-   `preflight.requiredProjectDir` when the target project matters. Wolfpack
-   readiness comes only from structured `wolfpack session status <target>
-   --json` terminal/session facts, never terminal prose. If the parent must do
-   something specific when the result arrives, set `onCompletePrompt` with that
-   parent-side follow-up. Example: “review the worker’s implementation diff
-   before reporting completion.” Do not put parent-review instructions in the
-   worker task unless the worker must do them.
+## do not
 
-4. Return immediately with the task id and target session. normal delegation
-   requests are fire-and-forget. Do not call `agent_task_wait` after dispatch;
-   use it only when the current user message explicitly asks to block for the
-   result now. If preflight fails without `idempotencyKey`, the tool result is
-   ephemeral and has no task id because no task directory was created. Continue
-   local work if there is other useful work to do. When the task finishes, the
-   idle inbox notification will remind the parent of any sender-defined
-   `onCompletePrompt`.
-
-5. Use structured task tools for follow-up:
-   - `agent_task_status` for one task without blocking
-   - `agent_task_wait` only when the current user message explicitly asks to block
-   - `agent_task_inbox` to check completed delegated work
-   - `agent_task_cancel` to cancel non-terminal tasks
-
-6. In target sessions, finish assigned tasks with `agent_task_done`. Keep the
-   required `summary` at or below 1200 characters and put machine-readable
-   details under `result`: `issueId`, `verdict`, `changedFiles`, `verification`,
-   `blockers`, `risks`, and `next` when useful. Verification entries should
-   include the exact command, status, exit code, and short summary where
-   applicable. After `agent_task_done`, do not send extra prose or attempt
-   session cleanup; the tool result is the completion channel and must remain
-   the worker's final action.
-
-7. The parent owns cleanup for child sessions it spawned:
-   - First receive and acknowledge the terminal structured task result.
-   - Keep an implementer session alive while independent review or immediate
-     correction work may reuse it.
-   - After the result is accepted, no correction is pending, and no other task
-     is assigned to that child, close it through the canonical Wolfpack control
-     workflow in `wolfpack-tailnet-control`.
-   - Close single-use reviewer sessions after acknowledging their results.
-   - For cancelled or timed-out work, resolve the structured task state before
-     closing the session; never use terminal prose to infer task completion.
-   - Do not close a pre-existing session merely because it was selected as a
-     task target. Cleanup ownership applies to sessions this parent spawned,
-     unless the user explicitly asks otherwise.
-
-   Pi task completion and Wolfpack session lifecycle remain separate: the task
-   extension reports completion; the parent decides when reuse is over; Wolfpack
-   performs the actual close.
-
-## Store Boundary
-
-Use cross-repo `agent_task_send` only when parent and target can access a shared
-or global task store. The filesystem store is project-local, so separate repos
-normally do not share task state. Until a shared store exists, direct
-`wolfpack session send <target> <compact-instruction>` is only a fallback
-instruction channel, not a task completion protocol. Do not use symlinks to fake
-a shared store.
-
-## Do Not
-
-- Do not call `agent_task_wait` after dispatch unless the current user message
-  explicitly asks to block for the result now.
-- Do not poll terminal output to decide that delegated work is complete.
-- Do not ask the target to report completion in prose.
-- Do not use `wolfpack session wait` for task completion; it waits for literal
-  terminal text and is the wrong protocol for this package.
-- Do not copy whole plan files into task prompts when `contextRefs` can point at
-  the source file.
-- Do not split related review findings into one task each when they share an
-  issue/root cause.
-- Do not duplicate Wolfpack session-control rules here. If session control is
-  ambiguous, consult/use `wolfpack-tailnet-control`.
-- Do not make workers kill their own sessions or auto-close a session directly
-  from `agent_task_done`; either can race result delivery and prevents deliberate
-  worker reuse.
-- Do not leave parent-spawned child sessions running after their structured
-  results are accepted and no follow-up work remains.
-
-## Examples
-
-User: “open a subagent and inspect the auth middleware”
-
-Expected approach:
-1. Spawn a Wolfpack child session with the existing Wolfpack control workflow.
-2. Call `agent_task_send` with the spawned session as `to`, “inspect the auth
-   middleware and report actionable boundary risks” as `task`, plus `metadata`
-   such as `{ "phaseId": "phase-1", "issueId": "auth-review", "role":
-   "reviewer", "verificationTier": "focused", "rootCause": "auth-boundary" }`.
-3. Prefer `contextRefs` like `{ "path": ".plans/current.md", "required": true
-   }` over pasted plan text.
-4. If follow-up is needed, set `onCompletePrompt`, e.g. “review the worker’s
-   findings before reporting back.”
-5. Tell the user the task id and that structured results will arrive through the
-   async inbox notification. Do not wait for the result.
-
-User: “check on the subagent”
-
-Expected approach:
-- Use `agent_task_inbox` or `agent_task_status`; do not read terminal prose to
-  infer done-ness.
+- do not use terminal output as task state or completion evidence.
+- do not ask workers to complete in prose.
+- do not inject task context while Pi is busy or has pending messages.
+- do not copy whole plans, ref contents, or transcripts into task context.
+- do not use filesystem task storage or retain old `mustReturn`, `rejected`, or semantic completion contracts.
+- do not promise JWT federation, artifact byte transfer, or background retry/offline dispatch.
+- do not make workers close their own sessions.

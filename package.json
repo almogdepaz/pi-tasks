@@ -1,7 +1,7 @@
 {
   "name": "@sgtbeatdown/pi-tasks",
-  "version": "0.1.0",
-  "description": "Structured task communication for Pi agents with pluggable stores and transports.",
+  "version": "0.1.1",
+  "description": "Durable Pi agent delegation through the Wolfpack task gateway.",
   "module": "src/extension.ts",
   "repository": {
     "type": "git",

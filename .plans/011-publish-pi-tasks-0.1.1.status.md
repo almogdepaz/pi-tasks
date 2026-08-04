@@ -1,0 +1,33 @@
+# Publish Pi Tasks 0.1.1 — execution status
+
+plan: `.plans/011-publish-pi-tasks-0.1.1.md`
+plan_sha256: `1ad9be40d6c121032d7095cf912b58ba2a5ef0f1bb8c6466b18a883e8b13d125`
+state: `in_progress`
+current_phase: `3 — commit and merge`
+
+## Goal lock
+
+This release publishes only Pi Tasks. Wolfpack repositories, deployments, and branches are out of scope. Unrelated local `.edc` and plans 005/007/009 remain untouched.
+
+## Evidence
+
+- registry latest before release: `0.1.0`
+- npm identity: `sgtbeatdown`
+- PR #1: open, clean, mergeable
+- red package metadata test: stale `pluggable stores and transports` description
+- candidate metadata: version `0.1.1`, description `Durable Pi agent delegation through the Wolfpack task gateway.`
+- focused package tests: 3 passed, 0 failed
+- full suite: 34 passed, 0 failed; typecheck passed
+- package dry run: 12 intended files, 82.76 KB unpacked; extension, gateway client, inbox, both skills, README, and read-only legacy metrics included
+- diff check and immutable plan digest passed
+
+## Task state
+
+- 1: `implemented`
+- 2: `accepted`
+- 3: `in_progress`
+- 4: `not_started`
+
+## Next action
+
+Commit intended release files, push the feature branch, and merge PR #1.

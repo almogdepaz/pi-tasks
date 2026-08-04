@@ -8,7 +8,12 @@ const summarySkillPath = new URL("../skills/task-context-summary/SKILL.md", impo
 
 describe("gateway package documentation", () => {
 	test("publishes the extension and package skills", async () => {
-		const packageJson = JSON.parse(await readFile(packageJsonPath, "utf8")) as { readonly pi?: { readonly extensions?: readonly string[]; readonly skills?: readonly string[] } };
+		const packageJson = JSON.parse(await readFile(packageJsonPath, "utf8")) as {
+			readonly description?: string;
+			readonly pi?: { readonly extensions?: readonly string[]; readonly skills?: readonly string[] };
+		};
+		expect(packageJson.description).toContain("Wolfpack task gateway");
+		expect(packageJson.description).not.toContain("pluggable stores and transports");
 		expect(packageJson.pi?.extensions).toEqual(["./src/extension.ts"]);
 		expect(packageJson.pi?.skills).toContain("./skills");
 	});

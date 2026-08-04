@@ -3,445 +3,220 @@ import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import { buildBackgroundTaskNotificationPrompt, selectUnpromptedTerminalTasks } from "./auto-notify";
-import type { DispatchTaskResult, TaskCommunicationLayer, TaskStore, TaskTransport } from "./task-communication";
-import { createFilesystemTaskStore } from "./stores/filesystem";
-import { createWolfpackTaskTransport } from "./transports/wolfpack";
-import { buildAssignment, compactTaskResult } from "./protocol";
-import { runTaskPreflight } from "./preflight";
-import type { AgentTaskRecord, TaskResultPayload, TerminalTaskStatus } from "./types";
-import { DEFAULT_TIMEOUT_MS, ON_COMPLETE_PROMPT_MAX_CHARS, TASK_PROTOCOL_VERSION } from "./types";
+import {
+	DEFAULT_TASK_TIMEOUT_MS,
+	GatewayClientError,
+	MAX_TASK_TIMEOUT_MS,
+	MIN_TASK_TIMEOUT_MS,
+	createWolfpackGatewayClient,
+	type TaskCompletionInput,
+	type TaskStatus,
+	type WolfpackGatewayClient,
+} from "./gateway-client";
+import { deliverTaskInbox, restoredInboxCursor } from "./task-inbox";
 
+const BACKGROUND_POLL_MS = 5_000;
 const WAIT_POLL_MS = 250;
-const BACKGROUND_POLL_MS = 5000;
+const SUMMARY_MAX_CHARS = 1_200;
 
-const WorkflowMetadataParams = Type.Object({
-	phaseId: Type.Optional(Type.String()),
-	issueId: Type.Optional(Type.String()),
-	role: Type.Optional(Type.String()),
-	verificationTier: Type.Optional(Type.String()),
-	rootCause: Type.Optional(Type.String()),
+const AddressParams = Type.Object({
+	machine: Type.String({ minLength: 1, description: "local or a canonical Wolfpack machine identity" }),
+	sessionId: Type.String({ minLength: 1, description: "Stable opaque Wolfpack broker session id" }),
 });
 
 const ContextRefParams = Type.Object({
-	path: Type.String(),
+	path: Type.String({ minLength: 1 }),
 	selector: Type.Optional(Type.String()),
-	required: Type.Optional(Type.Boolean()),
 	purpose: Type.Optional(Type.String()),
 });
 
-const PreflightParams = Type.Object({
-	requiredProjectDir: Type.Optional(Type.String()),
-	requiredModel: Type.Optional(Type.String()),
-	requireIdle: Type.Optional(Type.Boolean()),
-	requireReachable: Type.Optional(Type.Boolean()),
-});
-
 const SendParams = Type.Object({
-	to: Type.String({ description: "Target session, worker, or transport-specific address" }),
-	task: Type.String({ description: "Task instructions to send to the target" }),
-	metadata: Type.Optional(WorkflowMetadataParams),
-	contextRefs: Type.Optional(Type.Array(ContextRefParams)),
-	preflight: Type.Optional(PreflightParams),
-	onCompletePrompt: Type.Optional(
-		Type.String({
-			description: "Parent-side prompt to inject when this task completes and the parent chat is idle",
-			maxLength: ON_COMPLETE_PROMPT_MAX_CHARS,
-		}),
-	),
-	timeoutMs: Type.Optional(Type.Integer({ minimum: 1000, maximum: 86_400_000 })),
-	idempotencyKey: Type.Optional(Type.String()),
+	to: AddressParams,
+	task: Type.String({ minLength: 1, maxLength: 16 * 1024 }),
+	context: Type.Optional(Type.Object({
+		summary: Type.Optional(Type.String({ minLength: 1, maxLength: 16 * 1024 })),
+		refs: Type.Optional(Type.Array(ContextRefParams)),
+	})),
+	role: Type.Optional(Type.String()),
+	preflight: Type.Optional(Type.Object({ requiredProject: Type.Optional(Type.String()) })),
+	metadata: Type.Optional(Type.Object({
+		phaseId: Type.Optional(Type.String()),
+		issueId: Type.Optional(Type.String()),
+		verificationTier: Type.Optional(Type.String()),
+		rootCause: Type.Optional(Type.String()),
+	})),
+	onCompletePrompt: Type.Optional(Type.String({ maxLength: 4_000 })),
+	timeoutMs: Type.Optional(Type.Integer({ minimum: MIN_TASK_TIMEOUT_MS, maximum: MAX_TASK_TIMEOUT_MS })),
+	idempotencyKey: Type.Optional(Type.String({ minLength: 1 })),
 });
 
-const TaskIdParams = Type.Object({
-	taskId: Type.String({ description: "Task id, e.g. task_..." }),
+const TaskIdParams = Type.Object({ taskId: Type.String({ minLength: 1 }) });
+const WaitParams = Type.Object({ taskId: Type.String({ minLength: 1 }), timeoutMs: Type.Optional(Type.Integer({ minimum: MIN_TASK_TIMEOUT_MS, maximum: MAX_TASK_TIMEOUT_MS })) });
+const InboxParams = Type.Object({ ack: Type.Optional(Type.Boolean({ default: false })), includeAcknowledged: Type.Optional(Type.Boolean({ default: false })) });
+const MessageParams = Type.Object({
+	taskId: Type.String({ minLength: 1 }),
+	type: StringEnum(["question", "answer", "information"] as const),
+	message: Type.String({ minLength: 1, maxLength: 16 * 1024 }),
+	replyToMessageId: Type.Optional(Type.String({ minLength: 1 })),
 });
-
-const WaitParams = Type.Object({
-	taskId: Type.String({ description: "Task id, e.g. task_..." }),
-	timeoutMs: Type.Optional(Type.Integer({ minimum: 1000, maximum: 86_400_000 })),
-});
-
-const InboxParams = Type.Object({
-	ack: Type.Optional(Type.Boolean({ default: false })),
-	includeAcknowledged: Type.Optional(Type.Boolean({ default: false })),
-});
-
-const CancelParams = Type.Object({
-	taskId: Type.String({ description: "Task id, e.g. task_..." }),
-	reason: Type.Optional(Type.String()),
-});
-
 const DoneParams = Type.Object({
-	taskId: Type.String({ description: "Task id from the assignment" }),
-	status: StringEnum(["completed", "failed", "cancelled", "rejected"] as const),
-	summary: Type.String({ description: "Compact summary, max 1200 chars" }),
-	error: Type.Optional(
-		Type.Object({
-			code: Type.String(),
-			message: Type.String(),
-			retryable: Type.Boolean(),
-		}),
-	),
-	result: Type.Optional(
-		Type.Record(Type.String(), Type.Unknown(), {
-			description: "Optional compact structured payload: issueId, verdict, changedFiles, verification, blockers, risks, next",
-		}),
-	),
-	artifacts: Type.Optional(
-		Type.Array(
-			Type.Object({
-				name: Type.String(),
-				path: Type.Optional(Type.String()),
-				mimeType: Type.Optional(Type.String()),
-				description: Type.Optional(Type.String()),
-			}),
-		),
-	),
+	taskId: Type.String({ minLength: 1 }),
+	status: StringEnum(["completed", "failed", "cancelled"] as const),
+	summary: Type.String({ minLength: 1, maxLength: SUMMARY_MAX_CHARS }),
+	result: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+	error: Type.Optional(Type.Object({ code: Type.String(), message: Type.String(), retryable: Type.Boolean() })),
+	artifacts: Type.Optional(Type.Array(Type.Object({ path: Type.String({ minLength: 1 }), mimeType: Type.Optional(Type.String()), description: Type.Optional(Type.String()) }))),
 });
 
-export function createDefaultTaskCommunicationLayer(pi: ExtensionAPI): TaskCommunicationLayer {
-	return {
-		store: createFilesystemTaskStore(),
-		transport: createWolfpackTaskTransport({
-			exec: (command, args, options) => pi.exec(command, [...args], options),
-		}),
-	};
-}
-
-export function registerAgentTaskTools(pi: ExtensionAPI, communication: TaskCommunicationLayer): void {
-	const { store, transport } = communication;
+export function registerAgentTaskTools(pi: ExtensionAPI, client: WolfpackGatewayClient = createWolfpackGatewayClient()): void {
 	let backgroundTimer: ReturnType<typeof setInterval> | undefined;
-	const notifiedTaskIds = new Set<string>();
-	const autoPromptedTaskIds = new Set<string>();
+
+	const refreshInbox = async (ctx: ExtensionContext): Promise<void> => {
+		const cursor = restoredInboxCursor(ctx.sessionManager.getEntries());
+		await deliverTaskInbox(pi, client, ctx, cursor);
+	};
 
 	pi.on("session_start", async (_event, ctx) => {
-		const sessionName = transport.getCurrentSessionName(process.env);
-		ctx.ui.setStatus("wolfpack-tasks", ctx.ui.theme.fg("dim", `tasks: ${sessionName}`));
-
+		ctx.ui.setStatus("wolfpack-tasks", ctx.ui.theme.fg("dim", `tasks: ${client.callerSession}`));
 		backgroundTimer = setInterval(() => {
-			void refreshInboxStatus(ctx.cwd, sessionName, ctx).catch(() => {
-				ctx.ui.setStatus("wolfpack-tasks", ctx.ui.theme.fg("warning", "tasks: unavailable"));
-			});
+			void refreshInbox(ctx).catch(() => ctx.ui.setStatus("wolfpack-tasks", ctx.ui.theme.fg("warning", "tasks: unavailable")));
 		}, BACKGROUND_POLL_MS);
-
-		await refreshInboxStatus(ctx.cwd, sessionName, ctx).catch(() => undefined);
+		await refreshInbox(ctx).catch(() => undefined);
 	});
-
 	pi.on("agent_end", async (_event, ctx) => {
-		const sessionName = transport.getCurrentSessionName(process.env);
-		setTimeout(() => {
-			void refreshInboxStatus(ctx.cwd, sessionName, ctx).catch(() => undefined);
-		}, 0);
+		setTimeout(() => { void refreshInbox(ctx).catch(() => undefined); }, 0);
 	});
-
-	pi.on("session_shutdown", async () => {
-		if (backgroundTimer) {
-			clearInterval(backgroundTimer);
-			backgroundTimer = undefined;
-		}
+	pi.on("session_shutdown", () => {
+		if (backgroundTimer) clearInterval(backgroundTimer);
+		backgroundTimer = undefined;
 	});
-
-	async function refreshInboxStatus(projectDir: string, sessionName: string, ctx: ExtensionContext): Promise<void> {
-		const inbox = await store.listInbox(projectDir, sessionName, { includeAcknowledged: false });
-		const count = inbox.length;
-		ctx.ui.setStatus("wolfpack-tasks", ctx.ui.theme.fg(count > 0 ? "accent" : "dim", `tasks: ${count} inbox`));
-		for (const task of inbox) {
-			if (notifiedTaskIds.has(task.id)) continue;
-			notifiedTaskIds.add(task.id);
-			ctx.ui.notify(`task ${task.id} ${task.status}: ${task.targetSession}`, task.status === "completed" ? "info" : "warning");
-		}
-		triggerIdleInboxPrompt(inbox, ctx);
-	}
-
-	function triggerIdleInboxPrompt(inbox: readonly AgentTaskRecord[], ctx: ExtensionContext): void {
-		if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
-
-		const tasksToPrompt = selectUnpromptedTerminalTasks(inbox, autoPromptedTaskIds);
-		if (tasksToPrompt.length === 0) return;
-
-		try {
-			pi.sendUserMessage(buildBackgroundTaskNotificationPrompt(tasksToPrompt));
-			for (const task of tasksToPrompt) {
-				autoPromptedTaskIds.add(task.id);
-			}
-		} catch {
-			ctx.ui.notify("task results ready; parent is busy, will retry", "info");
-		}
-	}
 
 	pi.registerTool({
-		name: "agent_task_send",
-		label: "Send Agent Task",
-		description: "Send a structured task to another agent/session/worker and return immediately without waiting.",
-		promptSnippet: "Send nonblocking structured tasks to other agents/sessions/workers",
-		promptGuidelines: [
-			"Use agent_task_send instead of natural-language polling when delegating work to another agent/session/worker",
-			"normal delegation requests are fire-and-forget: after agent_task_send returns, report the task id/target and keep working or stop.",
-			"Do not call `agent_task_wait` after dispatch; use it only when the current user message explicitly asks to block for the result now.",
-			"Set onCompletePrompt when the parent should do specific follow-up after the task result arrives, such as reviewing implementation work.",
-		],
+		name: "agent_task_send", label: "Send Agent Task", description: "Durably send a bounded task to an existing Wolfpack Pi session.",
+		promptSnippet: "Send nonblocking structured tasks through the local Wolfpack gateway",
+		promptGuidelines: ["Use agent_task_send for normal nonblocking delegation; do not wait unless the user explicitly asks."],
 		parameters: SendParams,
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const parentSession = transport.getCurrentSessionName(process.env);
-			const preflight = await runTaskPreflight({
-				projectDir: ctx.cwd,
-				parentSession,
-				target: params.to,
-				store,
-				transport,
-				requirements: params.preflight,
-				metadata: params.metadata,
-				contextRefs: params.contextRefs,
-				signal,
-			});
-			if (!preflight.ok) {
-				const error = { code: "preflight_failed", message: summarizePreflightFailure(preflight), retryable: true };
-				if (!params.idempotencyKey) {
-					return taskToolResult({
-						schemaVersion: 1,
-						status: "rejected",
-						summary: "preflight failed",
-						artifacts: [],
-						onCompletePrompt: params.onCompletePrompt,
-						preflight,
-						error,
-					});
-				}
-
-				const rejected = await store.createOrReusePreflightRejectedTask({
-					projectDir: ctx.cwd,
-					parentSession,
-					targetSession: params.to,
-					taskText: params.task,
-					timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-					idempotencyKey: params.idempotencyKey,
-					targetTaskProtocol: TASK_PROTOCOL_VERSION,
-					onCompletePrompt: params.onCompletePrompt,
-					metadata: params.metadata,
-					contextRefs: params.contextRefs,
-					preflight,
-					summary: "preflight failed",
-					error,
-				});
-				return taskToolResult(compactTaskResult(rejected.task, await store.readTaskResult(ctx.cwd, rejected.task.id)));
-			}
-
-			const createdTask = await store.createOrReuseDispatchedTask({
-				projectDir: ctx.cwd,
-				parentSession,
-				targetSession: params.to,
-				taskText: params.task,
-				assignment: (taskId: string) =>
-					buildAssignment({
-						taskId,
-						fromSession: parentSession,
-						instructions: params.task,
-						metadata: params.metadata,
-						contextRefs: params.contextRefs,
-					}),
-				timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-				idempotencyKey: params.idempotencyKey,
-				targetTaskProtocol: TASK_PROTOCOL_VERSION,
-				onCompletePrompt: params.onCompletePrompt,
-				metadata: params.metadata,
-				contextRefs: params.contextRefs,
-				preflight,
-			});
-			const task = createdTask.task;
-			if (!createdTask.created) {
-				return taskToolResult(compactTaskResult(task, await store.readTaskResult(ctx.cwd, task.id)));
-			}
-
-			const assignment = buildAssignment({
-				taskId: task.id,
-				fromSession: parentSession,
-				instructions: params.task,
-				metadata: params.metadata,
-				contextRefs: params.contextRefs,
-			});
-			launchTaskDispatch({ projectDir: ctx.cwd, task, target: params.to, assignment, store, transport });
-
-			return taskToolResult({
-				schemaVersion: 1,
-				taskId: task.id,
-				status: task.status,
-				summary: `dispatched to ${params.to}`,
-				artifacts: [task.assignmentRef].filter((value): value is string => Boolean(value)),
-				error: null,
-			});
-		},
-		renderResult(result, _options, theme) {
-			return new Text(theme.fg("accent", getText(result)));
-		},
-	});
-
-	pi.registerTool({
-		name: "agent_task_status",
-		label: "Task Status",
-		description: "Read compact structured status for a task.",
-		parameters: TaskIdParams,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const task = await store.expireTaskIfOverdue(ctx.cwd, params.taskId);
-			return taskToolResult(compactTaskResult(task, await store.readTaskResult(ctx.cwd, params.taskId)));
-		},
-	});
-
-	pi.registerTool({
-		name: "agent_task_wait",
-		label: "Wait Agent Task",
-		description: "Blocking wait for a task to become terminal. Do not use after normal delegation; use only when the current user message explicitly asks to block for the result now.",
-		parameters: WaitParams,
-		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-			const waitMs = params.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-			const sessionName = transport.getCurrentSessionName(process.env);
-			const progressTimer = setInterval(() => {
-				onUpdate?.({ content: [{ type: "text", text: `waiting for ${params.taskId}...` }], details: {} });
-			}, 2000);
+		async execute(_toolCallId, params, signal) {
 			try {
-				const task = await store.waitForTask(ctx.cwd, params.taskId, { timeoutMs: waitMs, pollMs: WAIT_POLL_MS, ackParentSession: sessionName });
-				return taskToolResult(compactTaskResult(task, await store.readTaskResult(ctx.cwd, params.taskId)));
-			} catch (error) {
-				const task = await store.readTask(ctx.cwd, params.taskId);
-				return taskToolResult({
-					schemaVersion: 1,
-					taskId: task.id,
-					status: task.status,
-					summary: error instanceof Error ? error.message : "task wait failed",
-					artifacts: task.resultRef ? [task.resultRef] : [],
-					error: { code: "wait_timeout", message: "task wait timed out", retryable: true },
-				});
-			} finally {
-				clearInterval(progressTimer);
-			}
-		},
+				const receipt = await client.send(params, signal);
+				return toolResult(receipt, `## task received\n- task: \`${receipt.taskId}\`\n- target: \`${params.to.machine}/${params.to.sessionId}\`\n${warnings(receipt.warnings)}`);
+			} catch (error) { return clientError(error); }
+		}, renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
 	});
 
 	pi.registerTool({
-		name: "agent_task_inbox",
-		label: "Task Inbox",
-		description: "List terminal tasks for this parent session. Results are only shown to the model when this tool is called.",
-		parameters: InboxParams,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const sessionName = transport.getCurrentSessionName(process.env);
-			const tasks = await store.listInbox(ctx.cwd, sessionName, { includeAcknowledged: params.includeAcknowledged ?? false });
-			const compact = [];
-			for (const task of tasks) {
-				compact.push(compactTaskResult(task, await store.readTaskResult(ctx.cwd, task.id)));
-				if (params.ack) {
-					await store.ackTask(ctx.cwd, task.id, sessionName);
+		name: "agent_task_status", label: "Task Status", description: "Read compact structured task status from Wolfpack.", parameters: TaskIdParams,
+		async execute(_toolCallId, params, signal) {
+			try { const status = await client.status(params.taskId, signal); return statusResult(status); } catch (error) { return clientError(error); }
+		}, renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
+	});
+
+	pi.registerTool({
+		name: "agent_task_wait", label: "Wait Agent Task", description: "Block only when explicitly invoked until a task reaches a terminal state or this wait times out.", parameters: WaitParams,
+		async execute(_toolCallId, params, signal, onUpdate) {
+			const deadline = Date.now() + (params.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS);
+			try {
+				for (;;) {
+					throwIfAborted(signal);
+					const status = await client.status(params.taskId, signal);
+					if (terminal(status.status)) return statusResult(status);
+					if (Date.now() >= deadline) return toolResult({ taskId: params.taskId, status: status.status, error: { code: "WAIT_TIMEOUT", retryable: true } }, `## task wait\n- task: \`${params.taskId}\`\n- status: ${status.status}\n- wait timed out`);
+					onUpdate?.({ content: [{ type: "text", text: `waiting for ${params.taskId}...` }], details: {} });
+					await sleep(Math.min(WAIT_POLL_MS, Math.max(1, deadline - Date.now())), signal);
 				}
-			}
-			return taskToolResult({ tasks: compact });
-		},
+			} catch (error) { return clientError(error); }
+		}, renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
 	});
 
 	pi.registerTool({
-		name: "agent_task_cancel",
-		label: "Cancel Agent Task",
-		description: "Cancel a non-terminal task in the shared task store.",
-		parameters: CancelParams,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const task = await store.cancelTask(ctx.cwd, params.taskId, params.reason);
-			return taskToolResult(compactTaskResult(task, await store.readTaskResult(ctx.cwd, params.taskId)));
-		},
+		name: "agent_task_inbox", label: "Task Inbox", description: "Read inbox task events and optionally acknowledge terminal parent tasks.", parameters: InboxParams,
+		async execute(_toolCallId, params, signal) {
+			try {
+				let cursor = "0";
+				const taskIds = new Set<string>();
+				for (;;) {
+					const page = await client.inbox(cursor, params.includeAcknowledged ?? false, signal);
+					for (const event of page.events) taskIds.add(event.taskId);
+					if (!page.hasMore) break;
+					cursor = page.nextCursor;
+				}
+				const tasks = await Promise.all([...taskIds].map((taskId) => client.status(taskId, signal)));
+				if (params.ack) await Promise.all(tasks.filter((task) => terminal(task.status)).map((task) => client.ack(task.task.taskId, signal)));
+				return toolResult({ tasks }, `## task inbox\n${tasks.length === 0 ? "- empty" : tasks.map((task) => `- \`${task.task.taskId}\`: ${task.status}${task.completion ? ` — ${task.completion.summary}` : ""}`).join("\n")}`);
+			} catch (error) { return clientError(error); }
+		}, renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
 	});
 
 	pi.registerTool({
-		name: "agent_task_done",
-		label: "Complete Agent Task",
-		description: "Finish an assigned task with structured status. Use exactly once as the final action for assigned tasks.",
-		promptSnippet: "Complete an assigned task with a terminating structured result",
-		promptGuidelines: [
-			"Use agent_task_done exactly once as the final action for pi.task.assignment.v1 tasks.",
-			"After calling agent_task_done, do not emit another assistant response in prose.",
-		],
-		parameters: DoneParams,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const status = params.status as TerminalTaskStatus;
-			const payload: TaskResultPayload = {
-				summary: params.summary,
-				...(params.result && { result: params.result }),
-				...(params.error && { error: params.error }),
-				...(params.artifacts && { artifacts: params.artifacts }),
-			};
-			const task = await store.completeTask(ctx.cwd, params.taskId, status, payload);
-			return {
-				...taskToolResult(compactTaskResult(task, await store.readTaskResult(ctx.cwd, params.taskId))),
-				terminate: true,
-			};
-		},
+		name: "agent_task_message", label: "Message Agent Task", description: "Durably send a question, answer, or information event for a task.", parameters: MessageParams,
+		async execute(_toolCallId, params, signal) {
+			try {
+				const [identity, status] = await Promise.all([client.sessionStatus(signal), client.status(params.taskId, signal)]);
+				const receipt = await client.message(params, signal);
+				const receiverQuestion = params.type === "question" && identity.sessionId === status.task.target.sessionId;
+				return { ...toolResult(receipt, `## task ${params.type}\n- task: \`${params.taskId}\`\n${params.message}`), ...(receiverQuestion ? { terminate: true } : {}) };
+			} catch (error) { return clientError(error); }
+		}, renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
+	});
+
+	pi.registerTool({
+		name: "agent_task_cancel", label: "Cancel Agent Task", description: "Request cancellation for a non-terminal task through Wolfpack.", parameters: TaskIdParams,
+		async execute(_toolCallId, params, signal) {
+			try { const receipt = await client.cancel(params.taskId, signal); return toolResult(receipt, `## task cancellation requested\n- task: \`${params.taskId}\`${warnings(receipt.warnings)}`); } catch (error) { return clientError(error); }
+		}, renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
+	});
+
+	pi.registerTool({
+		name: "agent_task_done", label: "Complete Agent Task", description: "Finish an assigned task with a structured terminal result. Use exactly once as the final action.",
+		promptSnippet: "Complete an assigned task with a terminating structured result", promptGuidelines: ["Use agent_task_done exactly once as the final action for an assigned task."], parameters: DoneParams,
+		async execute(_toolCallId, params, signal) {
+			try {
+				const result: TaskCompletionInput = { summary: params.summary, ...(params.result && { result: params.result }), ...(params.error && { error: params.error }), ...(params.artifacts && { artifacts: params.artifacts }) };
+				const receipt = await client.complete({ taskId: params.taskId, status: params.status, result }, signal);
+				return { ...toolResult(receipt, `## task ${params.status}\n- task: \`${params.taskId}\`\n- ${params.summary}${warnings(receipt.warnings)}`), terminate: true };
+			} catch (error) { return clientError(error); }
+		}, renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
 	});
 }
 
 export default function piTasks(pi: ExtensionAPI): void {
-	registerAgentTaskTools(pi, createDefaultTaskCommunicationLayer(pi));
+	registerAgentTaskTools(pi);
 }
 
-interface BackgroundDispatchInput {
-	readonly projectDir: string;
-	readonly task: AgentTaskRecord;
-	readonly target: string;
-	readonly assignment: string;
-	readonly store: TaskStore;
-	readonly transport: TaskTransport;
+function statusResult(status: TaskStatus): AgentToolResult<unknown> {
+	return toolResult(status, `## task status\n- task: \`${status.task.taskId}\`\n- status: ${status.status}${status.completion ? `\n- summary: ${status.completion.summary}` : ""}${warnings(status.warnings)}`);
 }
 
-function launchTaskDispatch(input: BackgroundDispatchInput): void {
-	void dispatchTaskAndRecordFailure(input).catch((error) => {
-		console.error(`agent_task_send dispatch failure could not be recorded for ${input.task.id}: ${formatErrorMessage(error)}`);
-	});
+function toolResult(details: unknown, markdown: string): AgentToolResult<unknown> {
+	return { content: [{ type: "text", text: markdown }], details };
 }
 
-async function dispatchTaskAndRecordFailure(input: BackgroundDispatchInput): Promise<void> {
-	const dispatch = await runDispatch(input);
-	if (dispatch.ok) return;
-
-	await input.store.completeTask(input.projectDir, input.task.id, "rejected", {
-		summary: `dispatch failed: ${dispatch.message}`,
-		error: {
-			code: "dispatch_failed",
-			message: dispatch.message,
-			retryable: dispatch.retryable,
-		},
-	});
+function clientError(error: unknown): AgentToolResult<unknown> {
+	const gateway = error instanceof GatewayClientError ? error : new GatewayClientError("CLIENT_ERROR", error instanceof Error ? error.message : "task gateway request failed", true);
+	return toolResult({ error: { code: gateway.code, message: gateway.message, retryable: gateway.retryable } }, `## task gateway error\n- ${gateway.code}: ${gateway.message}`);
 }
 
-async function runDispatch(input: BackgroundDispatchInput): Promise<DispatchTaskResult> {
-	try {
-		return await input.transport.dispatchTask({
-			projectDir: input.projectDir,
-			task: input.task,
-			target: input.target,
-			assignment: input.assignment,
-		});
-	} catch (error) {
-		return { ok: false, message: formatErrorMessage(error), retryable: true };
-	}
+function warnings(values: readonly { readonly code: string; readonly message: string }[]): string {
+	return values.length === 0 ? "" : `\n## gateway warnings\n${values.map((value) => `- ${value.code}: ${value.message}`).join("\n")}`;
 }
 
-function formatErrorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : "task dispatch failed";
+function terminal(status: string): boolean {
+	return status === "completed" || status === "failed" || status === "cancelled" || status === "timed_out";
 }
 
-function summarizePreflightFailure(preflight: { readonly checks: readonly { readonly name: string; readonly status: string; readonly message?: string }[] }): string {
-	return preflight.checks
-		.filter((check) => check.status === "failed")
-		.map((check) => `${check.name}: ${check.message ?? "failed"}`)
-		.join("; ") || "preflight failed";
-}
-
-function taskToolResult(details: unknown): AgentToolResult<unknown> {
-	return {
-		content: [{ type: "text", text: JSON.stringify(details) }],
-		details,
-	};
-}
-
-function getText(result: { readonly content?: readonly unknown[] }): string {
+function text(result: { readonly content?: readonly unknown[] }): string {
 	const first = result.content?.[0];
-	if (!first || typeof first !== "object" || !("type" in first) || first.type !== "text" || !("text" in first)) {
-		return "";
-	}
-	return typeof first.text === "string" ? first.text : "";
+	return first && typeof first === "object" && "type" in first && first.type === "text" && "text" in first && typeof first.text === "string" ? first.text : "";
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw new GatewayClientError("ABORTED", "task wait was cancelled", true);
+}
+
+async function sleep(milliseconds: number, signal: AbortSignal | undefined): Promise<void> {
+	await new Promise<void>((resolve, reject) => {
+		const timeout = setTimeout(resolve, milliseconds);
+		const abort = (): void => { clearTimeout(timeout); reject(new GatewayClientError("ABORTED", "task wait was cancelled", true)); };
+		signal?.addEventListener("abort", abort, { once: true });
+	});
 }

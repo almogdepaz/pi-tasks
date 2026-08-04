@@ -20,12 +20,14 @@ export type GatewayErrorCode =
 export class GatewayClientError extends Error {
 	readonly code: GatewayErrorCode;
 	readonly retryable: boolean;
+	readonly path?: string;
 
-	constructor(code: GatewayErrorCode, message: string, retryable: boolean) {
+	constructor(code: GatewayErrorCode, message: string, retryable: boolean, path?: string) {
 		super(message);
 		this.name = "GatewayClientError";
 		this.code = code;
 		this.retryable = retryable;
+		this.path = path;
 	}
 }
 
@@ -187,7 +189,7 @@ export function createWolfpackGatewayClient(options: WolfpackGatewayClientOption
 				signal: controller.signal,
 			});
 			const parsed = await parseJson(response);
-			if (isErrorEnvelope(parsed)) throw new GatewayClientError(parsed.error.code, parsed.error.message, parsed.error.retryable);
+			if (isErrorEnvelope(parsed)) throw new GatewayClientError(parsed.error.code, parsed.error.message, parsed.error.retryable, parsed.error.path);
 			if (!response.ok) throw new GatewayClientError("MALFORMED_RESPONSE", `wolfpack returned HTTP ${response.status} without a task error envelope`, true);
 			if (!isOkEnvelope(parsed)) throw new GatewayClientError("MALFORMED_RESPONSE", "wolfpack returned an invalid task response", true);
 			return parsed;
@@ -278,11 +280,28 @@ function serializeBody(body: unknown): string {
 }
 
 function validateSend(input: SendTaskInput): void {
-	if (!isAddress(input.to) || !nonEmpty(input.task) || bytes(input.task) > MAX_TASK_BYTES) throw new GatewayClientError("INVALID_REQUEST", "task and target address are required and bounded", false);
-	if (input.context?.summary !== undefined && (!nonEmpty(input.context.summary) || bytes(input.context.summary) > MAX_CONTEXT_SUMMARY_BYTES)) throw new GatewayClientError("INVALID_REQUEST", "context summary exceeds the 16KiB initial limit", false);
-	if (bytes(JSON.stringify(input)) > MAX_ASSIGNMENT_ENVELOPE_BYTES) throw new GatewayClientError("INVALID_REQUEST", "assignment envelope exceeds the 48KiB initial limit", false);
+	const path = sendValidationPath(input);
+	if (path !== undefined) throw new GatewayClientError("INVALID_REQUEST", "task and target address are required and bounded", false, path);
+	if (input.context?.summary !== undefined && (!nonEmpty(input.context.summary) || bytes(input.context.summary) > MAX_CONTEXT_SUMMARY_BYTES)) throw new GatewayClientError("INVALID_REQUEST", "context summary exceeds the 16KiB initial limit", false, "/context/summary");
+	if (bytes(JSON.stringify(input)) > MAX_ASSIGNMENT_ENVELOPE_BYTES) throw new GatewayClientError("INVALID_REQUEST", "assignment envelope exceeds the 48KiB initial limit", false, "");
 	const timeoutMs = input.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS;
-	if (!Number.isInteger(timeoutMs) || timeoutMs < MIN_TASK_TIMEOUT_MS || timeoutMs > MAX_TASK_TIMEOUT_MS) throw new GatewayClientError("INVALID_REQUEST", "task timeout must be from 1000ms through 24h", false);
+	if (!Number.isInteger(timeoutMs) || timeoutMs < MIN_TASK_TIMEOUT_MS || timeoutMs > MAX_TASK_TIMEOUT_MS) throw new GatewayClientError("INVALID_REQUEST", "task timeout must be from 1000ms through 24h", false, "/timeoutMs");
+}
+
+function sendValidationPath(input: SendTaskInput): string | undefined {
+	if (!isRecord(input.to)) return "/to";
+	if (!nonEmpty(input.to.machine)) return "/to/machine";
+	if (!nonEmpty(input.to.sessionId)) return "/to/sessionId";
+	if (!nonEmpty(input.task) || bytes(input.task) > MAX_TASK_BYTES) return "/task";
+	if (input.preflight?.requiredProject !== undefined && !nonEmpty(input.preflight.requiredProject)) return "/preflight/requiredProject";
+	if (input.context?.refs !== undefined) {
+		if (!Array.isArray(input.context.refs)) return "/context/refs";
+		for (const [index, ref] of input.context.refs.entries()) {
+			if (!isRecord(ref)) return `/context/refs/${index}`;
+			if (!nonEmpty(ref.path)) return `/context/refs/${index}/path`;
+		}
+	}
+	return undefined;
 }
 
 function validateMessage(input: MessageTaskInput): void {
@@ -328,8 +347,13 @@ function isOkEnvelope(value: unknown): value is Record<string, unknown> & { read
 	return isRecord(value) && value.ok === true;
 }
 
-function isErrorEnvelope(value: unknown): value is { readonly ok: false; readonly error: { readonly code: string; readonly message: string; readonly retryable: boolean } } {
-	return isRecord(value) && value.ok === false && isRecord(value.error) && nonEmpty(value.error.code) && typeof value.error.message === "string" && typeof value.error.retryable === "boolean";
+function isErrorEnvelope(value: unknown): value is { readonly ok: false; readonly error: { readonly code: string; readonly message: string; readonly retryable: boolean; readonly path?: string } } {
+	return isRecord(value) && value.ok === false && isRecord(value.error) && nonEmpty(value.error.code) && typeof value.error.message === "string" && typeof value.error.retryable === "boolean"
+		&& (value.error.path === undefined || jsonPointer(value.error.path));
+}
+
+function jsonPointer(value: unknown): value is string {
+	return typeof value === "string" && /^(?:|\/(?:[^~/]|~[01])*)*$/.test(value);
 }
 
 function assignment(value: unknown): value is TaskAssignment {

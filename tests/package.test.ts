@@ -31,11 +31,49 @@ describe("gateway package documentation", () => {
 			"trusted local processes and trusted Tailnet machines",
 			"one initial attempt",
 			"four total attempts",
-			"real second peer",
+			"specific live peer",
 			"read-only analyzers",
 		]) expect(normalized).toContain(detail);
 		expect(normalized).not.toContain("wolfpack session send");
 		expect(normalized).not.toContain("createFilesystemTaskStore");
+	});
+
+	test("documents the structured correction path for invalid sends", async () => {
+		const readme = await readFile(readmePath, "utf8");
+		const minimalEnvelope = readme.match(/### minimal valid send envelope\n\n```json\n([\s\S]+?)\n```/);
+
+		expect(minimalEnvelope?.[1]).toBe(JSON.stringify({
+			to: { machine: "local", sessionId: "receiver-broker-id" },
+			task: "implement the narrow change and run focused tests",
+		}, null, 2));
+		expect(readme).toContain("`INVALID_REQUEST.error.path`");
+		expect(readme).toContain("RFC 6901 JSON Pointer");
+		expect(readme).toContain("rejected send field");
+		expect(readme).toContain("pre-persistence validation rejection creates no task");
+		expect(readme).toContain("idempotency remains necessary");
+		expect(readme).toContain("creation status is uncertain");
+	});
+
+	test("separates changed-file reporting from receiver-project artifact declarations", async () => {
+		const [readme, skill] = await Promise.all([readFile(readmePath, "utf8"), readFile(delegationSkillPath, "utf8")]);
+		for (const document of [readme, skill]) {
+			expect(document).toContain("result.changedFiles");
+			expect(document).toContain("receiver-project-relative regular files");
+			expect(document).toContain('"artifacts": [{ "path": "verification/task-2.md" }]');
+		}
+		expect(readme).toContain("canonical Wolfpack artifact contract");
+	});
+
+	test("requires current live-peer readiness before remote dispatch", async () => {
+		const [readme, skill] = await Promise.all([readFile(readmePath, "utf8"), readFile(delegationSkillPath, "utf8")]);
+		for (const document of [readme, skill]) {
+			expect(document).toContain("Live-peer readiness checklist");
+			expect(document).toContain("operator-recorded package/reload evidence");
+			expect(document).toContain("fixture-only verification");
+			expect(document).not.toContain("A real second peer is not currently available");
+		}
+		expect(readme).toContain("Isolated coverage is the deterministic acceptance gate");
+		expect(skill).toContain("Isolated coverage is the deterministic acceptance gate");
 	});
 
 	test("ships a recovery-only context summary workflow", async () => {

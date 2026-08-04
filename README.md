@@ -29,6 +29,20 @@ A target is always `{ machine, sessionId }`, where `sessionId` is the stable opa
 }
 ```
 
+### minimal valid send envelope
+
+```json
+{
+  "to": {
+    "machine": "local",
+    "sessionId": "receiver-broker-id"
+  },
+  "task": "implement the narrow change and run focused tests"
+}
+```
+
+`INVALID_REQUEST.error.path` is an optional RFC 6901 JSON Pointer to the rejected send field, for example `/preflight/requiredProject`; use it rather than parsing error prose. A pre-persistence validation rejection creates no task, so correct the field and retry. If creation status is uncertain, idempotency remains necessary.
+
 Remote addressing changes only `to.machine`:
 
 ```json
@@ -57,6 +71,14 @@ Normal delegation is fire-and-forget. Use `agent_task_wait` only when the user e
 
 Use `agent_task_message` for clarification instead of terminal prose. Only one question can be unresolved per task; answers link to that question. Information is durable and does not change task state. An accepted receiver question terminates that receiver turn; a parent question does not.
 
+Report source modifications in `result.changedFiles`. Artifacts are receiver-project-relative regular files for a parent to inspect, not a changed-file list:
+
+```json
+{ "result": { "changedFiles": ["src/extension.ts"] }, "artifacts": [{ "path": "verification/task-2.md" }] }
+```
+
+See the canonical Wolfpack artifact contract for provenance, containment, and warning behavior.
+
 The sender gateway owns canonical event order, timeout, and terminal state. The first accepted terminal event wins. Sender timeout triggers best-effort remote cancellation; late terminals remain diagnostics. After independently verifying a terminal result, call `agent_task_inbox({ ack: true })`. Remote acknowledgment is two-phase: the receiver durably confirms pending acknowledgment before the sender records final parent acknowledgment. If that delivery fails, the task remains visible and a later explicit acknowledgment repairs it with the same event ID.
 
 ## structured delivery and replay
@@ -68,12 +90,12 @@ On start or resume it rebuilds incorporated IDs from those custom-message detail
 ## parent workflow
 
 1. create or select a Wolfpack Pi session with the canonical session-control workflow and retain its stable broker ID.
-2. check the target's local gateway/package requirements, then send compact instructions with curated context and selected refs only when they save receiver investigation.
+2. before remote dispatch, complete Wolfpack's [Live-peer readiness checklist](https://github.com/almogdepaz/wolfpack/blob/main/docs/task-gateway.md#live-peer-readiness-checklist) and retain operator-recorded package/reload evidence; only then check the target's local requirements and send compact instructions with curated context and selected refs when they save receiver investigation.
 3. keep working; use `agent_task_status` or `agent_task_inbox` for structured follow-up, and `agent_task_message` for questions, answers, and decisions.
 4. verify cited files, diffs, tests, and paths-only artifact metadata independently before reporting success.
 5. acknowledge the accepted terminal result, then clean up only sessions this parent spawned. Keep a reusable implementer alive while review or correction remains possible; never make workers close their own sessions.
 
-A real second peer is not currently available for live operational verification. The protocol has isolated two-server coverage, but that does not prove a particular remote Wolfpack deployment is reachable. Do not overstate remote availability or use direct peer URLs from Pi.
+Isolated coverage is the deterministic acceptance gate, but a specific live peer still requires current readiness at the time of use. If the checklist cannot pass, stop before task creation and report fixture-only verification. Do not use direct peer URLs from Pi.
 
 See `skills/wolfpack-pi-task-delegation/SKILL.md` for the operational workflow and `skills/task-context-summary/SKILL.md` for recovery/reuse summaries.
 

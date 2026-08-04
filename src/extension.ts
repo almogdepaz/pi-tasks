@@ -65,7 +65,7 @@ const DoneParams = Type.Object({
 	summary: Type.String({ minLength: 1, maxLength: SUMMARY_MAX_CHARS }),
 	result: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
 	error: Type.Optional(Type.Object({ code: Type.String(), message: Type.String(), retryable: Type.Boolean() })),
-	artifacts: Type.Optional(Type.Array(Type.Object({ path: Type.String({ minLength: 1 }), mimeType: Type.Optional(Type.String()), description: Type.Optional(Type.String()) }))),
+	artifacts: Type.Optional(Type.Array(Type.Object({ path: Type.String({ minLength: 1, description: "artifact paths must name receiver-project-relative regular files to inspect; artifacts are not a changed-file list." }), mimeType: Type.Optional(Type.String()), description: Type.Optional(Type.String()) }))),
 });
 
 export function registerAgentTaskTools(pi: ExtensionAPI, client: WolfpackGatewayClient = createWolfpackGatewayClient()): void {
@@ -167,8 +167,8 @@ export function registerAgentTaskTools(pi: ExtensionAPI, client: WolfpackGateway
 	});
 
 	pi.registerTool({
-		name: "agent_task_done", label: "Complete Agent Task", description: "Finish an assigned task with a structured terminal result. Use exactly once as the final action.",
-		promptSnippet: "Complete an assigned task with a terminating structured result", promptGuidelines: ["Use agent_task_done exactly once as the final action for an assigned task."], parameters: DoneParams,
+		name: "agent_task_done", label: "Complete Agent Task", description: "Finish an assigned task with a structured terminal result. Report source modifications in result.changedFiles; artifacts are receiver-project-relative regular files to inspect, not a changed-file list. Use exactly once as the final action.",
+		promptSnippet: "Complete an assigned task: report changed files in result.changedFiles and artifacts separately", promptGuidelines: ["Report source modifications under result.changedFiles. Reserve artifacts for receiver-project-relative regular files a parent should inspect, not changed-file lists.", "Use agent_task_done exactly once as the final action for an assigned task."], parameters: DoneParams,
 		async execute(_toolCallId, params, signal) {
 			try {
 				const result: TaskCompletionInput = { summary: params.summary, ...(params.result && { result: params.result }), ...(params.error && { error: params.error }), ...(params.artifacts && { artifacts: params.artifacts }) };
@@ -193,7 +193,11 @@ function toolResult(details: unknown, markdown: string): AgentToolResult<unknown
 
 function clientError(error: unknown): AgentToolResult<unknown> {
 	const gateway = error instanceof GatewayClientError ? error : new GatewayClientError("CLIENT_ERROR", error instanceof Error ? error.message : "task gateway request failed", true);
-	return toolResult({ error: { code: gateway.code, message: gateway.message, retryable: gateway.retryable } }, `## task gateway error\n- ${gateway.code}: ${gateway.message}`);
+	const path = gateway.path === undefined ? {} : { path: gateway.path };
+	return toolResult(
+		{ error: { code: gateway.code, message: gateway.message, retryable: gateway.retryable, ...path } },
+		`## task gateway error\n- ${gateway.code}: ${gateway.message}${gateway.path === undefined ? "" : `\n- path: \`${gateway.path}\``}`,
+	);
 }
 
 function warnings(values: readonly { readonly code: string; readonly message: string }[]): string {

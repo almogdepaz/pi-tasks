@@ -1,9 +1,11 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
+import type { SendTaskInput } from "../src/gateway-client";
 import { GatewayClientError, createWolfpackGatewayClient } from "../src/gateway-client";
 
 let server: ReturnType<typeof Bun.serve>;
 let baseUrl = "";
+let sendRequests = 0;
 
 beforeAll(() => {
 	server = Bun.serve({
@@ -14,11 +16,18 @@ beforeAll(() => {
 				return Response.json({ ok: true, task: assignment(), status: "active", events: [], warnings: [] });
 			}
 			if (url.pathname === "/api/tasks/v1/send") {
+				sendRequests += 1;
 				return Response.json({ ok: true, taskId: "018f7f00-0000-7000-8000-000000000001", eventId: "018f7f00-0000-7000-8000-000000000002", sequence: "1", warnings: [] });
 			}
 			if (url.pathname === "/api/tasks/v1/message") return Response.json({ ok: true, taskId: "018f7f00-0000-7000-8000-000000000001", eventId: "018f7f00-0000-7000-8000-000000000003", sequence: "2" });
 			if (url.pathname === "/failure") {
 				return Response.json({ ok: false, error: { code: "TARGET_NOT_FOUND", message: "target missing", retryable: false } }, { status: 404 });
+			}
+			if (url.pathname === "/failure-with-path") {
+				return Response.json({ ok: false, error: { code: "INVALID_REQUEST", message: "task missing", retryable: false, path: "/task" } }, { status: 400 });
+			}
+			if (url.pathname === "/malformed-path") {
+				return Response.json({ ok: false, error: { code: "INVALID_REQUEST", message: "task missing", retryable: false, path: "task" } }, { status: 400 });
 			}
 			if (url.pathname === "/malformed") return Response.json({ nope: true });
 			if (url.pathname === "/slow") {
@@ -66,6 +75,18 @@ describe("wolfpack gateway client", () => {
 			name: "GatewayClientError",
 			code: "TARGET_NOT_FOUND",
 			retryable: false,
+			path: undefined,
+		});
+		await expect(client.request("GET", "/failure-with-path")).rejects.toMatchObject({
+			name: "GatewayClientError",
+			code: "INVALID_REQUEST",
+			retryable: false,
+			path: "/task",
+		});
+		await expect(client.request("GET", "/malformed-path")).rejects.toMatchObject({
+			name: "GatewayClientError",
+			code: "MALFORMED_RESPONSE",
+			retryable: true,
 		});
 		await expect(client.request("GET", "/malformed")).rejects.toMatchObject({
 			name: "GatewayClientError",
@@ -77,6 +98,24 @@ describe("wolfpack gateway client", () => {
 	test("rejects client-side bounded message payloads before a network request", async () => {
 		const client = createWolfpackGatewayClient({ baseUrl, sessionName: "parent" });
 		await expect(client.message({ taskId: "task-1", type: "information", message: "x".repeat(16 * 1024 + 1) })).rejects.toMatchObject({ code: "INVALID_REQUEST", retryable: false });
+	});
+
+	test("identifies local send validation fields without HTTP requests", async () => {
+		const client = createWolfpackGatewayClient({ baseUrl, sessionName: "parent" });
+		const sendsBefore = sendRequests;
+		const invalidInputs = [
+			{ input: { to: { machine: "local", sessionId: "receiver" }, task: "" }, path: "/task" },
+			{ input: { to: { machine: "local", sessionId: "" }, task: "send" }, path: "/to/sessionId" },
+			{ input: { to: { machine: "local", sessionId: "receiver" }, task: "send", context: { refs: [{ path: "" }] } }, path: "/context/refs/0/path" },
+			{ input: { to: { machine: "local", sessionId: "receiver" }, task: "send", context: { refs: {} } } as unknown as SendTaskInput, path: "/context/refs" },
+			{ input: { to: { machine: "local", sessionId: "receiver" }, task: "send", preflight: { requiredProject: "" } }, path: "/preflight/requiredProject" },
+			{ input: { to: { machine: "local", sessionId: "receiver" }, task: "send", timeoutMs: 999 }, path: "/timeoutMs" },
+		] as const;
+
+		for (const invalid of invalidInputs) {
+			await expect(client.send(invalid.input)).rejects.toMatchObject({ code: "INVALID_REQUEST", retryable: false, path: invalid.path });
+		}
+		expect(sendRequests).toBe(sendsBefore);
 	});
 
 	test("rejects a >48KiB but <64KiB UTF-8 assignment envelope before network dispatch", async () => {

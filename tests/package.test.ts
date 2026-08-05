@@ -40,6 +40,16 @@ describe("gateway package documentation", () => {
 		expect(normalized).not.toContain("createFilesystemTaskStore");
 	});
 
+	test("documents idle worker spawning and active-turn follow-up insertion", async () => {
+		const [readme, skill] = await Promise.all([readFile(readmePath, "utf8"), readFile(delegationSkillPath, "utf8")]);
+		for (const document of [readme, skill]) {
+			expect(document).toContain("delivery remains pending until `task.delivered`");
+			expect(document).toContain('`deliverAs: "followUp"`');
+		}
+		expect(skill).toContain("omit `--prompt`");
+		expect(skill).toContain("Do not start a disposable worker with a blocking");
+	});
+
 	test("documents the structured correction path for invalid sends", async () => {
 		const readme = await readFile(readmePath, "utf8");
 		const minimalEnvelope = readme.match(/### minimal valid send envelope\n\n```json\n([\s\S]+?)\n```/);

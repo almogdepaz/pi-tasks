@@ -17,7 +17,7 @@ use `wolfpack-tailnet-control` for session control. this skill covers gateway ta
 
 ## workflow
 
-1. create or select an existing Pi session with canonical Wolfpack session control. Read its structured response and retain the stable broker `sessionId`. Before remote dispatch, complete Wolfpack's [Live-peer readiness checklist](https://github.com/almogdepaz/wolfpack/blob/main/docs/task-gateway.md#live-peer-readiness-checklist), including operator-recorded package/reload evidence; if it cannot pass, stop before task creation and report fixture-only verification.
+1. create or select an existing Pi session with canonical Wolfpack session control. For a disposable worker, omit `--prompt`: `wolfpack agent spawn <project> --name <task-role> --json`. Put all worker instructions in `agent_task_send.task` so the fresh Pi process can reach idle before assignment. Do not start a disposable worker with a blocking “wait for assignments” model prompt. Read the structured spawn response and retain the stable broker `sessionId`. Before remote dispatch, complete Wolfpack's [Live-peer readiness checklist](https://github.com/almogdepaz/wolfpack/blob/main/docs/task-gateway.md#live-peer-readiness-checklist), including operator-recorded package/reload evidence; if it cannot pass, stop before task creation and report fixture-only verification.
 2. send concise opaque task instructions with `agent_task_send`. Parent normally authors optional Markdown `context.summary` and deliberately selects `context.refs` with `path`, optional `selector`, and `purpose`; refs are metadata, not copied files or transcript. Use `task-context-summary` only for recovery/reuse.
 3. include `role`, `metadata`, enforceable `preflight.requiredProject`, bounded timeout, idempotency key, and `onCompletePrompt` only when they apply. Timeout is 1000ms through 24h; default is 30 minutes. Task/context limits are 16 KiB each, assignment envelope 48 KiB, and request body 64 KiB.
 4. after durable receipt, keep working. Do not call `agent_task_wait` unless the user explicitly asks to block. Use `agent_task_status` or `agent_task_inbox` for structured follow-up.
@@ -27,9 +27,9 @@ use `wolfpack-tailnet-control` for session control. this skill covers gateway ta
 
 ## delivery and recovery
 
-`agent_task_send` returns after durable receiver-gateway receipt, not model execution. A remote initial send gets one initial attempt. The receiver stores a provisional receipt, and Pi sees the assignment only after sender receipt confirmation. Later peer events get four total attempts: initial plus retries around 1, 2, and 4 seconds with jitter. Retry exhaustion is a surfaced local delivery failure; v1 has no queue, scheduler, or offline dispatch.
+`agent_task_send` returns after durable receiver-gateway acceptance, not adapter insertion or model execution; delivery remains pending until `task.delivered`. A remote initial send gets one initial attempt. The receiver stores a provisional receipt, and Pi sees the assignment only after sender receipt confirmation. Later peer events get four total attempts: initial plus retries around 1, 2, and 4 seconds with jitter. Retry exhaustion is a surfaced local delivery failure; v1 has no gateway queue, scheduler, or offline dispatch.
 
-The sender gateway owns canonical order, expiry, and terminal choice; the first accepted terminal event wins. Sender timeout causes best-effort remote cancellation. The local extension polls every five seconds and injects only while idle with no pending messages. It stores `{ taskId, eventId }` in structured custom messages, replays missing events after restart, and records delivery only after structural insertion. Do not call that exactly-once execution.
+The sender gateway owns canonical order, expiry, and terminal choice; the first accepted terminal event wins. Sender timeout causes best-effort remote cancellation. The local extension polls every five seconds. With no pending message, it submits visible events through Pi's safe `deliverAs: "followUp"` queue: idle sessions start immediately, active turns finish first, and task delivery never steers or interrupts them. It stores `{ taskId, eventId }` in structured custom messages, replays missing events after restart, and records delivery only after structural insertion. Do not call that exactly-once execution.
 
 Isolated coverage is the deterministic acceptance gate, but a specific live peer still requires current readiness at the time of use. Do not claim that a particular remote deployment is reachable without the checklist evidence.
 
@@ -37,7 +37,7 @@ Isolated coverage is the deterministic acceptance gate, but a specific live peer
 
 - do not use terminal output as task state or completion evidence.
 - do not ask workers to complete in prose.
-- do not inject task context while Pi is busy or has pending messages.
+- do not steer or interrupt an active Pi turn with task context; use the adapter's follow-up queue.
 - do not copy whole plans, ref contents, or transcripts into task context.
 - do not use filesystem task storage or retain old `mustReturn`, `rejected`, or semantic completion contracts.
 - do not promise JWT federation, artifact byte transfer, or background retry/offline dispatch.

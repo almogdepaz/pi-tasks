@@ -23,8 +23,10 @@ function event(type: string, destination: "parent" | "receiver", id: string, seq
 
 function harness(options: { readonly existing?: readonly string[]; readonly idle?: boolean; readonly pending?: boolean } = {}) {
 	const sent: Array<{ readonly content: string; readonly details: { readonly taskId: string; readonly eventId: string } }> = [];
+	const deliveryOptions: Array<{ readonly triggerTurn: true; readonly deliverAs?: "followUp" }> = [];
 	const cursors: unknown[] = [];
 	const actions: string[] = [];
+	let queued = false;
 	const client: Pick<WolfpackGatewayClient, "inbox" | "status" | "delivered"> = {
 		async inbox(cursor: string, _includeAcknowledged: boolean) {
 			if (cursor === "0") return { events: [assignmentEvent], nextCursor: "1", hasMore: true };
@@ -49,21 +51,31 @@ function harness(options: { readonly existing?: readonly string[]; readonly idle
 	const entries = (options.existing ?? []).map((eventId) => ({ type: "custom_message", customType: "wolfpack-task-event", details: { taskId: "task-1", eventId } }));
 	const ctx = {
 		isIdle: () => options.idle ?? true,
-		hasPendingMessages: () => options.pending ?? false,
+		hasPendingMessages: () => (options.pending ?? false) || queued,
 		sessionManager: { buildContextEntries: () => entries, getEntries: () => entries },
 	};
 	const pi = {
-		sendMessage(message: { readonly content: string; readonly details: { readonly taskId: string; readonly eventId: string } }) {
+		sendMessage(message: { readonly content: string; readonly details: { readonly taskId: string; readonly eventId: string } }, sendOptions?: { readonly triggerTurn: true; readonly deliverAs?: "followUp" }) {
 			actions.push(`insert:${message.details.eventId}`);
 			sent.push(message);
-			entries.push({ type: "custom_message", customType: "wolfpack-task-event", details: message.details });
+			if (sendOptions) deliveryOptions.push(sendOptions);
+			if (ctx.isIdle()) entries.push({ type: "custom_message", customType: "wolfpack-task-event", details: message.details });
+			else queued = true;
 		},
 		appendEntry(_type: string, data: unknown) { cursors.push(data); },
 	};
-	return { client, ctx, pi, sent, delivered, cursors, actions };
+	const settleQueued = (): void => {
+		for (const message of sent) {
+			if (!entries.some((entry) => entry.type === "custom_message" && entry.details.eventId === message.details.eventId)) {
+				entries.push({ type: "custom_message", customType: "wolfpack-task-event", details: message.details });
+			}
+		}
+		queued = false;
+	};
+	return { client, ctx, pi, sent, deliveryOptions, delivered, cursors, actions, settleQueued };
 }
 
-describe("idle gateway inbox delivery", () => {
+describe("gateway inbox delivery", () => {
 	test("drains pages in order, inserts structured custom messages, then acknowledges and advances the cursor", async () => {
 		const fixture = harness();
 		await deliverTaskInbox(fixture.pi, fixture.client, fixture.ctx, "0");
@@ -126,6 +138,7 @@ describe("idle gateway inbox delivery", () => {
 		expect(await deliverTaskInbox(fixture.pi, fixture.client, fixture.ctx, "0")).toBe("0");
 		expect(fixture.cursors).toHaveLength(0);
 		idle = true;
+		fixture.settleQueued();
 		const restored = restoredInboxCursor(fixture.ctx.sessionManager.buildContextEntries());
 		expect(restored).toBe("0");
 		await deliverTaskInbox(fixture.pi, fixture.client, fixture.ctx, restored);
@@ -135,11 +148,16 @@ describe("idle gateway inbox delivery", () => {
 		expect(fixture.delivered.filter((delivery) => delivery.eventId === "event-answer")).toEqual([{ taskId: "task-1", eventId: "event-answer" }]);
 	});
 
-	test("does not inject while busy, and crash-before-ack reuses structural session evidence before acknowledging", async () => {
+	test("queues one follow-up while Pi is busy and waits for structural evidence before acknowledging", async () => {
 		const busy = harness({ idle: false });
 		await deliverTaskInbox(busy.pi, busy.client, busy.ctx, "0");
-		expect(busy.sent).toHaveLength(0);
+		await deliverTaskInbox(busy.pi, busy.client, busy.ctx, "0");
+
+		expect(busy.sent).toHaveLength(1);
+		expect(busy.sent[0]?.details).toEqual({ taskId: "task-1", eventId: "event-assignment" });
+		expect(busy.deliveryOptions).toEqual([{ triggerTurn: true, deliverAs: "followUp" }]);
 		expect(busy.delivered).toHaveLength(0);
+		expect(busy.cursors).toHaveLength(0);
 
 		const recovered = harness({ existing: ["event-assignment"] });
 		await deliverTaskInbox(recovered.pi, recovered.client, recovered.ctx, "0");
@@ -151,7 +169,7 @@ describe("idle gateway inbox delivery", () => {
 		]);
 	});
 
-	test("stops before insertion when Pi becomes busy while status is pending", async () => {
+	test("queues a follow-up when Pi becomes busy while status is pending", async () => {
 		let idle = true;
 		const fixture = harness();
 		fixture.ctx.isIdle = () => idle;
@@ -160,7 +178,8 @@ describe("idle gateway inbox delivery", () => {
 			return { task: { taskId: "task-1", source: { machine: "machine", sessionId: "parent-id" }, target: { machine: "machine", sessionId: "receiver-id" }, task: "implement", createdAt: "2026-08-03T00:00:00.000Z", expiresAt: "2026-08-03T01:00:00.000Z" }, status: "active", events: [], warnings: [] };
 		};
 		await deliverTaskInbox(fixture.pi, fixture.client, fixture.ctx, "0");
-		expect(fixture.sent).toHaveLength(0);
+		expect(fixture.sent).toHaveLength(1);
+		expect(fixture.deliveryOptions).toEqual([{ triggerTurn: true, deliverAs: "followUp" }]);
 		expect(fixture.delivered).toHaveLength(0);
 		expect(fixture.cursors).toHaveLength(0);
 	});

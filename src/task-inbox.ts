@@ -4,7 +4,6 @@ const TASK_EVENT_CUSTOM_TYPE = "wolfpack-task-event";
 const TASK_CURSOR_CUSTOM_TYPE = "wolfpack-task-cursor";
 
 interface InboxContext {
-	readonly isIdle: () => boolean;
 	readonly hasPendingMessages: () => boolean;
 	readonly sessionManager: {
 		readonly buildContextEntries: () => readonly unknown[];
@@ -13,7 +12,7 @@ interface InboxContext {
 }
 
 interface InboxPi {
-	sendMessage(message: { readonly customType: string; readonly content: string; readonly display: boolean; readonly details: TaskEventDetails }, options: { readonly triggerTurn: true }): void;
+	sendMessage(message: { readonly customType: string; readonly content: string; readonly display: boolean; readonly details: TaskEventDetails }, options: { readonly triggerTurn: true; readonly deliverAs: "followUp" }): void;
 	appendEntry(customType: string, data: { readonly cursor: string }): void;
 }
 
@@ -29,7 +28,7 @@ interface InboxClient {
 }
 
 export async function deliverTaskInbox(pi: InboxPi, client: InboxClient, ctx: InboxContext, initialCursor: string): Promise<string> {
-	if (!ctx.isIdle() || ctx.hasPendingMessages()) return initialCursor;
+	if (ctx.hasPendingMessages()) return initialCursor;
 	const entries = ctx.sessionManager.getEntries();
 	const incorporated = incorporatedEvents(entries);
 	const includeAcknowledged = initialCursor === "0" && !hasPersistedCursor(entries);
@@ -40,10 +39,10 @@ export async function deliverTaskInbox(pi: InboxPi, client: InboxClient, ctx: In
 			const disposition = inboxDisposition(event.type);
 			if (disposition === "internal") continue;
 			if (disposition === "unknown") throw new Error(`unknown task inbox event type: ${event.type}`);
-			if (!ctx.isIdle() || ctx.hasPendingMessages()) return cursor;
+			if (ctx.hasPendingMessages()) return cursor;
 			const eventKey = key(event.taskId, event.id);
 			const snapshot = await client.status(event.taskId);
-			if (!ctx.isIdle() || ctx.hasPendingMessages()) return cursor;
+			if (ctx.hasPendingMessages()) return cursor;
 			if (incorporated.has(eventKey)) {
 				if (event.destination.sessionId === snapshot.task.target.sessionId) await client.delivered(event.taskId, event.id);
 				continue;
@@ -54,7 +53,7 @@ export async function deliverTaskInbox(pi: InboxPi, client: InboxClient, ctx: In
 				content: renderTaskEvent(event, snapshot),
 				display: true,
 				details: { taskId: event.taskId, eventId: event.id },
-			}, { triggerTurn: true });
+			}, { triggerTurn: true, deliverAs: "followUp" });
 			if (!incorporatedEvents(ctx.sessionManager.getEntries()).has(eventKey)) return cursor;
 			incorporated.add(eventKey);
 			if (event.destination.sessionId === snapshot.task.target.sessionId) await client.delivered(event.taskId, event.id);

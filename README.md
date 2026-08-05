@@ -53,7 +53,7 @@ Context is optional, curated Markdown plus deliberately selected ref metadata. T
 
 Initial limits are 16 KiB UTF-8 each for task instructions and context summary, 48 KiB for the assignment envelope, and 64 KiB for an HTTP request body. The initial size limits require representative payload benchmarking before adjustment.
 
-`agent_task_send` waits for durable gateway receipt, not task execution. A remote initial send has one initial attempt: the receiver persists a provisional receipt, then receives sender confirmation before Pi can see the assignment. Later peer confirmation, messages, terminal updates, cancellation, delivery notices, and parent acknowledgment have four total attempts: the initial attempt plus retries around 1, 2, and 4 seconds with jitter. Exhaustion is a visible local delivery failure, not a background queue or offline dispatch promise.
+`agent_task_send` waits for durable gateway acceptance, not adapter insertion or task execution; delivery remains pending until `task.delivered`. A remote initial send has one initial attempt: the receiver persists a provisional receipt, then receives sender confirmation before Pi can see the assignment. Later peer confirmation, messages, terminal updates, cancellation, delivery notices, and parent acknowledgment have four total attempts: the initial attempt plus retries around 1, 2, and 4 seconds with jitter. Exhaustion is a visible local delivery failure, not a background queue or offline dispatch promise.
 
 Normal delegation is fire-and-forget. Use `agent_task_wait` only when the user explicitly asks to block.
 
@@ -84,13 +84,13 @@ The sender gateway owns canonical event order, timeout, and terminal state. The 
 
 ## structured delivery and replay
 
-The extension polls the local gateway every five seconds and only injects events when Pi is idle with no pending messages. It uses Pi structured custom messages with `{ taskId, eventId }` details, so task context participates in the session without parsing prose.
+The extension polls the local gateway every five seconds. With no pending message, it submits each visible event as a structured custom message using Pi's safe `deliverAs: "followUp"` mode: idle Pi starts immediately, while an active turn finishes before the queued event starts the next turn. It never steers or interrupts active work. Delivery remains pending until `task.delivered`. The `{ taskId, eventId }` details let task context participate in the session without parsing prose.
 
 On start or resume it rebuilds incorporated IDs from the full durable session entry set, not only active prompt context. A session gets only missing events; a new Pi session in the same Wolfpack PTY gets complete active history. The receiver records gateway delivery only after the structured insertion exists. A restart after insertion and before acknowledgment therefore acknowledges the existing entry without duplicate injection. Unknown model-visible events fail closed without advancing the cursor. Gateway delivery is at-least-once; this does not claim exactly-once model execution.
 
 ## parent workflow
 
-1. create or select a Wolfpack Pi session with the canonical session-control workflow and retain its stable broker ID.
+1. create or select a Wolfpack Pi session with the canonical session-control workflow and retain its stable broker ID. Spawn a disposable worker without an initial model prompt so it reaches idle before assignment; put worker instructions in `agent_task_send.task`.
 2. before remote dispatch, complete Wolfpack's [Live-peer readiness checklist](https://github.com/almogdepaz/wolfpack/blob/main/docs/task-gateway.md#live-peer-readiness-checklist) and retain operator-recorded package/reload evidence; only then check the target's local requirements and send compact instructions with curated context and selected refs when they save receiver investigation.
 3. keep working; use `agent_task_status` or `agent_task_inbox` for structured follow-up, and `agent_task_message` for questions, answers, and decisions.
 4. verify cited files, diffs, tests, and paths-only artifact metadata independently before reporting success.

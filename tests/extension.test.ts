@@ -106,11 +106,14 @@ describe("gateway-backed task tools", () => {
 	test("sends the locked gateway request shape without legacy fields", async () => {
 		const client = clientFixture();
 		const tools = toolsFor(client);
-		await tools.agent_task_send!.execute("call", {
+		const receipt = await tools.agent_task_send!.execute("call", {
 			to: { machine: "local", sessionId: "receiver" }, task: "implement narrowly",
 			context: { summary: "## progress\n- scoped", refs: [{ path: "src/extension.ts", selector: "L1", purpose: "scope" }] },
 			role: "implementer", preflight: { requiredProject: "repo" }, metadata: { issueId: "task-3" }, onCompletePrompt: "review diff", timeoutMs: 1_000, idempotencyKey: "send-1",
 		}, new AbortController().signal, undefined, { cwd: "/tmp/project" });
+		expect(receipt.content[0]?.text).toContain("## task accepted");
+		expect(receipt.content[0]?.text).toContain("delivery: pending adapter insertion");
+		expect(receipt.content[0]?.text).not.toContain("## task received");
 		expect(client.calls).toEqual([{
 			name: "send",
 			input: {

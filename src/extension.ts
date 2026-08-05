@@ -103,7 +103,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, client: WolfpackGateway
 		async execute(_toolCallId, params, signal) {
 			try {
 				const receipt = await client.send(params, signal);
-				return toolResult(receipt, `## task received\n- task: \`${receipt.taskId}\`\n- target: \`${params.to.machine}/${params.to.sessionId}\`\n${warnings(receipt.warnings)}`);
+				return toolResult(receipt, `## task accepted\n- task: \`${receipt.taskId}\`\n- target: \`${params.to.machine}/${params.to.sessionId}\`\n- delivery: pending adapter insertion (confirmed by \`task.delivered\`)\n${warnings(receipt.warnings)}`);
 			} catch (error) { return clientError(error); }
 		}, renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
 	});

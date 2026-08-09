@@ -3,91 +3,84 @@ import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import {
-	DEFAULT_TASK_TIMEOUT_MS,
-	GatewayClientError,
-	MAX_TASK_TIMEOUT_MS,
-	MIN_TASK_TIMEOUT_MS,
-	createWolfpackGatewayClient,
-	type TaskCompletionInput,
-	type TaskStatus,
-	type WolfpackGatewayClient,
-} from "./gateway-client";
-import { deliverTaskInbox, restoredInboxCursor } from "./task-inbox";
+import { deliverTaskInbox } from "./task-inbox";
+import { createWolfpackTaskCore } from "./wolfpack-task-relay";
+import type { TaskCore } from "./task-core";
 
+const DEFAULT_TASK_TIMEOUT_MS = 30 * 60 * 1_000;
+const MIN_TASK_TIMEOUT_MS = 1_000;
+const MAX_TASK_TIMEOUT_MS = 86_400_000;
 const BACKGROUND_POLL_MS = 5_000;
 const WAIT_POLL_MS = 250;
 const SUMMARY_MAX_CHARS = 1_200;
 
-const AddressParams = Type.Object({
-	machine: Type.String({ minLength: 1, description: "local or a canonical Wolfpack machine identity" }),
-	sessionId: Type.String({ minLength: 1, description: "Stable opaque Wolfpack broker session id" }),
+const EndpointParams = Type.Object({
+	relay: Type.String({ minLength: 1, description: "relay identifier" }),
+	id: Type.String({ minLength: 1, description: "opaque endpoint identifier" }),
 });
-
-const ContextRefParams = Type.Object({
-	path: Type.String({ minLength: 1 }),
-	selector: Type.Optional(Type.String()),
-	purpose: Type.Optional(Type.String()),
-});
-
 const SendParams = Type.Object({
-	to: AddressParams,
+	to: EndpointParams,
 	task: Type.String({ minLength: 1, maxLength: 16 * 1024 }),
-	context: Type.Optional(Type.Object({
-		summary: Type.Optional(Type.String({ minLength: 1, maxLength: 16 * 1024 })),
-		refs: Type.Optional(Type.Array(ContextRefParams)),
-	})),
-	role: Type.Optional(Type.String()),
-	preflight: Type.Optional(Type.Object({ requiredProject: Type.Optional(Type.String()) })),
-	metadata: Type.Optional(Type.Object({
-		phaseId: Type.Optional(Type.String()),
-		issueId: Type.Optional(Type.String()),
-		verificationTier: Type.Optional(Type.String()),
-		rootCause: Type.Optional(Type.String()),
-	})),
-	onCompletePrompt: Type.Optional(Type.String({ maxLength: 4_000 })),
 	timeoutMs: Type.Optional(Type.Integer({ minimum: MIN_TASK_TIMEOUT_MS, maximum: MAX_TASK_TIMEOUT_MS })),
-	idempotencyKey: Type.Optional(Type.String({ minLength: 1 })),
 });
-
 const TaskIdParams = Type.Object({ taskId: Type.String({ minLength: 1 }) });
 const WaitParams = Type.Object({ taskId: Type.String({ minLength: 1 }), timeoutMs: Type.Optional(Type.Integer({ minimum: MIN_TASK_TIMEOUT_MS, maximum: MAX_TASK_TIMEOUT_MS })) });
-const InboxParams = Type.Object({ includeAcknowledged: Type.Optional(Type.Boolean({ default: false })) });
-const MessageParams = Type.Object({
-	taskId: Type.String({ minLength: 1 }),
-	type: StringEnum(["question", "answer", "information"] as const),
-	message: Type.String({ minLength: 1, maxLength: 16 * 1024 }),
-	replyToMessageId: Type.Optional(Type.String({ minLength: 1 })),
-});
+const MessageParams = Type.Object({ taskId: Type.String({ minLength: 1 }), type: StringEnum(["question", "answer", "information"] as const), message: Type.String({ minLength: 1, maxLength: 16 * 1024 }) });
 const DoneParams = Type.Object({
-	taskId: Type.String({ minLength: 1 }),
-	status: StringEnum(["completed", "failed", "cancelled"] as const),
-	summary: Type.String({ minLength: 1, maxLength: SUMMARY_MAX_CHARS }),
+	taskId: Type.String({ minLength: 1 }), status: StringEnum(["completed", "failed", "cancelled"] as const), summary: Type.String({ minLength: 1, maxLength: SUMMARY_MAX_CHARS }),
 	result: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
 	error: Type.Optional(Type.Object({ code: Type.String(), message: Type.String(), retryable: Type.Boolean() })),
-	artifacts: Type.Optional(Type.Array(Type.Object({ path: Type.String({ minLength: 1, description: "artifact paths must name receiver-project-relative regular files to inspect; artifacts are not a changed-file list." }), mimeType: Type.Optional(Type.String()), description: Type.Optional(Type.String()) }))),
+	artifacts: Type.Optional(Type.Array(Type.Object({ path: Type.String({ minLength: 1, description: "artifact paths are receiver-project-relative regular files" }), mimeType: Type.Optional(Type.String()), description: Type.Optional(Type.String()) }))),
 });
 
-export function registerAgentTaskTools(pi: ExtensionAPI, client: WolfpackGatewayClient = createWolfpackGatewayClient()): void {
-	let backgroundTimer: ReturnType<typeof setInterval> | undefined;
+export type ConfiguredCoreFactory = (signal?: AbortSignal) => Promise<TaskCore>;
+
+/** Reuses a successful configured core while allowing the next lifecycle operation to retry a failed setup. */
+export function createConfiguredCoreLoader(factory: ConfiguredCoreFactory): ConfiguredCoreFactory {
+	let corePromise: Promise<TaskCore> | undefined;
+	return async (signal?: AbortSignal): Promise<TaskCore> => {
+		if (corePromise) return corePromise;
+		const candidate = Promise.resolve().then(() => factory(signal));
+		corePromise = candidate;
+		try {
+			return await candidate;
+		} catch (error) {
+			if (corePromise === candidate) corePromise = undefined;
+			throw error;
+		}
+	};
+}
+
+/** Registers v2 endpoint-owned tools using a configured durable Wolfpack relay by default. */
+export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefined = undefined, createCore: ConfiguredCoreFactory = (signal) => createWolfpackTaskCore({}, signal)): void {
 	let inboxContext: ExtensionContext | undefined;
-	const refreshInbox = createSingleFlightInboxRefresh(async () => {
+	let backgroundTimer: ReturnType<typeof setInterval> | undefined;
+	const configuredCore: ConfiguredCoreFactory = core === undefined ? createConfiguredCoreLoader(createCore) : async (): Promise<TaskCore> => core;
+	const refreshInbox = createSingleFlightInboxRefresh(async (signal) => {
 		if (!inboxContext) return;
-		const cursor = restoredInboxCursor(inboxContext.sessionManager.getEntries());
-		await deliverTaskInbox(pi, client, inboxContext, cursor);
+		const activeCore = await configuredCore(signal);
+		await activeCore.flushOutbox(signal);
+		await activeCore.evaluateTimeouts(signal);
+		await deliverTaskInbox(pi, activeCore, inboxContext, signal);
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
-		inboxContext = ctx;
-		ctx.ui.setStatus("wolfpack-tasks", ctx.ui.theme.fg("dim", `tasks: ${client.callerSession}`));
-		backgroundTimer = setInterval(() => {
-			void refreshInbox().catch(() => ctx.ui.setStatus("wolfpack-tasks", ctx.ui.theme.fg("warning", "tasks: unavailable")));
-		}, BACKGROUND_POLL_MS);
-		await refreshInbox().catch(() => undefined);
+	pi.on("session_start", async (_event, context) => {
+		inboxContext = context;
+		try {
+			await (await configuredCore()).connect();
+			backgroundTimer = setInterval(() => {
+				void refreshInbox().catch(() => {
+					context.ui.setStatus("pi-tasks", context.ui.theme.fg("warning", "tasks: relay unavailable"));
+				});
+			}, BACKGROUND_POLL_MS);
+			await refreshInbox();
+		} catch {
+			context.ui.setStatus("pi-tasks", context.ui.theme.fg("warning", "tasks: relay unavailable"));
+		}
 	});
-	pi.on("agent_end", async (_event, ctx) => {
-		inboxContext = ctx;
-		setTimeout(() => { void refreshInbox().catch(() => undefined); }, 0);
+	pi.on("agent_end", async (_event, context) => {
+		inboxContext = context;
+		await refreshInbox();
 	});
 	pi.on("session_shutdown", () => {
 		if (backgroundTimer) clearInterval(backgroundTimer);
@@ -96,104 +89,83 @@ export function registerAgentTaskTools(pi: ExtensionAPI, client: WolfpackGateway
 	});
 
 	pi.registerTool({
-		name: "agent_task_send", label: "Send Agent Task", description: "Durably send a bounded task to an existing Wolfpack Pi session.",
-		promptSnippet: "Send nonblocking structured tasks through the local Wolfpack gateway",
-		promptGuidelines: ["Use agent_task_send for normal nonblocking delegation; do not wait unless the user explicitly asks."],
-		parameters: SendParams,
-		async execute(_toolCallId, params, signal) {
+		name: "agent_task_send", label: "Send Agent Task", description: "Persist an endpoint-owned task and submit its opaque assignment envelope to a relay.", parameters: SendParams,
+		async execute(_id, params, signal) {
 			try {
-				const receipt = await client.send(params, signal);
-				return toolResult(receipt, `## task accepted\n- task: \`${receipt.taskId}\`\n- target: \`${params.to.machine}/${params.to.sessionId}\`\n- delivery: pending adapter insertion (confirmed by \`task.delivered\`)\n${warnings(receipt.warnings)}`);
-			} catch (error) { return clientError(error); }
+				const sent = await (await configuredCore(signal)).createTask({ target: params.to, task: params.task, timeoutMs: params.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS }, signal);
+				return toolResult(sent, `## task accepted\n- task: \`${sent.taskId}\`\n- target: \`${params.to.relay}/${params.to.id}\`\n- delivery: relay acceptance only`);
+			} catch (error) { return taskError(error); }
+		},
+		renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
+	});
+	pi.registerTool({
+		name: "agent_task_status", label: "Task Status", description: "Read local endpoint-owned task state; status is unavailable while its origin is offline.", parameters: TaskIdParams,
+		async execute(_id, params, signal) {
+			try {
+				const task = (await configuredCore(signal)).getTask(params.taskId);
+				return task ? toolResult(task, `## task status\n- task: \`${task.taskId}\`\n- status: ${task.status}`) : taskError(new Error("unknown local task"));
+			} catch (error) { return taskError(error); }
 		}, renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
 	});
-
 	pi.registerTool({
-		name: "agent_task_status", label: "Task Status", description: "Read compact structured task status from Wolfpack.", parameters: TaskIdParams,
-		async execute(_toolCallId, params, signal) {
-			try { const status = await client.status(params.taskId, signal); return statusResult(status); } catch (error) { return clientError(error); }
-		}, renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
-	});
-
-	pi.registerTool({
-		name: "agent_task_wait", label: "Wait Agent Task", description: "Block only when explicitly invoked until a task reaches a terminal state or this wait times out.", parameters: WaitParams,
-		async execute(_toolCallId, params, signal, onUpdate) {
+		name: "agent_task_wait", label: "Wait Agent Task", description: "Wait for a locally-known endpoint-owned task to reach a terminal state.", parameters: WaitParams,
+		async execute(_id, params, signal, onUpdate) {
 			const deadline = Date.now() + (params.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS);
 			try {
 				for (;;) {
-					throwIfAborted(signal);
-					const status = await client.status(params.taskId, signal);
-					if (terminal(status.status)) return statusResult(status);
-					if (Date.now() >= deadline) return toolResult({ taskId: params.taskId, status: status.status, error: { code: "WAIT_TIMEOUT", retryable: true } }, `## task wait\n- task: \`${params.taskId}\`\n- status: ${status.status}\n- wait timed out`);
+					await refreshInbox(signal);
+					const task = (await configuredCore(signal)).getTask(params.taskId);
+					if (!task) return taskError(new Error("unknown local task"));
+					if (terminal(task.status)) return toolResult(task, `## task status\n- task: \`${task.taskId}\`\n- status: ${task.status}`);
+					if (Date.now() >= deadline) return toolResult({ taskId: params.taskId, status: task.status }, `## task wait\n- task: \`${params.taskId}\`\n- status: ${task.status}\n- wait timed out`);
 					onUpdate?.({ content: [{ type: "text", text: `waiting for ${params.taskId}...` }], details: {} });
-					await sleep(Math.min(WAIT_POLL_MS, Math.max(1, deadline - Date.now())), signal);
+					await sleep(Math.min(WAIT_POLL_MS, deadline - Date.now()), signal);
 				}
-			} catch (error) { return clientError(error); }
+			} catch (error) { return taskError(error); }
 		}, renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
 	});
-
 	pi.registerTool({
-		name: "agent_task_inbox", label: "Task Inbox", description: "Read inbox task events without acknowledging them.", parameters: InboxParams,
-		async execute(_toolCallId, params, signal) {
+		name: "agent_task_inbox", label: "Task Inbox", description: "Read local task records after processing relay deliveries without acknowledging task lifecycle.", parameters: Type.Object({}),
+		async execute(_id, _params, signal) {
 			try {
-				let cursor = "0";
-				const taskIds = new Set<string>();
-				for (;;) {
-					const page = await client.inbox(cursor, params.includeAcknowledged ?? false, signal);
-					for (const event of page.events) taskIds.add(event.taskId);
-					if (!page.hasMore) break;
-					cursor = page.nextCursor;
-				}
-				const tasks = await Promise.all([...taskIds].map((taskId) => client.status(taskId, signal)));
-				return toolResult({ tasks }, `## task inbox\n${tasks.length === 0 ? "- empty" : tasks.map((task) => `- \`${task.task.taskId}\`: ${task.status}${task.completion ? ` — ${task.completion.summary}` : ""}`).join("\n")}`);
-			} catch (error) { return clientError(error); }
-		}, renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
+				await refreshInbox(signal);
+				const tasks = (await configuredCore(signal)).listTasks();
+				return toolResult({ tasks }, `## task inbox\n${tasks.map((task) => `- \`${task.taskId}\`: ${task.status}`).join("\n") || "- empty"}`);
+			} catch (error) { return taskError(error); }
+		},
+		renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
 	});
-
 	pi.registerTool({
-		name: "agent_task_ack", label: "Acknowledge Agent Task", description: "Acknowledge one independently verified terminal task.", parameters: TaskIdParams,
-		async execute(_toolCallId, params, signal) {
-			try { return toolResult(await client.ack(params.taskId, signal), `## task acknowledged\n- task: \`${params.taskId}\``); } catch (error) { return clientError(error); }
-		}, renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
+		name: "agent_task_message", label: "Message Agent Task", description: "Persist a message intent before relay submission.", parameters: MessageParams,
+		async execute(_id, params, signal) { try { await (await configuredCore(signal)).submitIntent({ taskId: params.taskId, type: `task.${params.type}`, payload: { message: params.message } }, signal); return toolResult({ taskId: params.taskId }, `## task ${params.type}\n- task: \`${params.taskId}\``); } catch (error) { return taskError(error); } },
+		renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
 	});
-
 	pi.registerTool({
-		name: "agent_task_message", label: "Message Agent Task", description: "Durably send a question, answer, or information event for a task.", parameters: MessageParams,
-		async execute(_toolCallId, params, signal) {
+		name: "agent_task_cancel", label: "Cancel Agent Task", description: "Persist cancellation before relay submission.", parameters: TaskIdParams,
+		async execute(_id, params, signal) { try { await (await configuredCore(signal)).submitIntent({ taskId: params.taskId, type: "task.cancelled", payload: {} }, signal); return toolResult({ taskId: params.taskId }, `## task cancellation requested\n- task: \`${params.taskId}\``); } catch (error) { return taskError(error); } },
+		renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
+	});
+	pi.registerTool({
+		name: "agent_task_ack", label: "Acknowledge Agent Task", description: "Record parent acknowledgement as an origin-owned logical event.", parameters: TaskIdParams,
+		async execute(_id, params, signal) { try { await (await configuredCore(signal)).acknowledgeParent(params.taskId, signal); return toolResult({ taskId: params.taskId }, `## task acknowledged\n- task: \`${params.taskId}\``); } catch (error) { return taskError(error); } },
+		renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
+	});
+	pi.registerTool({
+		name: "agent_task_done", label: "Complete Agent Task", description: "Persist a terminal task intent before relay submission.", parameters: DoneParams,
+		async execute(_id, params, signal) {
 			try {
-				const [identity, status] = await Promise.all([client.sessionStatus(signal), client.status(params.taskId, signal)]);
-				const receipt = await client.message(params, signal);
-				const receiverQuestion = params.type === "question" && identity.sessionId === status.task.target.sessionId;
-				return { ...toolResult(receipt, `## task ${params.type}\n- task: \`${params.taskId}\`\n${params.message}`), ...(receiverQuestion ? { terminate: true } : {}) };
-			} catch (error) { return clientError(error); }
-		}, renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
-	});
-
-	pi.registerTool({
-		name: "agent_task_cancel", label: "Cancel Agent Task", description: "Request cancellation for a non-terminal task through Wolfpack.", parameters: TaskIdParams,
-		async execute(_toolCallId, params, signal) {
-			try { const receipt = await client.cancel(params.taskId, signal); return toolResult(receipt, `## task cancellation requested\n- task: \`${params.taskId}\`${warnings(receipt.warnings)}`); } catch (error) { return clientError(error); }
-		}, renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
-	});
-
-	pi.registerTool({
-		name: "agent_task_done", label: "Complete Agent Task", description: "Finish an assigned task with a structured terminal result. Report source modifications in result.changedFiles; artifacts are receiver-project-relative regular files to inspect, not a changed-file list. Use exactly once as the final action.",
-		promptSnippet: "Complete an assigned task: report changed files in result.changedFiles and artifacts separately", promptGuidelines: ["Report source modifications under result.changedFiles. Reserve artifacts for receiver-project-relative regular files a parent should inspect, not changed-file lists.", "Use agent_task_done exactly once as the final action for an assigned task."], parameters: DoneParams,
-		async execute(_toolCallId, params, signal) {
-			try {
-				const result: TaskCompletionInput = { summary: params.summary, ...(params.result && { result: params.result }), ...(params.error && { error: params.error }), ...(params.artifacts && { artifacts: params.artifacts }) };
-				const receipt = await client.complete({ taskId: params.taskId, status: params.status, result }, signal);
-				return { ...toolResult(receipt, `## task ${params.status}\n- task: \`${params.taskId}\`\n- ${params.summary}${warnings(receipt.warnings)}`), terminate: true };
-			} catch (error) { return clientError(error); }
+				await (await configuredCore(signal)).submitIntent({ taskId: params.taskId, type: `task.${params.status}`, payload: { summary: params.summary, ...(params.result === undefined ? {} : { result: params.result }), ...(params.error === undefined ? {} : { error: params.error }), ...(params.artifacts === undefined ? {} : { artifacts: params.artifacts }) } }, signal);
+				return { ...toolResult({ taskId: params.taskId }, `## task ${params.status}\n- task: \`${params.taskId}\`\n- ${params.summary}`), terminate: true };
+			} catch (error) { return taskError(error); }
 		}, renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
 	});
 }
 
-export function createSingleFlightInboxRefresh(refresh: () => Promise<void>): () => Promise<void> {
+export function createSingleFlightInboxRefresh(refresh: (signal?: AbortSignal) => Promise<void>): (signal?: AbortSignal) => Promise<void> {
 	let inFlight: Promise<void> | undefined;
-	return (): Promise<void> => {
+	return (signal): Promise<void> => {
 		if (inFlight) return inFlight;
-		const current = refresh().finally(() => {
+		const current = refresh(signal).finally(() => {
 			if (inFlight === current) inFlight = undefined;
 		});
 		inFlight = current;
@@ -205,29 +177,17 @@ export default function piTasks(pi: ExtensionAPI): void {
 	registerAgentTaskTools(pi);
 }
 
-function statusResult(status: TaskStatus): AgentToolResult<unknown> {
-	return toolResult(status, `## task status\n- task: \`${status.task.taskId}\`\n- status: ${status.status}${status.completion ? `\n- summary: ${status.completion.summary}` : ""}${warnings(status.warnings)}`);
-}
-
 function toolResult(details: unknown, markdown: string): AgentToolResult<unknown> {
 	return { content: [{ type: "text", text: markdown }], details };
 }
 
-function clientError(error: unknown): AgentToolResult<unknown> {
-	const gateway = error instanceof GatewayClientError ? error : new GatewayClientError("CLIENT_ERROR", error instanceof Error ? error.message : "task gateway request failed", true);
-	const path = gateway.path === undefined ? {} : { path: gateway.path };
-	return toolResult(
-		{ error: { code: gateway.code, message: gateway.message, retryable: gateway.retryable, ...path } },
-		`## task gateway error\n- ${gateway.code}: ${gateway.message}${gateway.path === undefined ? "" : `\n- path: \`${gateway.path}\``}`,
-	);
-}
-
-function warnings(values: readonly { readonly code: string; readonly message: string }[]): string {
-	return values.length === 0 ? "" : `\n## gateway warnings\n${values.map((value) => `- ${value.code}: ${value.message}`).join("\n")}`;
+function taskError(error: unknown): AgentToolResult<unknown> {
+	const message = error instanceof Error ? error.message : "task operation failed";
+	return toolResult({ error: { code: "TASK_ERROR", message, retryable: true } }, `## task error\n- ${message}`);
 }
 
 function terminal(status: string): boolean {
-	return status === "completed" || status === "failed" || status === "cancelled" || status === "timed_out";
+	return ["completed", "failed", "cancelled", "timed_out"].includes(status);
 }
 
 function text(result: { readonly content?: readonly unknown[] }): string {
@@ -235,14 +195,10 @@ function text(result: { readonly content?: readonly unknown[] }): string {
 	return first && typeof first === "object" && "type" in first && first.type === "text" && "text" in first && typeof first.text === "string" ? first.text : "";
 }
 
-function throwIfAborted(signal: AbortSignal | undefined): void {
-	if (signal?.aborted) throw new GatewayClientError("ABORTED", "task wait was cancelled", true);
-}
-
 async function sleep(milliseconds: number, signal: AbortSignal | undefined): Promise<void> {
+	if (signal?.aborted) throw new Error("task wait was cancelled");
 	await new Promise<void>((resolve, reject) => {
-		const timeout = setTimeout(resolve, milliseconds);
-		const abort = (): void => { clearTimeout(timeout); reject(new GatewayClientError("ABORTED", "task wait was cancelled", true)); };
-		signal?.addEventListener("abort", abort, { once: true });
+		const timer = setTimeout(resolve, Math.max(1, milliseconds));
+		signal?.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("task wait was cancelled")); }, { once: true });
 	});
 }

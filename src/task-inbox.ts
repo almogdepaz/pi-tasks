@@ -1,14 +1,13 @@
-import type { TaskAssignment, TaskEvent, TaskStatus, WolfpackGatewayClient } from "./gateway-client";
+import type { TaskCore } from "./task-core";
+import { TaskEnvelopeKind, TaskProtocolError } from "./task-protocol";
+import type { RelayDelivery, TaskEvent } from "./task-protocol";
 
-const TASK_EVENT_CUSTOM_TYPE = "wolfpack-task-event";
-const TASK_CURSOR_CUSTOM_TYPE = "wolfpack-task-cursor";
+const TASK_EVENT_CUSTOM_TYPE = "pi-tasks-event";
+const TASK_CURSOR_CUSTOM_TYPE = "pi-tasks-relay-cursor";
 
 interface InboxContext {
 	readonly hasPendingMessages: () => boolean;
-	readonly sessionManager: {
-		readonly buildContextEntries: () => readonly unknown[];
-		readonly getEntries: () => readonly unknown[];
-	};
+	readonly sessionManager: { readonly getEntries: () => readonly unknown[] };
 }
 
 interface InboxPi {
@@ -21,62 +20,33 @@ interface TaskEventDetails {
 	readonly eventId: string;
 }
 
-interface InboxClient {
-	inbox(cursor: string, includeAcknowledged: boolean): Promise<{ readonly events: readonly TaskEvent[]; readonly nextCursor: string; readonly hasMore: boolean }>;
-	status(taskId: string): Promise<TaskStatus>;
-	delivered(taskId: string, eventId: string): Promise<unknown>;
-}
-
-export async function deliverTaskInbox(pi: InboxPi, client: InboxClient, ctx: InboxContext, initialCursor: string): Promise<string> {
-	if (ctx.hasPendingMessages()) return initialCursor;
-	const entries = ctx.sessionManager.getEntries();
-	const incorporated = incorporatedEvents(entries);
-	const includeAcknowledged = initialCursor === "0" && !hasPersistedCursor(entries);
-	let cursor = initialCursor;
-	for (;;) {
-		const page = await client.inbox(cursor, includeAcknowledged);
-		for (const event of page.events) {
-			const disposition = inboxDisposition(event.type);
-			if (disposition === "internal") continue;
-			if (disposition === "unknown") throw new Error(`unknown task inbox event type: ${event.type}`);
-			if (ctx.hasPendingMessages()) return cursor;
-			const eventKey = key(event.taskId, event.id);
-			const snapshot = await client.status(event.taskId);
-			if (ctx.hasPendingMessages()) return cursor;
-			if (incorporated.has(eventKey)) {
-				if (event.destination.sessionId === snapshot.task.target.sessionId) await client.delivered(event.taskId, event.id);
-				continue;
-			}
-			if (terminalHistoryAcknowledged(snapshot)) continue;
+/** Inserts durable Pi evidence before allowing the relay mailbox cursor to advance. */
+export async function deliverTaskInbox(pi: InboxPi, core: TaskCore, context: InboxContext, signal?: AbortSignal): Promise<void> {
+	if (context.hasPendingMessages()) return;
+	const deliveries = await core.receive(signal);
+	for (const delivery of deliveries) {
+		if (delivery.envelope.kind === TaskEnvelopeKind.intent) {
+			await core.acknowledgeRelayDelivery(delivery.cursor, signal);
+			pi.appendEntry(TASK_CURSOR_CUSTOM_TYPE, { cursor: delivery.cursor });
+			continue;
+		}
+		const event = inboxEvent(delivery);
+		if (!isKnownEvent(event.type)) throw new TaskProtocolError("UNKNOWN_EVENT", `unknown task inbox event type: ${event.type}`);
+		if (context.hasPendingMessages()) return;
+		const eventKey = key(event.taskId, event.eventId);
+		if (!incorporatedEvents(context.sessionManager.getEntries()).has(eventKey) && isModelVisible(event.type)) {
 			pi.sendMessage({
 				customType: TASK_EVENT_CUSTOM_TYPE,
-				content: renderTaskEvent(event, snapshot),
+				content: renderTaskEvent(event),
 				display: true,
-				details: { taskId: event.taskId, eventId: event.id },
+				details: { taskId: event.taskId, eventId: event.eventId },
 			}, { triggerTurn: true, deliverAs: "followUp" });
-			if (!incorporatedEvents(ctx.sessionManager.getEntries()).has(eventKey)) return cursor;
-			incorporated.add(eventKey);
-			if (event.destination.sessionId === snapshot.task.target.sessionId) await client.delivered(event.taskId, event.id);
+			if (!incorporatedEvents(context.sessionManager.getEntries()).has(eventKey)) return;
 		}
-		// Inbox cursors are machine-local delivery sequences, never task event sequences.
-		cursor = page.nextCursor;
-		pi.appendEntry(TASK_CURSOR_CUSTOM_TYPE, { cursor });
-		if (!page.hasMore) return cursor;
+		if (isModelVisible(event.type)) await core.recordInsertion({ taskId: event.taskId, eventId: event.eventId }, signal);
+		await core.acknowledgeRelayDelivery(delivery.cursor, signal);
+		pi.appendEntry(TASK_CURSOR_CUSTOM_TYPE, { cursor: delivery.cursor });
 	}
-}
-
-function hasPersistedCursor(entries: readonly unknown[]): boolean {
-	return entries.some((entry) => isRecord(entry) && entry.type === "custom" && entry.customType === TASK_CURSOR_CUSTOM_TYPE && isRecord(entry.data) && decimal(entry.data.cursor));
-}
-
-function inboxDisposition(type: string): "model-visible" | "internal" | "unknown" {
-	if (type === "task.created" || type === "task.question" || type === "task.answer" || type === "task.information" || terminalEvent(type) || type === "task.cancel_requested") return "model-visible";
-	if (type === "task.received" || type === "task.receipt_confirmed" || type === "task.delivered" || type === "message.delivered" || type === "task.parent_ack_pending" || type === "task.parent_acknowledged" || type === "event.delivery_failed" || type === "task.late_terminal") return "internal";
-	return "unknown";
-}
-
-function terminalHistoryAcknowledged(snapshot: TaskStatus): boolean {
-	return ["completed", "failed", "cancelled", "timed_out"].includes(snapshot.status) && snapshot.events.some((event) => event.type === "task.parent_acknowledged");
 }
 
 export function restoredInboxCursor(entries: readonly unknown[]): string {
@@ -88,47 +58,42 @@ export function restoredInboxCursor(entries: readonly unknown[]): string {
 	return cursor;
 }
 
-export function incorporatedEvents(entries: readonly unknown[]): Set<string> {
+function inboxEvent(delivery: RelayDelivery): TaskEvent {
+	try {
+		const payload = JSON.parse(delivery.envelope.payload) as unknown;
+		if (!isRecord(payload)) throw new Error("not an object");
+		if (delivery.envelope.kind === TaskEnvelopeKind.assignment && isTaskEvent(payload.event)) return payload.event;
+		if (delivery.envelope.kind === TaskEnvelopeKind.canonicalEvent && isTaskEvent(payload)) return payload;
+	} catch { /* normalize malformed opaque payloads to a protocol error */ }
+	throw new TaskProtocolError("INVALID_INBOX_EVENT", "relay envelope does not contain a valid model event");
+}
+
+function isKnownEvent(type: string): boolean {
+	return ["task.created", "task.completed", "task.failed", "task.cancelled", "task.timed_out", "task.information", "task.question", "task.answer", "task.delivery_receipt", "task.parent_acknowledged", "task.late_terminal"].includes(type);
+}
+
+function isModelVisible(type: string): boolean {
+	return !["task.delivery_receipt", "task.parent_acknowledged", "task.late_terminal"].includes(type);
+}
+
+function renderTaskEvent(event: TaskEvent): string {
+	if (event.type === "task.created") return `## task assignment\ntask: \`${event.taskId}\` · event: \`${event.eventId}\`\n\n${String(event.payload.task ?? "")}`;
+	const body = typeof event.payload.message === "string" ? `\n\n${event.payload.message}` : "";
+	const summary = typeof event.payload.summary === "string" ? `\n\n**summary:** ${event.payload.summary}` : "";
+	return `## task ${event.type.replace(/^task\./, "").replaceAll("_", " ")}\ntask: \`${event.taskId}\` · event: \`${event.eventId}\`${body}${summary}`;
+}
+
+function incorporatedEvents(entries: readonly unknown[]): Set<string> {
 	const events = new Set<string>();
 	for (const entry of entries) {
-		if (!isRecord(entry) || entry.type !== "custom_message" || entry.customType !== TASK_EVENT_CUSTOM_TYPE || !isRecord(entry.details) || !nonEmpty(entry.details.taskId) || !nonEmpty(entry.details.eventId)) continue;
+		if (!isRecord(entry) || entry.type !== "custom_message" || entry.customType !== TASK_EVENT_CUSTOM_TYPE || !isRecord(entry.details) || typeof entry.details.taskId !== "string" || typeof entry.details.eventId !== "string") continue;
 		events.add(key(entry.details.taskId, entry.details.eventId));
 	}
 	return events;
 }
 
-export function renderTaskEvent(event: TaskEvent, snapshot: TaskStatus): string {
-	const header = `task: \`${event.taskId}\` · event: \`${event.id}\``;
-	if (event.type === "task.created") return renderAssignment(header, snapshot.task, snapshot.warnings);
-	const message = event.message ? `\n\n${event.message}` : "";
-	const completion = event.completion ?? snapshot.completion;
-	const completionText = completion ? `\n\n**summary:** ${completion.summary}` : "";
-	const parentPrompt = terminalEvent(event.type) && event.destination.sessionId === snapshot.task.source.sessionId && snapshot.task.onCompletePrompt
-		? `\n\n## parent follow-up\n${snapshot.task.onCompletePrompt}`
-		: "";
-	const warnings = renderWarnings(snapshot.warnings);
-	return `## task ${label(event.type)}\n${header}${message}${completionText}${parentPrompt}${warnings}`;
-}
-
-function renderAssignment(header: string, assignment: TaskAssignment, warnings: readonly { readonly code: string; readonly message: string }[]): string {
-	const role = assignment.role ? `\n\n## role\n${assignment.role}` : "";
-	const context = assignment.context?.summary ? `\n\n## context\n${assignment.context.summary}` : "";
-	const refs = assignment.context?.refs?.length
-		? `\n\n## selected refs\n${assignment.context.refs.map((ref) => `- \`${ref.path}\`${ref.selector ? ` — ${ref.selector}` : ""}${ref.purpose ? ` — ${ref.purpose}` : ""}`).join("\n")}`
-		: "";
-	return `## task assignment\n${header}\n\n${assignment.task}${role}${context}${refs}${renderWarnings(warnings)}`;
-}
-
-function renderWarnings(warnings: readonly { readonly code: string; readonly message: string }[]): string {
-	return warnings.length === 0 ? "" : `\n\n## gateway warnings\n${warnings.map((warning) => `- ${warning.code}: ${warning.message}`).join("\n")}`;
-}
-
-function label(type: string): string {
-	return type.replace(/^task\./, "").replaceAll("_", " ");
-}
-
-function terminalEvent(type: string): boolean {
-	return type === "task.completed" || type === "task.failed" || type === "task.cancelled" || type === "task.timed_out";
+function isTaskEvent(value: unknown): value is TaskEvent {
+	return isRecord(value) && typeof value.eventId === "string" && typeof value.taskId === "string" && typeof value.type === "string" && typeof value.sequence === "string" && isRecord(value.source) && isRecord(value.target) && typeof value.occurredAt === "number" && isRecord(value.payload);
 }
 
 function key(taskId: string, eventId: string): string {
@@ -137,10 +102,6 @@ function key(taskId: string, eventId: string): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function nonEmpty(value: unknown): value is string {
-	return typeof value === "string" && value.length > 0;
 }
 
 function decimal(value: unknown): value is string {

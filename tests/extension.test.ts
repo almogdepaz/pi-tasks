@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { registerAgentTaskTools } from "../src/extension";
+import { registerAgentTaskTools } from "../src/legacy-extension";
 import { GatewayClientError } from "../src/gateway-client";
 
 interface RegisteredTool {

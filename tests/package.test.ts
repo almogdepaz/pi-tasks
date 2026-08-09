@@ -88,6 +88,19 @@ describe("gateway package documentation", () => {
 		expect(skill).toContain("Isolated coverage is the deterministic acceptance gate");
 	});
 
+	test("keeps phase role reuse, compact handoffs, and parent verification in the delegation workflow", async () => {
+		const skill = await readFile(delegationSkillPath, "utf8");
+		for (const detail of [
+			"one persistent implementer and one persistent read-only reviewer",
+			"Do not rotate a healthy role session for routine corrections",
+			"context.summary` only for constraints, decisions, and recovery state",
+			"Do not copy plans, source contents, or transcripts",
+			"terminal `send` is only for explicit human steering",
+			"independently verifies files, diff, tests, and artifacts",
+			"agent_task_ack({ taskId })",
+		]) expect(skill).toContain(detail);
+	});
+
 	test("ships a recovery-only context summary workflow", async () => {
 		const skill = await readFile(summarySkillPath, "utf8");
 		expect(skill).toContain("parent authors normal summaries");

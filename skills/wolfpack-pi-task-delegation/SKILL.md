@@ -19,6 +19,8 @@ use `wolfpack-tailnet-control` for session control. this skill covers gateway ta
 
 For a multi-step project phase, retain one persistent implementer and one persistent read-only reviewer. Reuse a healthy role session for corrections and follow-up review; a completed task is an assignment result, not a reason to replace its session. Do not rotate a healthy role session for routine corrections. Rotate only for explicit phase completion, material context saturation, harness failure, or a required independent specialist. Keep at most one active assignment per role unless the user explicitly asks for parallel work.
 
+Persistence is a parent decision, not a default. After every verified and acknowledged terminal task, the parent must explicitly choose whether to retain or close a session it spawned. Retain it only when the parent expects concrete follow-up work; close it when the parent does not expect to use it again. Do not leave the cleanup decision implicit.
+
 Use gateway task tools for assignments, questions, decisions, completion, and acknowledgment. terminal `send` is only for explicit human steering; it is not task state, a completion channel, or a substitute for `agent_task_message`.
 
 ## workflow
@@ -29,7 +31,7 @@ Use gateway task tools for assignments, questions, decisions, completion, and ac
 4. after durable receipt, keep working. Do not call `agent_task_wait` unless the user explicitly asks to block. Use `agent_task_status` or `agent_task_inbox` for structured follow-up.
 5. use `agent_task_message` for durable `question`, `answer`, or `information` flow. One question may be unresolved globally; answers link to it. A receiver question accepted by the sender ends the receiver turn; a parent question does not end the parent turn.
 6. assignees call `agent_task_done` exactly once as their final action with `completed`, `failed`, or `cancelled`, concise summary, and optional structured result/error/artifact metadata. Report source modifications in `result.changedFiles`; artifacts are receiver-project-relative regular files for a parent to inspect, not changed-file lists: `{ "result": { "changedFiles": ["src/extension.ts"] }, "artifacts": [{ "path": "verification/task-2.md" }] }`. Follow the canonical Wolfpack artifact contract for provenance, containment, and warning behavior. No prose completion afterward.
-7. parent independently verifies files, diff, tests, and artifacts before reporting success. Then use `agent_task_ack({ taskId })` for that one verified terminal task; remote acknowledgment is two-phase and failed propagation leaves the task visible for explicit repair. Cleanup applies only to sessions this parent spawned and only after result verification and acknowledgment. Retain reusable sessions while review or correction is pending.
+7. parent independently verifies files, diff, tests, and artifacts before reporting success. Then use `agent_task_ack({ taskId })` for that one verified terminal task; remote acknowledgment is two-phase and failed propagation leaves the task visible for explicit repair. After acknowledgment, explicitly decide whether the spawned session has a likely next assignment. Retain it while review, correction, or another concrete assignment is expected; otherwise close it through canonical Wolfpack session control. Cleanup applies only to sessions this parent spawned and only after result verification and acknowledgment.
 
 ## delivery and recovery
 
@@ -48,3 +50,4 @@ Isolated coverage is the deterministic acceptance gate, but a specific live peer
 - do not use filesystem task storage or retain old `mustReturn`, `rejected`, or semantic completion contracts.
 - do not promise JWT federation, artifact byte transfer, or background retry/offline dispatch.
 - do not make workers close their own sessions.
+- do not leave a parent-spawned session open after acknowledgment when the parent does not expect further work from it.

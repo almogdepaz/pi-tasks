@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { deliverTaskInbox, restoredInboxCursor } from "../src/task-inbox";
+import { deliverTaskInbox, restoredInboxCursor } from "../src/legacy-task-inbox";
 import type { TaskEvent, WolfpackGatewayClient } from "../src/gateway-client";
 
 const assignmentEvent = event("task.created", "receiver", "event-assignment", "99");

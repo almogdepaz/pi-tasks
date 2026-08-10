@@ -1,6 +1,25 @@
 # pi-tasks
 
-`pi-tasks` is a Pi extension client for the Wolfpack task gateway. Wolfpack owns task state in its machine-global `~/.wolfpack/tasks` store; this package does not create task files or write assignments to terminals. Pi is one conforming adapter. Read Wolfpack's [harness-neutral task adapter contract](https://github.com/almogdepaz/wolfpack/blob/main/docs/task-adapter-contract.md) for canonical adapter behavior and its [task gateway guide](https://github.com/almogdepaz/wolfpack/blob/main/docs/task-gateway.md) for routes and operations.
+`pi-tasks` is a Pi extension client for Wolfpack task transports. The retained v1 adapter uses Wolfpack's machine-global `~/.wolfpack/tasks` store; v2 keeps endpoint-owned Pi task state locally and uses Wolfpack as a content-blind relay. Neither adapter writes assignments to terminals. Read Wolfpack's [harness-neutral task adapter contract](https://github.com/almogdepaz/wolfpack/blob/main/docs/task-adapter-contract.md) for canonical adapter behavior and its [task gateway guide](https://github.com/almogdepaz/wolfpack/blob/main/docs/task-gateway.md) for routes and operations.
+
+## v2 endpoint-owned relay
+
+The default extension uses the configured local Wolfpack relay v2 adapter, never the in-memory conformance relay. It registers an opaque endpoint with `POST /api/task-relay/v2/connect`, stores endpoint-owned task state in `~/.pi/tasks/v2/tasks.sqlite`, and exchanges opaque relay envelopes through Wolfpack. The adapter needs a Wolfpack release exposing the stable [relay v2 control-api contract](https://github.com/almogdepaz/wolfpack/blob/main/docs/control-api-schema.md#pi-tasks-relay-v2-boundary); a v1-only gateway is incompatible and does not silently fall back.
+
+Set `WOLFPACK_SESSION_NAME` for every Pi process. The adapter uses `WOLFPACK_PORT` when the local control port differs from `18790`; `WOLFPACK_SESSION_NAME` resolves the active Pi process to its relay endpoint. On startup, obtain a target's opaque `{ relay, id }` endpoint from its Wolfpack session-status projection after that target has registered, then send it through the endpoint-owned tool shape:
+
+```json
+{
+  "to": { "relay": "wolfpack-pi-tasks-v2", "id": "target-opaque-endpoint-id" },
+  "task": "implement the narrow change and run focused tests"
+}
+```
+
+Wolfpack's relay owns durable mailbox delivery and peer forwarding; Pi owns task lifecycle, logical event order, receipts, and its local SQLite state. Insertion receipts are idempotent by `{ taskId, eventId }`, so replay after Pi has structurally recorded an event cannot create an additional logical receipt. `createInMemoryTaskRelay` remains exported solely as a deterministic conformance fixture.
+
+## v1 gateway adapter (retained)
+
+The v1 gateway client is available only through the published `@sgtbeatdown/pi-tasks/v1-compat-extension` entry. This is an explicit opt-in: after resolving the installed package root, add `src/v1-compat-extension.ts` as an extension path in Pi settings instead of loading the package default. The package manifest loads only `src/extension.ts` (v2); v2 does not fall back to v1 when its relay is unavailable or incompatible. Its v1 behavior and operational requirements are documented below.
 
 ## requirements and trust boundary
 

@@ -18,6 +18,20 @@ describe("gateway package documentation", () => {
 		expect(packageJson.pi?.skills).toContain("./skills");
 	});
 
+	test("publishes v1 only as an explicit compatibility entry while v2 remains the default", async () => {
+		const [packageJson, readme, v2Extension] = await Promise.all([
+			readFile(packageJsonPath, "utf8").then((value) => JSON.parse(value) as { readonly exports?: Record<string, string>; readonly pi?: { readonly extensions?: readonly string[] } }),
+			readFile(readmePath, "utf8"),
+			readFile(new URL("../src/extension.ts", import.meta.url), "utf8"),
+		]);
+		expect(packageJson.pi?.extensions).toEqual(["./src/extension.ts"]);
+		expect(packageJson.exports?.["./v1-compat-extension"]).toBe("./src/v1-compat-extension.ts");
+		expect(readme).toContain("@sgtbeatdown/pi-tasks/v1-compat-extension");
+		expect(readme).toContain("explicit opt-in");
+		expect(readme).toContain("does not fall back");
+		expect(v2Extension).not.toContain("legacy-extension");
+	});
+
 	test("documents local and peer gateway delegation without legacy transport guidance", async () => {
 		const [readme, skill] = await Promise.all([readFile(readmePath, "utf8"), readFile(delegationSkillPath, "utf8")]);
 		const normalized = `${readme}\n${skill}`.replace(/\s+/g, " ");

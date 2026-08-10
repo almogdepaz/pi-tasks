@@ -1,0 +1,118 @@
+export const TASK_PROTOCOL_VERSION = "pi-tasks/v2" as const;
+export const MAX_RELAY_PAYLOAD_BYTES = 48 * 1024;
+
+export interface TaskEndpoint {
+	readonly relay: string;
+	readonly id: string;
+}
+
+/** A provider-defined reference which core resolves without interpreting. */
+export interface RelayTargetReference {
+	readonly relay: string;
+	readonly reference: string;
+}
+
+export interface RelayConnectInput {
+	readonly endpoint: TaskEndpoint;
+	readonly protocolVersion: string;
+	readonly receiveCursor: string;
+}
+
+export interface RelayConnection {
+	readonly endpoint: TaskEndpoint;
+	readonly receiveCursor: string;
+}
+
+export const TaskEnvelopeKind = {
+	assignment: "assignment",
+	intent: "intent",
+	canonicalEvent: "canonical_event",
+} as const;
+
+export type TaskEnvelopeKind = (typeof TaskEnvelopeKind)[keyof typeof TaskEnvelopeKind];
+
+export interface RelayEnvelope {
+	readonly envelopeId: string;
+	readonly protocolVersion: string;
+	readonly source: TaskEndpoint;
+	readonly target: TaskEndpoint;
+	readonly taskId: string;
+	readonly kind: TaskEnvelopeKind;
+	/** Opaque to relays. The endpoint protocol defines its JSON representation. */
+	readonly payload: string;
+}
+
+export interface RelayAcceptance {
+	readonly envelopeId: string;
+}
+
+export interface RelayReceiveRequest {
+	readonly endpoint: TaskEndpoint;
+	readonly cursor: string;
+	readonly limit: number;
+}
+
+export interface RelayDelivery {
+	readonly cursor: string;
+	readonly envelope: RelayEnvelope;
+}
+
+export interface RelayInboxPage {
+	readonly deliveries: readonly RelayDelivery[];
+	readonly nextCursor: string;
+	readonly hasMore: boolean;
+}
+
+export interface RelayDeliveryAck {
+	readonly endpoint: TaskEndpoint;
+	readonly cursor: string;
+}
+
+export interface TaskRelay {
+	readonly id: string;
+	connect(input: RelayConnectInput, signal?: AbortSignal): Promise<RelayConnection>;
+	resolve(input: RelayTargetReference, signal?: AbortSignal): Promise<TaskEndpoint>;
+	send(input: RelayEnvelope, signal?: AbortSignal): Promise<RelayAcceptance>;
+	receive(input: RelayReceiveRequest, signal?: AbortSignal): Promise<RelayInboxPage>;
+	acknowledgeDelivery(input: RelayDeliveryAck, signal?: AbortSignal): Promise<void>;
+}
+
+export interface TaskEvent {
+	readonly eventId: string;
+	readonly taskId: string;
+	readonly type: string;
+	readonly sequence: string;
+	readonly source: TaskEndpoint;
+	readonly target: TaskEndpoint;
+	readonly occurredAt: number;
+	readonly payload: Record<string, unknown>;
+}
+
+export interface TaskRecord {
+	readonly taskId: string;
+	readonly protocolVersion: string;
+	readonly origin: TaskEndpoint;
+	readonly target: TaskEndpoint;
+	readonly task: string;
+	readonly createdAt: number;
+	readonly expiresAt: number;
+	readonly status: "active" | "completed" | "failed" | "cancelled" | "timed_out";
+	readonly events: readonly TaskEvent[];
+}
+
+export interface TaskIntent {
+	readonly intentId: string;
+	readonly taskId: string;
+	readonly type: "task.completed" | "task.failed" | "task.cancelled" | "task.information" | "task.question" | "task.answer" | "task.delivery_receipt";
+	readonly payload: Record<string, unknown>;
+}
+
+export class TaskProtocolError extends Error {
+	readonly code: string;
+
+	constructor(code: string, message: string) {
+		super(message);
+		this.name = "TaskProtocolError";
+		this.code = code;
+	}
+}

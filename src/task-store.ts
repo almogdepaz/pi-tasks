@@ -1,8 +1,9 @@
-import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
+import { openSqliteDatabase } from "./sqlite-database";
+import type { SqliteDatabase } from "./sqlite-database";
 import type { RelayEnvelope, TaskEvent, TaskRecord } from "./task-protocol";
 
 const SCHEMA_VERSION = 3;
@@ -42,7 +43,7 @@ export interface TaskStore {
 export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
 	const path = options.path ?? join(homedir(), ".pi", "tasks", "v2", "tasks.sqlite");
 	preparePath(path);
-	const database = new Database(path, { create: true, strict: true });
+	const database = openSqliteDatabase(path);
 	database.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
 	migrate(database);
 
@@ -147,7 +148,7 @@ interface EventRow {
 	readonly payload: string;
 }
 
-function migrate(database: Database): void {
+function migrate(database: SqliteDatabase): void {
 	const version = database.query("PRAGMA user_version").get() as { readonly user_version: number };
 	if (version.user_version > SCHEMA_VERSION) throw new Error("task store schema is newer than this pi-tasks version");
 	if (version.user_version === 0) {

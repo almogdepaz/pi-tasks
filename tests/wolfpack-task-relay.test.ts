@@ -1,8 +1,9 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
 
-import { createWolfpackTaskCore, createWolfpackTaskRelay } from "../src/wolfpack-task-relay";
+import { createWolfpackTaskCore, createWolfpackTaskRelay, wolfpackTaskStorePath } from "../src/wolfpack-task-relay";
 
 const temporaryDirectories: string[] = [];
 
@@ -100,6 +101,54 @@ test("persists the Wolfpack generation and durable receive, intent, and timeout 
 		.map((request) => (request.body as { readonly generation: string }).generation);
 	expect(generations).toHaveLength(2);
 	expect(generations[0]).toBe(generations[1]);
+});
+
+test("isolates default durable state by Wolfpack session and reuses one session generation", async () => {
+	const firstSession = `store-a-${randomUUID()}`;
+	const secondSession = `store-b-${randomUUID()}`;
+	const firstPath = wolfpackTaskStorePath(firstSession);
+	const secondPath = wolfpackTaskStorePath(secondSession);
+
+	try {
+		await createWolfpackTaskCore({ baseUrl, sessionName: firstSession });
+		await createWolfpackTaskCore({ baseUrl, sessionName: firstSession });
+		await createWolfpackTaskCore({ baseUrl, sessionName: secondSession });
+
+		expect(firstPath).not.toBe(secondPath);
+		expect(existsSync(firstPath)).toBe(true);
+		expect(existsSync(secondPath)).toBe(true);
+		const firstGenerations = requests
+			.filter((request) => request.path === "/api/task-relay/v2/connect" && (request.body as { readonly callerSession?: string }).callerSession === firstSession)
+			.map((request) => (request.body as { readonly generation: string }).generation);
+		const secondGenerations = requests
+			.filter((request) => request.path === "/api/task-relay/v2/connect" && (request.body as { readonly callerSession?: string }).callerSession === secondSession)
+			.map((request) => (request.body as { readonly generation: string }).generation);
+		expect(firstGenerations).toHaveLength(2);
+		expect(new Set(firstGenerations).size).toBe(1);
+		expect(secondGenerations).toHaveLength(1);
+		expect(secondGenerations[0]).not.toBe(firstGenerations[0]);
+	} finally {
+		rmSync(dirname(firstPath), { recursive: true, force: true });
+		rmSync(dirname(secondPath), { recursive: true, force: true });
+	}
+});
+
+test("does not fall back to the legacy global sqlite store", async () => {
+	const directory = mkdtempSync("/tmp/pi-tasks-no-global-fallback-");
+	temporaryDirectories.push(directory);
+	const previousHome = process.env.HOME;
+	process.env.HOME = directory;
+	try {
+		const legacyPath = join(directory, ".pi", "tasks", "v2", "tasks.sqlite");
+		const legacy = await createWolfpackTaskCore({ baseUrl, sessionName: "legacy-writer", path: legacyPath, ids: sequence("legacy") });
+		const legacyTask = await legacy.createTask({ target: { relay: "wolfpack-pi-tasks-v2", id: "receiver" }, task: "legacy global state", timeoutMs: 1_000 });
+		const sessionCore = await createWolfpackTaskCore({ baseUrl, sessionName: "no-legacy-fallback", ids: sequence("session") });
+
+		expect(sessionCore.getTask(legacyTask.taskId)).toBeUndefined();
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
 });
 
 test("renews an expired Wolfpack registration through the real connect route", async () => {

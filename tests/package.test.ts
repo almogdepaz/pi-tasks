@@ -32,6 +32,13 @@ describe("gateway package documentation", () => {
 		expect(v2Extension).not.toContain("legacy-extension");
 	});
 
+	test("documents deterministic per-session v2 storage", async () => {
+		const readme = await readFile(readmePath, "utf8");
+		expect(readme).not.toContain("~/.pi/tasks/v2/tasks.sqlite");
+		expect(readme).toContain("~/.pi/tasks/v2/sessions/<sha256(WOLFPACK_SESSION_NAME)>/tasks.sqlite");
+		expect(readme).toContain("deterministic per-session path");
+	});
+
 	test("documents local and peer gateway delegation without legacy transport guidance", async () => {
 		const [readme, skill] = await Promise.all([readFile(readmePath, "utf8"), readFile(delegationSkillPath, "utf8")]);
 		const normalized = `${readme}\n${skill}`.replace(/\s+/g, " ");

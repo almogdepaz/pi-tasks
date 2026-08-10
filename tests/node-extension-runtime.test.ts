@@ -38,7 +38,8 @@ test("loads the default extension through Pi's Node runtime", async () => {
 		new Response(subprocess.stderr).text(),
 	]);
 
+	const messages = stdout.split("\n").filter((line) => line.trim().length > 0).map((line) => JSON.parse(line) as unknown);
 	expect(stderr).not.toContain("Failed to load extension");
 	expect(exitCode).toBe(0);
-	expect(JSON.parse(stdout)).toMatchObject({ type: "response", command: "get_state", success: true });
+	expect(messages).toContainEqual(expect.objectContaining({ type: "response", command: "get_state", success: true }));
 });

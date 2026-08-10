@@ -29,6 +29,7 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # local pi/wolfpack runtime state
 .pi
+.plans/
 .wolfpack/tasks
 
 # editor config

@@ -55,34 +55,66 @@ export function createConfiguredCoreLoader(factory: ConfiguredCoreFactory): Conf
 export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefined = undefined, createCore: ConfiguredCoreFactory = (signal) => createWolfpackTaskCore({}, signal)): void {
 	let inboxContext: ExtensionContext | undefined;
 	let backgroundTimer: ReturnType<typeof setInterval> | undefined;
+	let lifecycleEpoch = 0;
 	const configuredCore: ConfiguredCoreFactory = core === undefined ? createConfiguredCoreLoader(createCore) : async (): Promise<TaskCore> => core;
 	const refreshInbox = createSingleFlightInboxRefresh(async (signal) => {
-		if (!inboxContext) return;
+		const context = inboxContext;
+		if (!context) return;
 		const activeCore = await configuredCore(signal);
+		if (inboxContext !== context) return;
 		await activeCore.flushOutbox(signal);
+		if (inboxContext !== context) return;
 		await activeCore.evaluateTimeouts(signal);
-		await deliverTaskInbox(pi, activeCore, inboxContext, signal);
+		if (inboxContext !== context) return;
+		const isCurrent = (): boolean => inboxContext === context;
+		const guardedCore: TaskCore = {
+			...activeCore,
+			async receive(receiveSignal) {
+				const deliveries = await activeCore.receive(receiveSignal);
+				return isCurrent() ? deliveries : [];
+			},
+			async acknowledgeRelayDelivery(cursor, acknowledgementSignal) {
+				if (isCurrent()) await activeCore.acknowledgeRelayDelivery(cursor, acknowledgementSignal);
+			},
+			async recordInsertion(input, insertionSignal) {
+				if (isCurrent()) await activeCore.recordInsertion(input, insertionSignal);
+			},
+		};
+		await deliverTaskInbox({
+			sendMessage(message, options) { if (isCurrent()) pi.sendMessage(message, options); },
+			appendEntry(customType, data) { if (isCurrent()) pi.appendEntry(customType, data); },
+		}, guardedCore, {
+			hasPendingMessages: (): boolean => !isCurrent() || context.hasPendingMessages(),
+			sessionManager: context.sessionManager,
+		}, signal);
 	});
+	const refreshLifecycle = async (context: ExtensionContext, connect: boolean, epoch: number): Promise<void> => {
+		const isCurrent = (): boolean => lifecycleEpoch === epoch && inboxContext === context;
+		try {
+			if (connect) await (await configuredCore()).connect();
+			if (!isCurrent()) return;
+			await refreshInbox();
+			if (!isCurrent()) return;
+			context.ui.setStatus("pi-tasks", undefined);
+		} catch {
+			if (isCurrent()) context.ui.setStatus("pi-tasks", context.ui.theme.fg("warning", "tasks: relay unavailable"));
+		}
+	};
 
 	pi.on("session_start", async (_event, context) => {
+		const epoch = ++lifecycleEpoch;
 		inboxContext = context;
-		try {
-			await (await configuredCore()).connect();
-			backgroundTimer = setInterval(() => {
-				void refreshInbox().catch(() => {
-					context.ui.setStatus("pi-tasks", context.ui.theme.fg("warning", "tasks: relay unavailable"));
-				});
-			}, BACKGROUND_POLL_MS);
-			await refreshInbox();
-		} catch {
-			context.ui.setStatus("pi-tasks", context.ui.theme.fg("warning", "tasks: relay unavailable"));
-		}
+		if (backgroundTimer) clearInterval(backgroundTimer);
+		backgroundTimer = setInterval(() => { void refreshLifecycle(context, false, epoch); }, BACKGROUND_POLL_MS);
+		await refreshLifecycle(context, true, epoch);
 	});
 	pi.on("agent_end", async (_event, context) => {
+		const epoch = lifecycleEpoch;
 		inboxContext = context;
-		await refreshInbox();
+		await refreshLifecycle(context, false, epoch);
 	});
 	pi.on("session_shutdown", () => {
+		lifecycleEpoch += 1;
 		if (backgroundTimer) clearInterval(backgroundTimer);
 		backgroundTimer = undefined;
 		inboxContext = undefined;

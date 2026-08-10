@@ -1,3 +1,7 @@
+import { createHash } from "node:crypto";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 import { createTaskCore } from "./task-core";
 import { createTaskStore } from "./task-store";
 import { TASK_PROTOCOL_VERSION, TaskProtocolError } from "./task-protocol";
@@ -22,6 +26,7 @@ export const WOLFPACK_TASK_RELAY_LEASE_MS = 60_000;
 const DEFAULT_WOLFPACK_PORT = 18_790;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_REQUEST_TIMEOUT_MS = 60_000;
+const SESSION_STORE_DIRECTORY = "sessions";
 
 export interface WolfpackTaskRelayOptions {
 	readonly baseUrl?: string;
@@ -39,6 +44,13 @@ export interface WolfpackTaskCoreOptions extends WolfpackTaskRelayOptions, TaskS
 
 export interface WolfpackTaskRelay extends TaskRelay {
 	endpoint(signal?: AbortSignal): Promise<TaskEndpoint>;
+}
+
+/** Returns the isolated durable store path for one Wolfpack session. */
+export function wolfpackTaskStorePath(sessionName: string): string {
+	if (!nonEmpty(sessionName)) throw new TaskProtocolError("RELAY_UNAVAILABLE", "WOLFPACK_SESSION_NAME is required for the Wolfpack relay v2 adapter");
+	const sessionKey = createHash("sha256").update(sessionName).digest("hex");
+	return join(homedir(), ".pi", "tasks", "v2", SESSION_STORE_DIRECTORY, sessionKey, "tasks.sqlite");
 }
 
 interface WolfpackRelayEnvelope {
@@ -160,10 +172,11 @@ export function createWolfpackTaskRelay(options: WolfpackTaskRelayOptions = {}):
 
 /** Registers this process, then returns a core whose endpoint is the registered opaque Wolfpack endpoint. */
 export async function createWolfpackTaskCore(options: WolfpackTaskCoreOptions = {}, signal?: AbortSignal): Promise<ReturnType<typeof createTaskCore>> {
-	const store = createTaskStore({ path: options.path });
+	const sessionName = options.sessionName ?? process.env.WOLFPACK_SESSION_NAME;
+	const store = createTaskStore({ path: options.path ?? wolfpackTaskStorePath(requiredSession(sessionName)) });
 	const generation = options.generation ?? store.getEndpointGeneration() ?? crypto.randomUUID();
 	store.transaction(() => { store.setEndpointGeneration(generation); });
-	const relay = createWolfpackTaskRelay({ ...options, generation });
+	const relay = createWolfpackTaskRelay({ ...options, sessionName, generation });
 	try {
 		const endpoint = await relay.endpoint(signal);
 		return createTaskCore({ endpoint, relay, store, ...(options.clock === undefined ? {} : { clock: options.clock }), ...(options.ids === undefined ? {} : { ids: options.ids }) });

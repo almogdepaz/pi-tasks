@@ -4,7 +4,7 @@
 
 ## v2 endpoint-owned relay
 
-The default extension uses the configured local Wolfpack relay v2 adapter, never the in-memory conformance relay. It registers an opaque endpoint with `POST /api/task-relay/v2/connect`, stores endpoint-owned task state in `~/.pi/tasks/v2/tasks.sqlite`, and exchanges opaque relay envelopes through Wolfpack. The adapter needs a Wolfpack release exposing the stable [relay v2 control-api contract](https://github.com/almogdepaz/wolfpack/blob/main/docs/control-api-schema.md#pi-tasks-relay-v2-boundary); a v1-only gateway is incompatible and does not silently fall back.
+The default extension uses the configured local Wolfpack relay v2 adapter, never the in-memory conformance relay. It registers an opaque endpoint with `POST /api/task-relay/v2/connect`, stores endpoint-owned task state at the deterministic per-session path `~/.pi/tasks/v2/sessions/<sha256(WOLFPACK_SESSION_NAME)>/tasks.sqlite`, and exchanges opaque relay envelopes through Wolfpack. The adapter needs a Wolfpack release exposing the stable [relay v2 control-api contract](https://github.com/almogdepaz/wolfpack/blob/main/docs/control-api-schema.md#pi-tasks-relay-v2-boundary); a v1-only gateway is incompatible and does not silently fall back.
 
 Set `WOLFPACK_SESSION_NAME` for every Pi process. The adapter uses `WOLFPACK_PORT` when the local control port differs from `18790`; `WOLFPACK_SESSION_NAME` resolves the active Pi process to its relay endpoint. On startup, obtain a target's opaque `{ relay, id }` endpoint from its Wolfpack session-status projection after that target has registered, then send it through the endpoint-owned tool shape:
 

@@ -3,14 +3,14 @@
 - plan: `.plans/020-node-runtime-sqlite.md`
 - plan sha256: `b301e9bc02cdbe202ce8fe7d7b593ae04f5234b9d906eb798539b569044c3059`
 - base/head: `main` at `098cbcfc80ea0a0e217b4e03f9e57a7ed8db04b0`
-- overall state: `ready_to_commit`
-- current phase: commit/push
+- overall state: `accepted`
+- current phase: complete
 
 ## task states
 
 1. runtime regression: `implemented`
 2. cross-runtime SQLite boundary: `implemented`
-3. verification/deployment: `implemented`
+3. verification/deployment: `accepted`
 
 ## constraints
 
@@ -30,7 +30,9 @@
 - manual Node store smoke persisted/read a task with named parameters; transaction rollback left no task.
 - full verification: 79 tests / 308 expectations passed; typecheck passed; package dry-run included `src/sqlite-database.ts`; `git diff --check` and immutable plan digest passed.
 - diff review: scope is limited to one native runtime adapter, task-store wiring, the exact Node/Jiti startup regression, and plan ledgers; no protocol/schema/storage-path/dependency change.
+- implementation commit: `2466b2d8d3926ad112b3508d0b30a8c3118b412d`; pushed directly to `origin/main` as authorized and remote equality verified.
+- local deployment is the configured package checkout `/Users/home/Dev/wolfpack-pi-tasks`; no copy or package publication is required.
 
 ## next action
 
-commit and push main, verify the remote and configured local checkout, then record final deployment evidence.
+none. existing Pi processes must `/reload` or restart; fresh processes load this checkout.

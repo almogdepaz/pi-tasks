@@ -4,6 +4,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 import { deliverTaskInbox } from "./task-inbox";
+import { TaskOutboxDeliveryError, TaskProtocolError } from "./task-protocol";
 import { createWolfpackTaskCore } from "./wolfpack-task-relay";
 import type { TaskCore } from "./task-core";
 
@@ -11,6 +12,7 @@ const DEFAULT_TASK_TIMEOUT_MS = 30 * 60 * 1_000;
 const MIN_TASK_TIMEOUT_MS = 1_000;
 const MAX_TASK_TIMEOUT_MS = 86_400_000;
 const BACKGROUND_POLL_MS = 5_000;
+const TARGET_NOT_REGISTERED_CODE = "TARGET_NOT_REGISTERED";
 const WAIT_POLL_MS = 250;
 const SUMMARY_MAX_CHARS = 1_200;
 
@@ -59,13 +61,22 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 	const configuredCore: ConfiguredCoreFactory = core === undefined ? createConfiguredCoreLoader(createCore) : async (): Promise<TaskCore> => core;
 	const refreshInbox = createSingleFlightInboxRefresh(async (signal) => {
 		const context = inboxContext;
-		if (!context) return;
+		if (!context) return undefined;
 		const activeCore = await configuredCore(signal);
-		if (inboxContext !== context) return;
-		await activeCore.flushOutbox(signal);
-		if (inboxContext !== context) return;
-		await activeCore.evaluateTimeouts(signal);
-		if (inboxContext !== context) return;
+		if (inboxContext !== context) return undefined;
+		let outboxError: unknown;
+		try {
+			await activeCore.flushOutbox(signal);
+		} catch (error) {
+			outboxError = error;
+		}
+		if (inboxContext !== context) return undefined;
+		try {
+			await activeCore.evaluateTimeouts(signal);
+		} catch (error) {
+			outboxError ??= error;
+		}
+		if (inboxContext !== context) return undefined;
 		const isCurrent = (): boolean => inboxContext === context;
 		const guardedCore: TaskCore = {
 			...activeCore,
@@ -87,17 +98,26 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 			hasPendingMessages: (): boolean => !isCurrent() || context.hasPendingMessages(),
 			sessionManager: context.sessionManager,
 		}, signal);
+		return outboxError;
 	});
-	const refreshLifecycle = async (context: ExtensionContext, connect: boolean, epoch: number): Promise<void> => {
+	const refreshLifecycle = async (context: ExtensionContext, epoch: number): Promise<void> => {
 		const isCurrent = (): boolean => lifecycleEpoch === epoch && inboxContext === context;
 		try {
-			if (connect) await (await configuredCore()).connect();
+			const activeCore = await configuredCore();
+			let connectionError: unknown;
+			try {
+				await activeCore.connect();
+			} catch (error) {
+				connectionError = error;
+			}
 			if (!isCurrent()) return;
-			await refreshInbox();
+			const outboxError = await refreshInbox();
 			if (!isCurrent()) return;
-			context.ui.setStatus("pi-tasks", undefined);
-		} catch {
-			if (isCurrent()) context.ui.setStatus("pi-tasks", context.ui.theme.fg("warning", "tasks: relay unavailable"));
+			const lifecycleError = outboxError ?? connectionError;
+			const status = lifecycleError === undefined ? undefined : outboxFailureStatus(lifecycleError);
+			context.ui.setStatus("pi-tasks", status === undefined ? undefined : context.ui.theme.fg("warning", status));
+		} catch (error) {
+			if (isCurrent()) context.ui.setStatus("pi-tasks", context.ui.theme.fg("warning", outboxFailureStatus(error)));
 		}
 	};
 
@@ -105,13 +125,16 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		const epoch = ++lifecycleEpoch;
 		inboxContext = context;
 		if (backgroundTimer) clearInterval(backgroundTimer);
-		backgroundTimer = setInterval(() => { void refreshLifecycle(context, false, epoch); }, BACKGROUND_POLL_MS);
-		await refreshLifecycle(context, true, epoch);
+		backgroundTimer = setInterval(() => {
+			const currentContext = inboxContext;
+			if (currentContext) void refreshLifecycle(currentContext, epoch);
+		}, BACKGROUND_POLL_MS);
+		await refreshLifecycle(context, epoch);
 	});
 	pi.on("agent_end", async (_event, context) => {
 		const epoch = lifecycleEpoch;
 		inboxContext = context;
-		await refreshLifecycle(context, false, epoch);
+		await refreshLifecycle(context, epoch);
 	});
 	pi.on("session_shutdown", () => {
 		lifecycleEpoch += 1;
@@ -193,9 +216,9 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 	});
 }
 
-export function createSingleFlightInboxRefresh(refresh: (signal?: AbortSignal) => Promise<void>): (signal?: AbortSignal) => Promise<void> {
-	let inFlight: Promise<void> | undefined;
-	return (signal): Promise<void> => {
+export function createSingleFlightInboxRefresh<TValue>(refresh: (signal?: AbortSignal) => Promise<TValue>): (signal?: AbortSignal) => Promise<TValue> {
+	let inFlight: Promise<TValue> | undefined;
+	return (signal): Promise<TValue> => {
 		if (inFlight) return inFlight;
 		const current = refresh(signal).finally(() => {
 			if (inFlight === current) inFlight = undefined;
@@ -215,7 +238,14 @@ function toolResult(details: unknown, markdown: string): AgentToolResult<unknown
 
 function taskError(error: unknown): AgentToolResult<unknown> {
 	const message = error instanceof Error ? error.message : "task operation failed";
+	if (error instanceof TaskProtocolError) {
+		return toolResult({ ...error.details, error: { code: error.code, message, retryable: error.retryable } }, `## task error\n- ${message}`);
+	}
 	return toolResult({ error: { code: "TASK_ERROR", message, retryable: true } }, `## task error\n- ${message}`);
+}
+
+function outboxFailureStatus(error: unknown): "tasks: relay unavailable" | "tasks: outbox degraded" {
+	return error instanceof TaskOutboxDeliveryError && error.code === TARGET_NOT_REGISTERED_CODE ? "tasks: outbox degraded" : "tasks: relay unavailable";
 }
 
 function terminal(status: string): boolean {

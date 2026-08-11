@@ -3,11 +3,11 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import piTasks, { createConfiguredCoreLoader, createSingleFlightInboxRefresh, registerAgentTaskTools } from "../src/extension";
 import type { TaskCore } from "../src/task-core";
-import { TASK_PROTOCOL_VERSION, TaskEnvelopeKind } from "../src/task-protocol";
+import { TASK_PROTOCOL_VERSION, TaskEnvelopeKind, TaskOutboxDeliveryError, TaskProtocolError } from "../src/task-protocol";
 
 interface Tool {
 	readonly name: string;
-	execute(id: string, parameters: Record<string, unknown>, signal: AbortSignal, update: undefined, context: unknown): Promise<{ readonly content: readonly { readonly text: string }[] }>;
+	execute(id: string, parameters: Record<string, unknown>, signal: AbortSignal, update: undefined, context: unknown): Promise<{ readonly content: readonly { readonly text: string }[]; readonly details: unknown }>;
 }
 
 test("default extension uses the configured Wolfpack relay adapter rather than an in-memory or missing relay", async () => {
@@ -21,6 +21,212 @@ test("default extension uses the configured Wolfpack relay adapter rather than a
 	if (previousSession === undefined) delete process.env.WOLFPACK_SESSION_NAME;
 	else process.env.WOLFPACK_SESSION_NAME = previousSession;
 	expect(result.content[0]?.text).toContain("WOLFPACK_SESSION_NAME is required");
+});
+
+test("returns structured relay metadata and the persisted task id after assignment delivery fails", async () => {
+	const tools: Record<string, Tool> = {};
+	const core = {
+		async createTask(): Promise<never> {
+			throw new TaskProtocolError("TARGET_NOT_REGISTERED", "target is inactive", { retryable: false, details: { taskId: "persisted-task" } });
+		},
+	} as unknown as TaskCore;
+	registerAgentTaskTools({
+		on(): void { undefined; },
+		registerTool(tool: unknown): void { const value = tool as Tool; tools[value.name] = value; },
+	} as unknown as ExtensionAPI, core);
+
+	const result = await tools.agent_task_send!.execute("call", { to: { relay: "wolfpack-pi-tasks-v2", id: "inactive" }, task: "persist first" }, new AbortController().signal, undefined, {});
+
+	expect(result.details).toEqual({
+		taskId: "persisted-task",
+		error: { code: "TARGET_NOT_REGISTERED", message: "target is inactive", retryable: false },
+	});
+});
+
+test("continues timeout and inbox processing while reporting degraded outbox delivery", async () => {
+	let sessionStart: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
+	let sessionShutdown: (() => void) | undefined;
+	const calls: string[] = [];
+	const statuses: Array<string | undefined> = [];
+	const core = {
+		async connect(): Promise<void> { calls.push("connect"); },
+		async flushOutbox(): Promise<void> {
+			calls.push("flush");
+			throw new TaskOutboxDeliveryError("TARGET_NOT_REGISTERED", "target is inactive", { retryable: false });
+		},
+		async evaluateTimeouts(): Promise<void> { calls.push("timeout"); },
+		async receive(): Promise<readonly []> { calls.push("receive"); return []; },
+	} as unknown as TaskCore;
+	const context = {
+		hasPendingMessages: (): boolean => false,
+		sessionManager: { getEntries: (): readonly unknown[] => [] },
+		ui: {
+			setStatus: (_key: string, value: string | undefined): void => { statuses.push(value); },
+			theme: { fg: (_color: string, text: string): string => text },
+		},
+	};
+	registerAgentTaskTools({
+		on(event: string, handler: unknown): void {
+			if (event === "session_start") sessionStart = handler as (event: unknown, context: unknown) => Promise<unknown>;
+			if (event === "session_shutdown") sessionShutdown = handler as () => void;
+		},
+		registerTool(): void { undefined; },
+	} as unknown as ExtensionAPI, core);
+
+	try {
+		await sessionStart!({}, context);
+		expect(calls).toEqual(["connect", "flush", "timeout", "receive"]);
+		expect(statuses.at(-1)).toBe("tasks: outbox degraded");
+	} finally {
+		sessionShutdown?.();
+	}
+});
+
+test("continues inbox receive and reports degradation when timeout delivery fails", async () => {
+	let sessionStart: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
+	let sessionShutdown: (() => void) | undefined;
+	const calls: string[] = [];
+	const statuses: Array<string | undefined> = [];
+	const core = {
+		async connect(): Promise<void> { calls.push("connect"); },
+		async flushOutbox(): Promise<void> { calls.push("flush"); },
+		async evaluateTimeouts(): Promise<void> {
+			calls.push("timeout");
+			throw new TaskOutboxDeliveryError("TARGET_NOT_REGISTERED", "timed-out task target is inactive", { retryable: false });
+		},
+		async receive(): Promise<readonly []> { calls.push("receive"); return []; },
+	} as unknown as TaskCore;
+	const context = {
+		hasPendingMessages: (): boolean => false,
+		sessionManager: { getEntries: (): readonly unknown[] => [] },
+		ui: {
+			setStatus: (_key: string, value: string | undefined): void => { statuses.push(value); },
+			theme: { fg: (_color: string, text: string): string => text },
+		},
+	};
+	registerAgentTaskTools({
+		on(event: string, handler: unknown): void {
+			if (event === "session_start") sessionStart = handler as (event: unknown, context: unknown) => Promise<unknown>;
+			if (event === "session_shutdown") sessionShutdown = handler as () => void;
+		},
+		registerTool(): void { undefined; },
+	} as unknown as ExtensionAPI, core);
+
+	try {
+		await sessionStart!({}, context);
+		expect(calls).toEqual(["connect", "flush", "timeout", "receive"]);
+		expect(statuses.at(-1)).toBe("tasks: outbox degraded");
+	} finally {
+		sessionShutdown?.();
+	}
+});
+
+test("reports receive-created delivery failures as outbox degradation", async () => {
+	let sessionStart: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
+	let sessionShutdown: (() => void) | undefined;
+	const statuses: Array<string | undefined> = [];
+	const core = {
+		async connect(): Promise<void> { undefined; },
+		async flushOutbox(): Promise<void> { undefined; },
+		async evaluateTimeouts(): Promise<void> { undefined; },
+		async receive(): Promise<readonly []> {
+			throw new TaskOutboxDeliveryError("TARGET_NOT_REGISTERED", "canonical event target is inactive", { retryable: false });
+		},
+	} as unknown as TaskCore;
+	const context = {
+		hasPendingMessages: (): boolean => false,
+		sessionManager: { getEntries: (): readonly unknown[] => [] },
+		ui: {
+			setStatus: (_key: string, value: string | undefined): void => { statuses.push(value); },
+			theme: { fg: (_color: string, text: string): string => text },
+		},
+	};
+	registerAgentTaskTools({
+		on(event: string, handler: unknown): void {
+			if (event === "session_start") sessionStart = handler as (event: unknown, context: unknown) => Promise<unknown>;
+			if (event === "session_shutdown") sessionShutdown = handler as () => void;
+		},
+		registerTool(): void { undefined; },
+	} as unknown as ExtensionAPI, core);
+
+	try {
+		await sessionStart!({}, context);
+		expect(statuses.at(-1)).toBe("tasks: outbox degraded");
+	} finally {
+		sessionShutdown?.();
+	}
+});
+
+test("does not mislabel relay failures during outbox delivery as degradation", async () => {
+	let sessionStart: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
+	let sessionShutdown: (() => void) | undefined;
+	const statuses: Array<string | undefined> = [];
+	const core = {
+		async connect(): Promise<void> { undefined; },
+		async flushOutbox(): Promise<void> {
+			throw new TaskOutboxDeliveryError("RELAY_UNAVAILABLE", "relay is unavailable");
+		},
+		async evaluateTimeouts(): Promise<void> { undefined; },
+		async receive(): Promise<readonly []> { return []; },
+	} as unknown as TaskCore;
+	const context = {
+		hasPendingMessages: (): boolean => true,
+		sessionManager: { getEntries: (): readonly unknown[] => [] },
+		ui: {
+			setStatus: (_key: string, value: string | undefined): void => { statuses.push(value); },
+			theme: { fg: (_color: string, text: string): string => text },
+		},
+	};
+	registerAgentTaskTools({
+		on(event: string, handler: unknown): void {
+			if (event === "session_start") sessionStart = handler as (event: unknown, context: unknown) => Promise<unknown>;
+			if (event === "session_shutdown") sessionShutdown = handler as () => void;
+		},
+		registerTool(): void { undefined; },
+	} as unknown as ExtensionAPI, core);
+
+	try {
+		await sessionStart!({}, context);
+		expect(statuses.at(-1)).toBe("tasks: relay unavailable");
+	} finally {
+		sessionShutdown?.();
+	}
+});
+
+test("does not mislabel relay receive failures as outbox degradation", async () => {
+	let sessionStart: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
+	let sessionShutdown: (() => void) | undefined;
+	const statuses: Array<string | undefined> = [];
+	const core = {
+		async connect(): Promise<void> { undefined; },
+		async flushOutbox(): Promise<void> { undefined; },
+		async evaluateTimeouts(): Promise<void> { undefined; },
+		async receive(): Promise<readonly []> {
+			throw new TaskProtocolError("TARGET_NOT_REGISTERED", "relay receive registration is absent", { retryable: false });
+		},
+	} as unknown as TaskCore;
+	const context = {
+		hasPendingMessages: (): boolean => false,
+		sessionManager: { getEntries: (): readonly unknown[] => [] },
+		ui: {
+			setStatus: (_key: string, value: string | undefined): void => { statuses.push(value); },
+			theme: { fg: (_color: string, text: string): string => text },
+		},
+	};
+	registerAgentTaskTools({
+		on(event: string, handler: unknown): void {
+			if (event === "session_start") sessionStart = handler as (event: unknown, context: unknown) => Promise<unknown>;
+			if (event === "session_shutdown") sessionShutdown = handler as () => void;
+		},
+		registerTool(): void { undefined; },
+	} as unknown as ExtensionAPI, core);
+
+	try {
+		await sessionStart!({}, context);
+		expect(statuses.at(-1)).toBe("tasks: relay unavailable");
+	} finally {
+		sessionShutdown?.();
+	}
 });
 
 test("starts polling after rejected startup and clears the warning after autonomous recovery", async () => {
@@ -75,6 +281,102 @@ test("starts polling after rejected startup and clears the warning after autonom
 		await Promise.resolve();
 		expect(attempts).toBe(2);
 		expect(statuses.at(-1)).toBeUndefined();
+	} finally {
+		sessionShutdown?.();
+		globalThis.setInterval = originalSetInterval;
+	}
+});
+
+test("renews registration while pending Pi messages prevent inbox receive", async () => {
+	let sessionStart: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
+	let sessionShutdown: (() => void) | undefined;
+	let poll: (() => void) | undefined;
+	let connects = 0;
+	let refreshes = 0;
+	let polled: (() => void) | undefined;
+	const pollCompleted = new Promise<void>((resolve) => { polled = resolve; });
+	const originalSetInterval = globalThis.setInterval;
+	globalThis.setInterval = ((handler: (...args: unknown[]) => void) => {
+		poll = (): void => handler();
+		return 1 as unknown as ReturnType<typeof setInterval>;
+	}) as typeof setInterval;
+	const core = {
+		async connect(): Promise<void> { connects += 1; },
+		async flushOutbox(): Promise<void> {
+			refreshes += 1;
+			if (refreshes === 2) polled?.();
+		},
+		async evaluateTimeouts(): Promise<void> { undefined; },
+		async receive(): Promise<readonly []> { throw new Error("receive must remain gated"); },
+	} as unknown as TaskCore;
+	const context = {
+		hasPendingMessages: (): boolean => true,
+		sessionManager: { getEntries: (): readonly unknown[] => [] },
+		ui: { setStatus: (): void => undefined, theme: { fg: (_color: string, text: string): string => text } },
+	};
+
+	try {
+		registerAgentTaskTools({
+			on(event: string, handler: unknown): void {
+				if (event === "session_start") sessionStart = handler as (event: unknown, context: unknown) => Promise<unknown>;
+				if (event === "session_shutdown") sessionShutdown = handler as () => void;
+			},
+			registerTool(): void { undefined; },
+		} as unknown as ExtensionAPI, core);
+
+		await sessionStart!({}, context);
+		poll?.();
+		await Promise.race([pollCompleted, Bun.sleep(100).then(() => { throw new Error("background poll did not refresh"); })]);
+		expect(connects).toBe(2);
+	} finally {
+		sessionShutdown?.();
+		globalThis.setInterval = originalSetInterval;
+	}
+});
+
+test("continues autonomous polling after Pi replaces the extension context at agent_end", async () => {
+	let sessionStart: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
+	let agentEnd: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
+	let sessionShutdown: (() => void) | undefined;
+	let poll: (() => void) | undefined;
+	let refreshes = 0;
+	let polled: (() => void) | undefined;
+	const pollCompleted = new Promise<void>((resolve) => { polled = resolve; });
+	const originalSetInterval = globalThis.setInterval;
+	globalThis.setInterval = ((handler: (...args: unknown[]) => void) => {
+		poll = (): void => handler();
+		return 1 as unknown as ReturnType<typeof setInterval>;
+	}) as typeof setInterval;
+	const core = {
+		async connect(): Promise<void> { undefined; },
+		async flushOutbox(): Promise<void> {
+			refreshes += 1;
+			if (refreshes === 3) polled?.();
+		},
+		async evaluateTimeouts(): Promise<void> { undefined; },
+		async receive(): Promise<readonly []> { return []; },
+	} as unknown as TaskCore;
+	const context = () => ({
+		hasPendingMessages: (): boolean => false,
+		sessionManager: { getEntries: (): readonly unknown[] => [] },
+		ui: { setStatus: (): void => undefined, theme: { fg: (_color: string, text: string): string => text } },
+	});
+
+	try {
+		registerAgentTaskTools({
+			on(event: string, handler: unknown): void {
+				if (event === "session_start") sessionStart = handler as (event: unknown, context: unknown) => Promise<unknown>;
+				if (event === "agent_end") agentEnd = handler as (event: unknown, context: unknown) => Promise<unknown>;
+				if (event === "session_shutdown") sessionShutdown = handler as () => void;
+			},
+			registerTool(): void { undefined; },
+		} as unknown as ExtensionAPI, core);
+
+		await sessionStart!({}, context());
+		await agentEnd!({}, context());
+		poll?.();
+		await Promise.race([pollCompleted, Bun.sleep(100).then(() => { throw new Error("background poll did not refresh"); })]);
+		expect(refreshes).toBe(3);
 	} finally {
 		sessionShutdown?.();
 		globalThis.setInterval = originalSetInterval;
@@ -217,7 +519,7 @@ test("retries a rejected configured core during a later lifecycle inbox refresh"
 	await agentEnd!({}, context);
 
 	expect(attempts).toBe(2);
-	expect(calls).toEqual(["flush", "timeout", "receive"]);
+	expect(calls).toEqual(["connect", "flush", "timeout", "receive"]);
 });
 
 test("clears a rejected configured core before retrying it", async () => {

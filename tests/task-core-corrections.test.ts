@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { createInMemoryTaskRelay } from "../src/in-memory-task-relay";
 import { createTaskCore } from "../src/task-core";
 import { createTaskStore } from "../src/task-store";
-import { TASK_PROTOCOL_VERSION } from "../src/task-protocol";
-import type { TaskEndpoint } from "../src/task-protocol";
+import { TASK_PROTOCOL_VERSION, TaskProtocolError } from "../src/task-protocol";
+import type { RelayEnvelope, TaskEndpoint, TaskRelay } from "../src/task-protocol";
 
 const ORIGIN: TaskEndpoint = { relay: "memory", id: "origin" };
 const RECEIVER: TaskEndpoint = { relay: "memory", id: "receiver" };
@@ -115,13 +115,82 @@ test("retries a durable canonical outbox before acknowledging a replayed receive
 
 	relay.failNextSend();
 	await expect(origin.receive()).rejects.toThrow("in-memory relay send failed");
-	expect(originStore.outbox("pending")).toHaveLength(2);
+	expect(originStore.outbox("pending")).toHaveLength(1);
 	expect(originStore.getReceiveCursor()).toBe("0");
 
 	const replayed = await origin.receive();
 	expect(replayed).toHaveLength(1);
 	expect(originStore.outbox("pending")).toHaveLength(0);
 	expect(Number(originStore.getReceiveCursor())).toBeGreaterThan(0);
+});
+
+test("attempts later pending envelopes and reports only the newly created assignment outcome", async () => {
+	const state = { blockedTargetId: "stale" as string | undefined, sent: [] as string[], receiveCalls: 0 };
+	const relay = selectiveRelay(state);
+	const origin = { relay: relay.id, id: "origin" };
+	const store = createTaskStore({ path: ":memory:" });
+	const core = createTaskCore({ endpoint: origin, relay, store, ids: sequence("isolated") });
+	await core.connect();
+
+	await expect(core.createTask({ target: { relay: relay.id, id: "stale" }, task: "stale", timeoutMs: 1_000 })).rejects.toMatchObject({
+		code: "TARGET_NOT_REGISTERED",
+		retryable: false,
+		details: { taskId: "isolated-1" },
+	});
+	const created = await core.createTask({ target: { relay: relay.id, id: "live" }, task: "deliver", timeoutMs: 1_000 });
+
+	expect(created.taskId).toBe("isolated-4");
+	expect(state.sent).toEqual(["isolated-3", "isolated-3", "isolated-6"]);
+	expect(store.outbox("pending").map((record) => record.envelope.envelopeId)).toEqual(["isolated-3"]);
+});
+
+test("evaluates every expired task when one timeout envelope is undeliverable", async () => {
+	const state = { blockedTargetId: undefined as string | undefined, sent: [] as string[], receiveCalls: 0 };
+	const relay = selectiveRelay(state);
+	const origin = { relay: relay.id, id: "origin" };
+	const now = { value: 1_000 };
+	const core = createTaskCore({ endpoint: origin, relay, store: createTaskStore({ path: ":memory:" }), clock: { now: (): number => now.value }, ids: sequence("timeout") });
+	await core.connect();
+	const stale = await core.createTask({ target: { relay: relay.id, id: "stale" }, task: "stale", timeoutMs: 500 });
+	const live = await core.createTask({ target: { relay: relay.id, id: "live" }, task: "live", timeoutMs: 500 });
+	state.blockedTargetId = "stale";
+	now.value = 1_501;
+
+	await expect(core.evaluateTimeouts()).rejects.toMatchObject({ code: "TARGET_NOT_REGISTERED", retryable: false });
+
+	expect(core.getTask(stale.taskId)?.status).toBe("timed_out");
+	expect(core.getTask(live.taskId)?.status).toBe("timed_out");
+});
+
+test("reports timeout delivery only for envelopes created by that evaluation", async () => {
+	const state = { blockedTargetId: "stale" as string | undefined, sent: [] as string[], receiveCalls: 0 };
+	const relay = selectiveRelay(state);
+	const origin = { relay: relay.id, id: "origin" };
+	const now = { value: 1_000 };
+	const store = createTaskStore({ path: ":memory:" });
+	const core = createTaskCore({ endpoint: origin, relay, store, clock: { now: (): number => now.value }, ids: sequence("scoped-timeout") });
+	await core.connect();
+	await expect(core.createTask({ target: { relay: relay.id, id: "stale" }, task: "historical failure", timeoutMs: 10_000 })).rejects.toThrow("target is inactive");
+	const expiring = await core.createTask({ target: { relay: relay.id, id: "live" }, task: "expire independently", timeoutMs: 500 });
+	now.value = 1_501;
+
+	await expect(core.evaluateTimeouts()).resolves.toBeUndefined();
+
+	expect(core.getTask(expiring.taskId)?.status).toBe("timed_out");
+	expect(store.outbox("pending")).toHaveLength(1);
+	expect(store.outbox("pending")[0]?.envelope.target.id).toBe("stale");
+});
+
+test("receives inbox deliveries while an unrelated outbox envelope remains undeliverable", async () => {
+	const state = { blockedTargetId: "stale" as string | undefined, sent: [] as string[], receiveCalls: 0 };
+	const relay = selectiveRelay(state);
+	const origin = { relay: relay.id, id: "origin" };
+	const core = createTaskCore({ endpoint: origin, relay, store: createTaskStore({ path: ":memory:" }), ids: sequence("receive") });
+	await core.connect();
+	await expect(core.createTask({ target: { relay: relay.id, id: "stale" }, task: "stale", timeoutMs: 1_000 })).rejects.toThrow("target is inactive");
+
+	await expect(core.receive()).resolves.toEqual([]);
+	expect(state.receiveCalls).toBe(1);
 });
 
 test("scans every locally-owned origin task for timeout after relay acceptance fails and survives restart", async () => {
@@ -148,6 +217,24 @@ test("scans every locally-owned origin task for timeout after relay acceptance f
 	expect(restarted.getTask("origin-1")?.events.map((event) => event.type)).toEqual(["task.created", "task.timed_out"]);
 	restartedStore.close();
 });
+
+function selectiveRelay(state: { blockedTargetId: string | undefined; sent: string[]; receiveCalls: number }): TaskRelay {
+	return {
+		id: "selective",
+		async connect(input) { return { endpoint: input.endpoint, receiveCursor: input.receiveCursor }; },
+		async resolve(input) { return { relay: input.relay, id: input.reference }; },
+		async send(input: RelayEnvelope) {
+			state.sent.push(input.envelopeId);
+			if (input.target.id === state.blockedTargetId) throw new TaskProtocolError("TARGET_NOT_REGISTERED", "target is inactive", { retryable: false });
+			return { envelopeId: input.envelopeId };
+		},
+		async receive(input) {
+			state.receiveCalls += 1;
+			return { deliveries: [], nextCursor: input.cursor, hasMore: false };
+		},
+		async acknowledgeDelivery() { undefined; },
+	};
+}
 
 function sequence(prefix: string): () => string {
 	let current = 0;

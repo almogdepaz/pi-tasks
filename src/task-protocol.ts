@@ -109,10 +109,21 @@ export interface TaskIntent {
 
 export class TaskProtocolError extends Error {
 	readonly code: string;
+	readonly retryable: boolean;
+	readonly details: Readonly<Record<string, unknown>> | undefined;
 
-	constructor(code: string, message: string) {
+	constructor(code: string, message: string, options: { readonly retryable?: boolean; readonly details?: Readonly<Record<string, unknown>> } = {}) {
 		super(message);
 		this.name = "TaskProtocolError";
 		this.code = code;
+		this.retryable = options.retryable ?? true;
+		this.details = options.details;
+	}
+}
+
+export class TaskOutboxDeliveryError extends TaskProtocolError {
+	constructor(code: string, message: string, options: { readonly retryable?: boolean; readonly details?: Readonly<Record<string, unknown>> } = {}) {
+		super(code, message, options);
+		this.name = "TaskOutboxDeliveryError";
 	}
 }

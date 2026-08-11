@@ -26,6 +26,7 @@ export const WOLFPACK_TASK_RELAY_LEASE_MS = 60_000;
 const DEFAULT_WOLFPACK_PORT = 18_790;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_REQUEST_TIMEOUT_MS = 60_000;
+const REGISTRATION_POLL_MARGIN_MS = 10_000;
 const SESSION_STORE_DIRECTORY = "sessions";
 
 export interface WolfpackTaskRelayOptions {
@@ -95,14 +96,16 @@ export function createWolfpackTaskRelay(options: WolfpackTaskRelayOptions = {}):
 	const callerSession = options.sessionName ?? process.env.WOLFPACK_SESSION_NAME;
 	const baseUrl = options.baseUrl ?? `http://127.0.0.1:${portFrom(process.env.WOLFPACK_PORT)}`;
 	const generation = options.generation ?? crypto.randomUUID();
-	const leaseMs = options.leaseMs ?? WOLFPACK_TASK_RELAY_LEASE_MS;
 	const requestTimeoutMs = boundedRequestTimeout(options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
+	const registrationRenewalWindowMs = requestTimeoutMs + REGISTRATION_POLL_MARGIN_MS;
+	const minimumLeaseMs = requestTimeoutMs + registrationRenewalWindowMs;
+	const leaseMs = Math.max(options.leaseMs ?? WOLFPACK_TASK_RELAY_LEASE_MS, minimumLeaseMs);
 	const requestFetch = options.fetch ?? fetch;
 	const envelopeIds = new Map<string, string>();
 	let registration: Registration | undefined;
 
 	const register = async (signal?: AbortSignal): Promise<TaskEndpoint> => {
-		if (registration && registration.expiresAt > Date.now()) return registration.endpoint;
+		if (registration && registration.expiresAt - Date.now() > registrationRenewalWindowMs) return registration.endpoint;
 		if (!nonEmpty(callerSession)) throw new TaskProtocolError("RELAY_UNAVAILABLE", "WOLFPACK_SESSION_NAME is required for the Wolfpack relay v2 adapter");
 		const response = await request<WolfpackConnectResponse>(requestFetch, baseUrl, requestTimeoutMs, "POST", "/api/task-relay/v2/connect", {
 			callerSession,
@@ -259,8 +262,8 @@ async function request<TResponse extends WolfpackRelayResponse>(requestFetch: ty
 			throw new TaskProtocolError("INVALID_RESPONSE", "Wolfpack relay returned invalid JSON");
 		}
 		if (!isRecord(payload)) throw new TaskProtocolError("INVALID_RESPONSE", "Wolfpack relay returned an invalid response");
-		if (payload.ok === false && isRecord(payload.error) && nonEmpty(payload.error.code) && typeof payload.error.message === "string") {
-			throw new TaskProtocolError(payload.error.code, payload.error.message);
+		if (payload.ok === false && isRecord(payload.error) && nonEmpty(payload.error.code) && typeof payload.error.message === "string" && typeof payload.error.retryable === "boolean") {
+			throw new TaskProtocolError(payload.error.code, payload.error.message, { retryable: payload.error.retryable });
 		}
 		if (!response.ok || payload.ok !== true) throw new TaskProtocolError("INVALID_RESPONSE", "Wolfpack relay returned an invalid response");
 		return payload as TResponse;

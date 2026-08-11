@@ -2,6 +2,7 @@ import {
 	MAX_RELAY_PAYLOAD_BYTES,
 	TASK_PROTOCOL_VERSION,
 	TaskEnvelopeKind,
+	TaskOutboxDeliveryError,
 	TaskProtocolError,
 } from "./task-protocol";
 import type {
@@ -25,6 +26,7 @@ const CANONICAL_EVENTS = new Set([
 const RECEIVER_INTENT_TYPES = new Set<TaskIntent["type"]>([
 	"task.completed", "task.failed", "task.cancelled", "task.information", "task.question", "task.answer", "task.delivery_receipt",
 ]);
+const IGNORE_OUTBOX_FAILURES: ReadonlySet<string> = new Set();
 
 export interface TaskCoreOptions {
 	readonly endpoint: TaskEndpoint;
@@ -86,31 +88,36 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 				createdAt: now, expiresAt: now + input.timeoutMs, status: "active",
 			};
 			const created = event(task, ids(), "task.created", "1", options.endpoint, target, now, { task: input.task });
+			const assignment = envelope(ids(), options.endpoint, target, taskId, TaskEnvelopeKind.assignment, { task, event: created });
 			options.store.transaction(() => {
 				options.store.putTask(task);
 				options.store.appendEvent(created);
-				options.store.putOutbox(envelope(ids(), options.endpoint, target, taskId, TaskEnvelopeKind.assignment, { task, event: created }));
+				options.store.putOutbox(assignment);
 			});
-			await flush(options, signal);
+			try {
+				await flush(options, signal, new Set([assignment.envelopeId]));
+			} catch (error) {
+				throw operationError(error, taskId);
+			}
 			return { taskId };
 		},
 		getTask(taskId) { return options.store.getTask(taskId); },
 		listTasks() { return options.store.listTasks(); },
 		async flushOutbox(signal) { await flush(options, signal); },
 		async receive(signal) {
-			await flush(options, signal);
+			await flush(options, signal, IGNORE_OUTBOX_FAILURES);
 			const page = await options.relay.receive({ endpoint: options.endpoint, cursor: options.store.getReceiveCursor(), limit: RECEIVE_PAGE_SIZE }, signal);
 			if (!isInboxPage(page)) throw new TaskProtocolError("INVALID_INBOX", "relay returned an invalid inbox page");
 			const visibleDeliveries: RelayDelivery[] = [];
 			for (const delivery of page.deliveries) {
 				if (!isDelivery(delivery)) throw new TaskProtocolError("INVALID_DELIVERY", "relay returned an invalid delivery");
 				const received = validateReceivedEnvelope(options, delivery.envelope);
-				let flushNeeded = false;
+				let persistedEnvelopeIds: readonly string[] = [];
 				options.store.transaction(() => {
 					if (!options.store.persistInbox(delivery.envelope, delivery.cursor)) return;
-					flushNeeded = persistReceivedEnvelope(options, clock.now, ids, received);
+					persistedEnvelopeIds = persistReceivedEnvelope(options, clock.now, ids, received);
 				});
-				if (flushNeeded) await flush(options, signal);
+				if (persistedEnvelopeIds.length > 0) await flush(options, signal, new Set(persistedEnvelopeIds));
 				if (received.kind === "intent") {
 					await this.acknowledgeRelayDelivery(delivery.cursor, signal);
 					continue;
@@ -127,40 +134,42 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 		async submitIntent(input, signal) {
 			if (!RECEIVER_INTENT_TYPES.has(input.type) || !isRecord(input.payload)) throw new TaskProtocolError("INVALID_INTENT", "intent type or payload is invalid");
 			const task = requiredTask(options.store, input.taskId);
+			let persistedEnvelopeIds: readonly string[] = [];
 			options.store.transaction(() => {
-				persistIntent(options, clock.now, ids, task, input);
+				persistedEnvelopeIds = persistIntent(options, clock.now, ids, task, input);
 			});
-			await flush(options, signal);
+			await flush(options, signal, new Set(persistedEnvelopeIds));
 		},
 		async recordInsertion(input, signal) {
 			const task = requiredTask(options.store, input.taskId);
-			let receiptInserted = false;
+			let persistedEnvelopeIds: readonly string[] = [];
 			options.store.transaction(() => {
-				receiptInserted = options.store.putInsertionReceipt(input.taskId, input.eventId);
-				if (receiptInserted) persistIntent(options, clock.now, ids, task, { taskId: input.taskId, type: "task.delivery_receipt", payload: { eventId: input.eventId } });
+				if (options.store.putInsertionReceipt(input.taskId, input.eventId)) {
+					persistedEnvelopeIds = persistIntent(options, clock.now, ids, task, { taskId: input.taskId, type: "task.delivery_receipt", payload: { eventId: input.eventId } });
+				}
 			});
-			if (receiptInserted) await flush(options, signal);
+			if (persistedEnvelopeIds.length > 0) await flush(options, signal, new Set(persistedEnvelopeIds));
 		},
 		async evaluateTimeouts(signal) {
+			const persistedEnvelopeIds: string[] = [];
 			for (const candidate of options.store.listTasks()) {
 				if (!sameEndpoint(candidate.origin, options.endpoint) || TERMINAL_STATUSES.has(candidate.status) || candidate.expiresAt > clock.now()) continue;
-				let timedOut = false;
 				options.store.transaction(() => {
 					const task = options.store.getTask(candidate.taskId);
 					if (!task || !sameEndpoint(task.origin, options.endpoint) || TERMINAL_STATUSES.has(task.status) || task.expiresAt > clock.now()) return;
-					canonicalize(options, clock.now, ids, task, { intentId: ids(), taskId: task.taskId, type: "task.cancelled", payload: {} }, "task.timed_out");
-					timedOut = true;
+					persistedEnvelopeIds.push(...canonicalize(options, clock.now, ids, task, { intentId: ids(), taskId: task.taskId, type: "task.cancelled", payload: {} }, "task.timed_out"));
 				});
-				if (timedOut) await flush(options, signal);
 			}
+			if (persistedEnvelopeIds.length > 0) await flush(options, signal, new Set(persistedEnvelopeIds));
 		},
 		async acknowledgeParent(taskId, signal) {
 			const task = requiredTask(options.store, taskId);
 			if (!sameEndpoint(task.origin, options.endpoint)) throw new TaskProtocolError("NOT_ORIGIN", "only origin may acknowledge a task");
+			let persistedEnvelopeIds: readonly string[] = [];
 			options.store.transaction(() => {
-				canonicalize(options, clock.now, ids, task, { intentId: ids(), taskId, type: "task.information", payload: {} }, "task.parent_acknowledged");
+				persistedEnvelopeIds = canonicalize(options, clock.now, ids, task, { intentId: ids(), taskId, type: "task.information", payload: {} }, "task.parent_acknowledged");
 			});
-			await flush(options, signal);
+			await flush(options, signal, new Set(persistedEnvelopeIds));
 		},
 	};
 }
@@ -210,49 +219,74 @@ function validateCanonicalEvent(options: TaskCoreOptions, envelope: RelayEnvelop
 	return { kind: "canonical_event", task, event: payload };
 }
 
-function persistReceivedEnvelope(options: TaskCoreOptions, now: () => number, ids: () => string, received: ReceivedEnvelope): boolean {
+function persistReceivedEnvelope(options: TaskCoreOptions, now: () => number, ids: () => string, received: ReceivedEnvelope): readonly string[] {
 	if (received.kind === "assignment") {
 		options.store.putTask(received.task);
 		options.store.appendEvent(received.event);
-		return false;
+		return [];
 	}
-	if (received.kind === "intent") {
-		canonicalize(options, now, ids, received.task, received.intent, received.intent.type);
-		return true;
-	}
+	if (received.kind === "intent") return canonicalize(options, now, ids, received.task, received.intent, received.intent.type);
 	if (options.store.appendEvent(received.event) && TERMINAL_EVENTS.has(received.event.type)) options.store.setStatus(received.task.taskId, statusFor(received.event.type));
-	return false;
+	return [];
 }
 
-function persistIntent(options: TaskCoreOptions, now: () => number, ids: () => string, task: TaskRecord, input: SubmitIntentInput): void {
+function persistIntent(options: TaskCoreOptions, now: () => number, ids: () => string, task: TaskRecord, input: SubmitIntentInput): readonly string[] {
 	if (sameEndpoint(options.endpoint, task.origin)) {
-		canonicalize(options, now, ids, task, { intentId: ids(), taskId: input.taskId, type: input.type, payload: input.payload }, input.type);
-		return;
+		return canonicalize(options, now, ids, task, { intentId: ids(), taskId: input.taskId, type: input.type, payload: input.payload }, input.type);
 	}
 	const envelopeId = ids();
 	const intent: TaskIntent = { intentId: ids(), taskId: input.taskId, type: input.type, payload: input.payload };
 	options.store.putIntent(intent.intentId, input.taskId, envelopeId);
 	options.store.putOutbox(envelope(envelopeId, options.endpoint, task.origin, input.taskId, TaskEnvelopeKind.intent, intent));
+	return [envelopeId];
 }
 
-function canonicalize(options: TaskCoreOptions, now: () => number, ids: () => string, task: TaskRecord, intent: TaskIntent, requestedType: string): void {
+function canonicalize(options: TaskCoreOptions, now: () => number, ids: () => string, task: TaskRecord, intent: TaskIntent, requestedType: string): readonly string[] {
 	const terminal = TERMINAL_EVENTS.has(requestedType);
 	const type = terminal && TERMINAL_STATUSES.has(task.status) ? "task.late_terminal" : requestedType;
 	const sequence = String(task.events.length + 1);
 	const canonical = event(task, ids(), type, sequence, options.endpoint, task.target, now(), { intentId: intent.intentId, ...intent.payload });
+	const persistedEnvelopeIds: string[] = [];
 	options.store.appendEvent(canonical);
 	if (TERMINAL_EVENTS.has(type)) options.store.setStatus(task.taskId, statusFor(type));
-	options.store.putOutbox(envelope(ids(), options.endpoint, task.target, task.taskId, TaskEnvelopeKind.canonicalEvent, canonical));
+	const targetEnvelope = envelope(ids(), options.endpoint, task.target, task.taskId, TaskEnvelopeKind.canonicalEvent, canonical);
+	options.store.putOutbox(targetEnvelope);
+	persistedEnvelopeIds.push(targetEnvelope.envelopeId);
 	if (!sameEndpoint(task.origin, task.target)) {
-		options.store.putOutbox(envelope(ids(), options.endpoint, task.origin, task.taskId, TaskEnvelopeKind.canonicalEvent, canonical));
+		const originEnvelope = envelope(ids(), options.endpoint, task.origin, task.taskId, TaskEnvelopeKind.canonicalEvent, canonical);
+		options.store.putOutbox(originEnvelope);
+		persistedEnvelopeIds.push(originEnvelope.envelopeId);
 	}
+	return persistedEnvelopeIds;
 }
 
-async function flush(options: TaskCoreOptions, signal: AbortSignal | undefined): Promise<void> {
+async function flush(options: TaskCoreOptions, signal: AbortSignal | undefined, reportedEnvelopeIds?: ReadonlySet<string>): Promise<void> {
+	const failures: Array<{ readonly envelopeId: string; readonly error: unknown }> = [];
 	for (const record of options.store.outbox("pending")) {
-		await options.relay.send(record.envelope, signal);
-		options.store.transaction(() => { options.store.markOutboxAccepted(record.envelope.envelopeId); });
+		try {
+			await options.relay.send(record.envelope, signal);
+			options.store.transaction(() => { options.store.markOutboxAccepted(record.envelope.envelopeId); });
+		} catch (error) {
+			if (signal?.aborted || (error instanceof TaskProtocolError && error.code === "ABORTED")) throw error;
+			failures.push({ envelopeId: record.envelope.envelopeId, error });
+		}
 	}
+	const reportedFailure = failures.find((failure) => reportedEnvelopeIds === undefined || reportedEnvelopeIds.has(failure.envelopeId));
+	if (reportedFailure) throw outboxDeliveryError(reportedFailure.error);
+}
+
+function outboxDeliveryError(error: unknown): TaskOutboxDeliveryError {
+	if (error instanceof TaskProtocolError) {
+		return new TaskOutboxDeliveryError(error.code, error.message, { retryable: error.retryable, details: error.details });
+	}
+	return new TaskOutboxDeliveryError("TASK_ERROR", error instanceof Error ? error.message : "task delivery failed");
+}
+
+function operationError(error: unknown, taskId: string): TaskProtocolError {
+	if (error instanceof TaskProtocolError) {
+		return new TaskProtocolError(error.code, error.message, { retryable: error.retryable, details: { ...error.details, taskId } });
+	}
+	return new TaskProtocolError("TASK_ERROR", error instanceof Error ? error.message : "task operation failed", { details: { taskId } });
 }
 
 function event(task: Omit<TaskRecord, "events">, eventId: string, type: string, sequence: string, source: TaskEndpoint, target: TaskEndpoint, occurredAt: number, payload: Record<string, unknown>): TaskEvent {

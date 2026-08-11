@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { createWolfpackTaskCore, createWolfpackTaskRelay, wolfpackTaskStorePath } from "../src/wolfpack-task-relay";
+import { TASK_PROTOCOL_VERSION } from "../src/task-protocol";
 
 const temporaryDirectories: string[] = [];
 
@@ -22,13 +23,22 @@ beforeAll(() => {
 			if (url.pathname === "/api/task-relay/v2/connect") {
 				const callerSession = typeof body === "object" && body !== null && "callerSession" in body ? body.callerSession : undefined;
 				if (callerSession === "renewing-sender") return Response.json({ ok: true, endpoint: { relay: "wolfpack-pi-tasks-v2", id: "renewing-sender" }, leaseExpiresAt: new Date(Date.now() + 20).toISOString() });
+				if (callerSession === "proactive-sender") return Response.json({ ok: true, endpoint: { relay: "wolfpack-pi-tasks-v2", id: "proactive-sender" }, leaseExpiresAt: new Date(Date.now() + 60_000).toISOString() });
+				if (callerSession === "maximum-timeout-sender") {
+					const leaseMs = typeof body === "object" && body !== null && "leaseMs" in body && typeof body.leaseMs === "number" ? body.leaseMs : 0;
+					return Response.json({ ok: true, endpoint: { relay: "wolfpack-pi-tasks-v2", id: "maximum-timeout-sender" }, leaseExpiresAt: new Date(Date.now() + leaseMs).toISOString() });
+				}
 				const generation = typeof body === "object" && body !== null && "generation" in body && typeof body.generation === "string" ? body.generation : "";
 				const endpoint = { relay: "wolfpack-pi-tasks-v2", id: callerSession === "restart-sender" ? `restart-${generation}` : "sender" };
 				if (typeof callerSession === "string") endpointsBySession.set(callerSession, endpoint);
 				return Response.json({ ok: true, endpoint, leaseExpiresAt: "2099-01-01T00:00:00.000Z" });
 			}
 			if (url.pathname === "/api/task-relay/v2/resolve") return Response.json({ ok: true, endpoint: { relay: "wolfpack-pi-tasks-v2", id: "receiver" } });
-			if (url.pathname === "/api/task-relay/v2/send") return Response.json({ ok: true, kind: "accepted", acceptanceId: "accepted-envelope", forwarding: "local" });
+			if (url.pathname === "/api/task-relay/v2/send") {
+				const callerSession = typeof body === "object" && body !== null && "callerSession" in body ? body.callerSession : undefined;
+				if (callerSession === "structured-error-sender") return Response.json({ ok: false, error: { code: "TARGET_NOT_REGISTERED", message: "target is inactive", retryable: false } }, { status: 409 });
+				return Response.json({ ok: true, kind: "accepted", acceptanceId: "accepted-envelope", forwarding: "local" });
+			}
 			if (url.pathname === "/api/task-relay/v2/receive") {
 				const endpoint = endpointsBySession.get(url.searchParams.get("callerSession") ?? "") ?? { relay: "wolfpack-pi-tasks-v2", id: "sender" };
 				return Response.json({
@@ -160,6 +170,75 @@ test("renews an expired Wolfpack registration through the real connect route", a
 
 	expect(first).toEqual(second);
 	expect(requests.filter((request) => request.path === "/api/task-relay/v2/connect" && (request.body as { readonly callerSession?: string }).callerSession === "renewing-sender")).toHaveLength(2);
+});
+
+test("renews a normal Wolfpack lease early enough for request latency and poll cadence", async () => {
+	const originalNow = Date.now;
+	let now = 1_000_000;
+	Date.now = (): number => now;
+	try {
+		const relay = createWolfpackTaskRelay({ baseUrl, sessionName: "proactive-sender", generation: "proactive-process" });
+		const first = await relay.endpoint();
+		now += 40_000;
+		const second = await relay.endpoint();
+
+		expect(first).toEqual(second);
+		expect(requests.filter((request) => request.path === "/api/task-relay/v2/connect" && (request.body as { readonly callerSession?: string }).callerSession === "proactive-sender")).toHaveLength(2);
+	} finally {
+		Date.now = originalNow;
+	}
+});
+
+test("sizes the maximum-timeout lease across delayed registration and renewal requests", async () => {
+	const originalNow = Date.now;
+	let now = 1_000_000;
+	let priorLeaseExpiry = 0;
+	let expiryGap = false;
+	const requestedLeases: number[] = [];
+	let connects = 0;
+	Date.now = (): number => now;
+	try {
+		const requestFetch = Object.assign(async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			connects += 1;
+			const body = JSON.parse(String(init?.body)) as { readonly leaseMs: number };
+			requestedLeases.push(body.leaseMs);
+			if (connects === 1) {
+				priorLeaseExpiry = now + body.leaseMs;
+				const leaseExpiresAt = new Date(priorLeaseExpiry).toISOString();
+				now += 60_000;
+				return Response.json({ ok: true, endpoint: { relay: "wolfpack-pi-tasks-v2", id: "maximum-timeout-sender" }, leaseExpiresAt });
+			}
+			now += 60_000;
+			expiryGap = now > priorLeaseExpiry;
+			priorLeaseExpiry = now + body.leaseMs;
+			return Response.json({ ok: true, endpoint: { relay: "wolfpack-pi-tasks-v2", id: "maximum-timeout-sender" }, leaseExpiresAt: new Date(priorLeaseExpiry).toISOString() });
+		}, { preconnect: fetch.preconnect });
+		const relay = createWolfpackTaskRelay({ baseUrl, sessionName: "maximum-timeout-sender", generation: "maximum-timeout-process", requestTimeoutMs: 60_000, fetch: requestFetch });
+
+		await relay.endpoint();
+		now += 5_000;
+		await relay.endpoint();
+
+		expect(requestedLeases).toEqual([130_000, 130_000]);
+		expect(expiryGap).toBeFalse();
+	} finally {
+		Date.now = originalNow;
+	}
+});
+
+test("preserves relay error code and retryability from rejected sends", async () => {
+	const relay = createWolfpackTaskRelay({ baseUrl, sessionName: "structured-error-sender", generation: "structured-error-process" });
+	const endpoint = await relay.endpoint();
+
+	await expect(relay.send({
+		envelopeId: "rejected-envelope",
+		protocolVersion: TASK_PROTOCOL_VERSION,
+		source: endpoint,
+		target: { relay: "wolfpack-pi-tasks-v2", id: "inactive" },
+		taskId: "task-1",
+		kind: "assignment",
+		payload: "{}",
+	})).rejects.toMatchObject({ code: "TARGET_NOT_REGISTERED", retryable: false });
 });
 
 test("propagates caller cancellation and bounds stalled relay HTTP requests", async () => {

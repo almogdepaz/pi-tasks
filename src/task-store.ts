@@ -4,12 +4,13 @@ import { dirname, join } from "node:path";
 
 import { openSqliteDatabase } from "./sqlite-database";
 import type { SqliteDatabase } from "./sqlite-database";
-import type { RelayEnvelope, TaskEvent, TaskRecord } from "./task-protocol";
+import type { RelayEnvelope, TaskEndpoint, TaskEvent, TaskRecord } from "./task-protocol";
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const OWNER_ONLY_MODE = 0o700;
 const OWNER_ONLY_FILE_MODE = 0o600;
 const ENDPOINT_GENERATION_STATE_KEY = "endpoint_generation";
+const ENDPOINT_BINDING_STATE_KEY = "endpoint_binding";
 
 export interface TaskStoreOptions {
 	readonly path?: string;
@@ -18,6 +19,18 @@ export interface TaskStoreOptions {
 export interface OutboxRecord {
 	readonly envelope: RelayEnvelope;
 	readonly state: "pending" | "accepted";
+}
+
+export interface OutboxQuarantineInput {
+	readonly errorCode: string;
+	readonly reason: string;
+	readonly details: Readonly<Record<string, unknown>>;
+	readonly quarantinedAt: number;
+}
+
+export interface OutboxQuarantineRecord extends OutboxQuarantineInput {
+	readonly envelope: RelayEnvelope;
+	readonly priorState: OutboxRecord["state"];
 }
 
 export interface TaskStore {
@@ -30,6 +43,8 @@ export interface TaskStore {
 	putOutbox(envelope: RelayEnvelope): void;
 	outbox(state: OutboxRecord["state"]): readonly OutboxRecord[];
 	markOutboxAccepted(envelopeId: string): void;
+	quarantineOutbox(envelopeId: string, input: OutboxQuarantineInput): void;
+	quarantinedOutbox(): readonly OutboxQuarantineRecord[];
 	persistInbox(envelope: RelayEnvelope, cursor: string): boolean;
 	getReceiveCursor(): string;
 	setReceiveCursor(cursor: string): void;
@@ -37,6 +52,8 @@ export interface TaskStore {
 	putInsertionReceipt(taskId: string, eventId: string): boolean;
 	getEndpointGeneration(): string | undefined;
 	setEndpointGeneration(generation: string): void;
+	getEndpointBinding(): TaskEndpoint | undefined;
+	setEndpointBinding(endpoint: TaskEndpoint): void;
 	close(): void;
 }
 
@@ -92,6 +109,26 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
 		markOutboxAccepted(envelopeId) {
 			database.query("UPDATE outbox SET state = 'accepted' WHERE envelope_id = ?").run(envelopeId);
 		},
+		quarantineOutbox(envelopeId, input) {
+			const row = database.query("SELECT envelope, state FROM outbox WHERE envelope_id = ?").get(envelopeId) as { readonly envelope: string; readonly state: OutboxRecord["state"] } | null;
+			if (!row) return;
+			database.query(`INSERT INTO outbox_quarantine (envelope, error_code, reason, details, quarantined_at, prior_state, envelope_id)
+				VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(envelope_id) DO NOTHING`).run(
+				row.envelope, input.errorCode, input.reason, JSON.stringify(input.details), input.quarantinedAt, row.state, envelopeId,
+			);
+			database.query("DELETE FROM outbox WHERE envelope_id = ?").run(envelopeId);
+		},
+		quarantinedOutbox() {
+			const rows = database.query("SELECT envelope, error_code, reason, details, quarantined_at, prior_state FROM outbox_quarantine ORDER BY rowid").all() as OutboxQuarantineRow[];
+			return rows.map((row) => ({
+				envelope: parseEnvelope(row.envelope),
+				errorCode: row.error_code,
+				reason: row.reason,
+				details: parseRecord(row.details),
+				quarantinedAt: row.quarantined_at,
+				priorState: row.prior_state,
+			}));
+		},
 		persistInbox(envelope, cursor) {
 			const result = database.query("INSERT INTO inbox (envelope_id, cursor, envelope) VALUES (?, ?, ?) ON CONFLICT(envelope_id) DO NOTHING").run(envelope.envelopeId, cursor, JSON.stringify(envelope));
 			return result.changes === 1;
@@ -117,6 +154,13 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
 		setEndpointGeneration(generation) {
 			database.query("INSERT INTO relay_state (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value = excluded.value").run(ENDPOINT_GENERATION_STATE_KEY, generation);
 		},
+		getEndpointBinding() {
+			const row = database.query("SELECT value FROM relay_state WHERE name = ?").get(ENDPOINT_BINDING_STATE_KEY) as { readonly value: string } | null;
+			return row ? parseEndpoint(row.value) : undefined;
+		},
+		setEndpointBinding(endpoint) {
+			database.query("INSERT INTO relay_state (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value = excluded.value").run(ENDPOINT_BINDING_STATE_KEY, JSON.stringify(endpoint));
+		},
 		close() { database.close(); },
 	};
 	return store;
@@ -133,6 +177,15 @@ interface TaskRow {
 	readonly created_at: number;
 	readonly expires_at: number;
 	readonly status: string;
+}
+
+interface OutboxQuarantineRow {
+	readonly envelope: string;
+	readonly error_code: string;
+	readonly reason: string;
+	readonly details: string;
+	readonly quarantined_at: number;
+	readonly prior_state: OutboxRecord["state"];
 }
 
 interface EventRow {
@@ -175,6 +228,29 @@ function migrate(database: SqliteDatabase): void {
 			PRAGMA user_version = 3;
 		`);
 	}
+	if (version.user_version <= 3) {
+		database.exec(`CREATE TABLE IF NOT EXISTS outbox_quarantine (
+			envelope_id TEXT PRIMARY KEY,
+			envelope TEXT NOT NULL,
+			reason TEXT NOT NULL,
+			quarantined_at INTEGER NOT NULL,
+			error_code TEXT NOT NULL DEFAULT 'UNKNOWN',
+			details TEXT NOT NULL DEFAULT '{}',
+			prior_state TEXT NOT NULL DEFAULT 'pending'
+		);`);
+		ensureColumn(database, "outbox_quarantine", "envelope", "TEXT NOT NULL DEFAULT '{}'");
+		ensureColumn(database, "outbox_quarantine", "reason", "TEXT NOT NULL DEFAULT 'operator quarantine'");
+		ensureColumn(database, "outbox_quarantine", "quarantined_at", "INTEGER NOT NULL DEFAULT 0");
+		ensureColumn(database, "outbox_quarantine", "error_code", "TEXT NOT NULL DEFAULT 'UNKNOWN'");
+		ensureColumn(database, "outbox_quarantine", "details", "TEXT NOT NULL DEFAULT '{}'");
+		ensureColumn(database, "outbox_quarantine", "prior_state", "TEXT NOT NULL DEFAULT 'pending'");
+		database.exec("PRAGMA user_version = 4;");
+	}
+}
+
+function ensureColumn(database: SqliteDatabase, table: string, name: string, definition: string): void {
+	const columns = database.query(`PRAGMA table_info(${table})`).all() as Array<{ readonly name: string }>;
+	if (!columns.some((column) => column.name === name)) database.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
 }
 
 function preparePath(path: string): void {
@@ -233,6 +309,18 @@ function parseEnvelope(value: string): RelayEnvelope {
 	return JSON.parse(value) as RelayEnvelope;
 }
 
+function parseEndpoint(value: string): TaskEndpoint {
+	const endpoint = JSON.parse(value) as unknown;
+	if (!isRecord(endpoint) || typeof endpoint.relay !== "string" || endpoint.relay.length === 0 || typeof endpoint.id !== "string" || endpoint.id.length === 0) {
+		throw new Error("task store endpoint binding is malformed");
+	}
+	return { relay: endpoint.relay, id: endpoint.id };
+}
+
 function parseRecord(value: string): Record<string, unknown> {
 	return JSON.parse(value) as Record<string, unknown>;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
 }

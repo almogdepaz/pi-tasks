@@ -116,6 +116,7 @@ test("retries a durable canonical outbox before acknowledging a replayed receive
 	relay.failNextSend();
 	await expect(origin.receive()).rejects.toThrow("in-memory relay send failed");
 	expect(originStore.outbox("pending")).toHaveLength(1);
+	expect(originStore.quarantinedOutbox()).toEqual([]);
 	expect(originStore.getReceiveCursor()).toBe("0");
 
 	const replayed = await origin.receive();
@@ -124,7 +125,7 @@ test("retries a durable canonical outbox before acknowledging a replayed receive
 	expect(Number(originStore.getReceiveCursor())).toBeGreaterThan(0);
 });
 
-test("attempts later pending envelopes and reports only the newly created assignment outcome", async () => {
+test("quarantines a permanent rejection, reports it to its initiating operation, and does not retry it", async () => {
 	const state = { blockedTargetId: "stale" as string | undefined, sent: [] as string[], receiveCalls: 0 };
 	const relay = selectiveRelay(state);
 	const origin = { relay: relay.id, id: "origin" };
@@ -140,8 +141,35 @@ test("attempts later pending envelopes and reports only the newly created assign
 	const created = await core.createTask({ target: { relay: relay.id, id: "live" }, task: "deliver", timeoutMs: 1_000 });
 
 	expect(created.taskId).toBe("isolated-4");
-	expect(state.sent).toEqual(["isolated-3", "isolated-3", "isolated-6"]);
-	expect(store.outbox("pending").map((record) => record.envelope.envelopeId)).toEqual(["isolated-3"]);
+	expect(state.sent).toEqual(["isolated-3", "isolated-6"]);
+	expect(store.outbox("pending")).toEqual([]);
+	expect(store.quarantinedOutbox()).toEqual([expect.objectContaining({
+		errorCode: "TARGET_NOT_REGISTERED",
+		reason: "target is inactive",
+		details: { targetId: "stale" },
+		priorState: "pending",
+		envelope: expect.objectContaining({ envelopeId: "isolated-3" }),
+	})]);
+});
+
+test("keeps retryable target registration failures pending and reports them on later flushes", async () => {
+	const state = { blockedTargetId: "stale" as string | undefined, sent: [] as string[], receiveCalls: 0, retryable: true };
+	const relay = selectiveRelay(state);
+	const origin = { relay: relay.id, id: "origin" };
+	const store = createTaskStore({ path: ":memory:" });
+	const core = createTaskCore({ endpoint: origin, relay, store, ids: sequence("transient") });
+	await core.connect();
+
+	await expect(core.createTask({ target: { relay: relay.id, id: "stale" }, task: "retry", timeoutMs: 1_000 })).rejects.toMatchObject({
+		code: "TARGET_NOT_REGISTERED",
+		retryable: true,
+		details: { taskId: "transient-1" },
+	});
+	await expect(core.flushOutbox()).rejects.toMatchObject({ code: "TARGET_NOT_REGISTERED", retryable: true });
+
+	expect(state.sent).toEqual(["transient-3", "transient-3"]);
+	expect(store.outbox("pending").map((record) => record.envelope.envelopeId)).toEqual(["transient-3"]);
+	expect(store.quarantinedOutbox()).toEqual([]);
 });
 
 test("evaluates every expired task when one timeout envelope is undeliverable", async () => {
@@ -177,8 +205,8 @@ test("reports timeout delivery only for envelopes created by that evaluation", a
 	await expect(core.evaluateTimeouts()).resolves.toBeUndefined();
 
 	expect(core.getTask(expiring.taskId)?.status).toBe("timed_out");
-	expect(store.outbox("pending")).toHaveLength(1);
-	expect(store.outbox("pending")[0]?.envelope.target.id).toBe("stale");
+	expect(store.outbox("pending")).toEqual([]);
+	expect(store.quarantinedOutbox().map((record) => record.envelope.target.id)).toEqual(["stale"]);
 });
 
 test("receives inbox deliveries while an unrelated outbox envelope remains undeliverable", async () => {
@@ -218,14 +246,14 @@ test("scans every locally-owned origin task for timeout after relay acceptance f
 	restartedStore.close();
 });
 
-function selectiveRelay(state: { blockedTargetId: string | undefined; sent: string[]; receiveCalls: number }): TaskRelay {
+function selectiveRelay(state: { blockedTargetId: string | undefined; sent: string[]; receiveCalls: number; retryable?: boolean }): TaskRelay {
 	return {
 		id: "selective",
 		async connect(input) { return { endpoint: input.endpoint, receiveCursor: input.receiveCursor }; },
 		async resolve(input) { return { relay: input.relay, id: input.reference }; },
 		async send(input: RelayEnvelope) {
 			state.sent.push(input.envelopeId);
-			if (input.target.id === state.blockedTargetId) throw new TaskProtocolError("TARGET_NOT_REGISTERED", "target is inactive", { retryable: false });
+			if (input.target.id === state.blockedTargetId) throw new TaskProtocolError("TARGET_NOT_REGISTERED", "target is inactive", { retryable: state.retryable ?? false, details: { targetId: input.target.id } });
 			return { envelopeId: input.envelopeId };
 		},
 		async receive(input) {

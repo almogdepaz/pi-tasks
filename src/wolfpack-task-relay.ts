@@ -18,7 +18,7 @@ import type {
 	TaskRelay,
 } from "./task-protocol";
 import type { TaskCoreOptions } from "./task-core";
-import type { TaskStoreOptions } from "./task-store";
+import type { TaskStore, TaskStoreOptions } from "./task-store";
 
 export const WOLFPACK_TASK_RELAY_ID = "wolfpack-pi-tasks-v2";
 export const WOLFPACK_TASK_RELAY_PROTOCOL_VERSION = 2;
@@ -28,6 +28,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_REQUEST_TIMEOUT_MS = 60_000;
 const REGISTRATION_POLL_MARGIN_MS = 10_000;
 const SESSION_STORE_DIRECTORY = "sessions";
+const ENDPOINT_ROTATED_CODE = "ENDPOINT_ROTATED";
 
 export interface WolfpackTaskRelayOptions {
 	readonly baseUrl?: string;
@@ -182,11 +183,34 @@ export async function createWolfpackTaskCore(options: WolfpackTaskCoreOptions = 
 	const relay = createWolfpackTaskRelay({ ...options, sessionName, generation });
 	try {
 		const endpoint = await relay.endpoint(signal);
+		bindRegisteredEndpoint(store, endpoint, options.clock?.now() ?? Date.now());
 		return createTaskCore({ endpoint, relay, store, ...(options.clock === undefined ? {} : { clock: options.clock }), ...(options.ids === undefined ? {} : { ids: options.ids }) });
 	} catch (error) {
 		store.close();
 		throw error;
 	}
+}
+
+function bindRegisteredEndpoint(store: TaskStore, endpoint: TaskEndpoint, now: number): void {
+	const priorEndpoint = store.getEndpointBinding();
+	if (!priorEndpoint) {
+		store.transaction(() => { store.setEndpointBinding(endpoint); });
+		return;
+	}
+	if (sameEndpoint(priorEndpoint, endpoint)) return;
+	store.transaction(() => {
+		store.setEndpointBinding(endpoint);
+		store.setReceiveCursor("0");
+		for (const record of store.outbox("pending")) {
+			if (!sameEndpoint(record.envelope.source, priorEndpoint)) continue;
+			store.quarantineOutbox(record.envelope.envelopeId, {
+				errorCode: ENDPOINT_ROTATED_CODE,
+				reason: "source endpoint rotated before delivery",
+				details: { priorEndpoint, endpoint },
+				quarantinedAt: now,
+			});
+		}
+	});
 }
 
 function toWolfpackEnvelope(envelope: RelayEnvelope): WolfpackRelayEnvelope {

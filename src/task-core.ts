@@ -17,6 +17,7 @@ import type {
 import type { TaskStore } from "./task-store";
 
 const RECEIVE_PAGE_SIZE = 100;
+const TARGET_NOT_REGISTERED_CODE = "TARGET_NOT_REGISTERED";
 const TERMINAL_STATUSES = new Set<TaskRecord["status"]>(["completed", "failed", "cancelled", "timed_out"]);
 const TERMINAL_EVENTS = new Set(["task.completed", "task.failed", "task.cancelled", "task.timed_out"]);
 const CANONICAL_EVENTS = new Set([
@@ -268,6 +269,16 @@ async function flush(options: TaskCoreOptions, signal: AbortSignal | undefined, 
 			options.store.transaction(() => { options.store.markOutboxAccepted(record.envelope.envelopeId); });
 		} catch (error) {
 			if (signal?.aborted || (error instanceof TaskProtocolError && error.code === "ABORTED")) throw error;
+			if (error instanceof TaskProtocolError && error.code === TARGET_NOT_REGISTERED_CODE && !error.retryable) {
+				options.store.transaction(() => {
+					options.store.quarantineOutbox(record.envelope.envelopeId, {
+						errorCode: error.code,
+						reason: error.message,
+						details: error.details ?? {},
+						quarantinedAt: Date.now(),
+					});
+				});
+			}
 			failures.push({ envelopeId: record.envelope.envelopeId, error });
 		}
 	}

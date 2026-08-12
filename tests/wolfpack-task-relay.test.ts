@@ -3,8 +3,10 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 
+import { createTaskStore } from "../src/task-store";
 import { createWolfpackTaskCore, createWolfpackTaskRelay, wolfpackTaskStorePath } from "../src/wolfpack-task-relay";
 import { TASK_PROTOCOL_VERSION } from "../src/task-protocol";
+import type { RelayEnvelope, TaskEndpoint } from "../src/task-protocol";
 
 const temporaryDirectories: string[] = [];
 
@@ -111,6 +113,56 @@ test("persists the Wolfpack generation and durable receive, intent, and timeout 
 		.map((request) => (request.body as { readonly generation: string }).generation);
 	expect(generations).toHaveLength(2);
 	expect(generations[0]).toBe(generations[1]);
+});
+
+test("first endpoint binding preserves all pending work and the cursor", async () => {
+	const directory = mkdtempSync("/tmp/pi-tasks-wolfpack-");
+	temporaryDirectories.push(directory);
+	const path = join(directory, "tasks.sqlite");
+	const endpoint = { relay: "wolfpack-pi-tasks-v2", id: "first-endpoint" };
+	const legacyEndpoint = { relay: "wolfpack-pi-tasks-v2", id: "legacy-endpoint" };
+	const store = createTaskStore({ path });
+	store.setReceiveCursor("7");
+	store.putOutbox(assignment("pending-first-binding", endpoint, "receiver"));
+	store.putOutbox(assignment("pending-legacy-source", legacyEndpoint, "receiver"));
+
+	await createWolfpackTaskCore({ sessionName: "first-binding", generation: "first-generation", path, fetch: registrationFetch(endpoint) });
+
+	expect(store.getEndpointBinding()).toEqual(endpoint);
+	expect(store.getReceiveCursor()).toBe("7");
+	expect(store.outbox("pending").map((record) => record.envelope.envelopeId)).toEqual(["pending-first-binding", "pending-legacy-source"]);
+	expect(store.quarantinedOutbox()).toEqual([]);
+	store.close();
+});
+
+test("atomically resets rotated endpoint state and quarantines only prior-source pending work", async () => {
+	const directory = mkdtempSync("/tmp/pi-tasks-wolfpack-");
+	temporaryDirectories.push(directory);
+	const path = join(directory, "tasks.sqlite");
+	const prior = { relay: "wolfpack-pi-tasks-v2", id: "prior-endpoint" };
+	const rotated = { relay: "wolfpack-pi-tasks-v2", id: "rotated-endpoint" };
+	const unrelated = { relay: "wolfpack-pi-tasks-v2", id: "unrelated-source" };
+	const store = createTaskStore({ path });
+	store.setEndpointBinding(prior);
+	store.setReceiveCursor("9");
+	store.putOutbox(assignment("prior-pending", prior, "receiver"));
+	store.putOutbox(assignment("unrelated-pending", unrelated, "receiver"));
+	store.putOutbox(assignment("prior-accepted", prior, "receiver"));
+	store.markOutboxAccepted("prior-accepted");
+
+	await createWolfpackTaskCore({ sessionName: "rotated-binding", generation: "rotated-generation", path, fetch: registrationFetch(rotated) });
+
+	expect(store.getEndpointBinding()).toEqual(rotated);
+	expect(store.getReceiveCursor()).toBe("0");
+	expect(store.outbox("pending").map((record) => record.envelope.envelopeId)).toEqual(["unrelated-pending"]);
+	expect(store.outbox("accepted").map((record) => record.envelope.envelopeId)).toEqual(["prior-accepted"]);
+	expect(store.quarantinedOutbox()).toEqual([expect.objectContaining({
+		errorCode: "ENDPOINT_ROTATED",
+		priorState: "pending",
+		details: { priorEndpoint: prior, endpoint: rotated },
+		envelope: expect.objectContaining({ envelopeId: "prior-pending" }),
+	})]);
+	store.close();
 });
 
 test("isolates default durable state by Wolfpack session and reuses one session generation", async () => {
@@ -316,6 +368,26 @@ function streamedConnectResponse(): { readonly value: Response; readonly jsonSta
 		attach(value: AbortSignal | null | undefined): void {
 			signal = value ?? undefined;
 		},
+	};
+}
+
+function registrationFetch(endpoint: TaskEndpoint): typeof fetch {
+	return Object.assign(async (): Promise<Response> => Response.json({
+		ok: true,
+		endpoint,
+		leaseExpiresAt: "2099-01-01T00:00:00.000Z",
+	}), { preconnect: fetch.preconnect }) as typeof fetch;
+}
+
+function assignment(envelopeId: string, source: TaskEndpoint, targetId: string): RelayEnvelope {
+	return {
+		envelopeId,
+		protocolVersion: TASK_PROTOCOL_VERSION,
+		source,
+		target: { relay: source.relay, id: targetId },
+		taskId: `task-${envelopeId}`,
+		kind: "assignment",
+		payload: "{}",
 	};
 }
 

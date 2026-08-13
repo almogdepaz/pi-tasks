@@ -23,7 +23,7 @@ test("persists inbound state, inserts structural evidence, then records a logica
 	};
 	const context = { hasPendingMessages: (): boolean => false, sessionManager: { getEntries: (): readonly unknown[] => entries } };
 
-	await deliverTaskInbox(pi, child, context);
+	await deliverTaskInbox(pi, child, context, new Set());
 
 	expect(entries).toContainEqual({ type: "custom_message", customType: "pi-tasks-event", details: { taskId: created.taskId, eventId: "parent-2" } });
 	expect(relay.envelopesFor(receiver)).toHaveLength(1);
@@ -45,7 +45,7 @@ test("origin acknowledges raw receiver intents before rendering their canonical 
 		appendEntry(customType: string, data: unknown) { childEntries.push({ type: "custom", customType, data }); },
 	};
 	const ready = { hasPendingMessages: (): boolean => false, sessionManager: { getEntries: (): readonly unknown[] => childEntries } };
-	await deliverTaskInbox(childPi, child, ready);
+	await deliverTaskInbox(childPi, child, ready, new Set());
 	await child.submitIntent({ taskId: created.taskId, type: "task.information", payload: { message: "progress" } });
 	await child.submitIntent({ taskId: created.taskId, type: "task.completed", payload: { summary: "finished" } });
 
@@ -55,15 +55,16 @@ test("origin acknowledges raw receiver intents before rendering their canonical 
 		appendEntry(customType: string, data: unknown) { parentEntries.push({ type: "custom", customType, data }); },
 	};
 	const parentContext = { hasPendingMessages: (): boolean => false, sessionManager: { getEntries: (): readonly unknown[] => parentEntries } };
+	const pendingInsertions = new Set<string>();
 
-	await deliverTaskInbox(parentPi, parent, parentContext);
+	await deliverTaskInbox(parentPi, parent, parentContext, pendingInsertions);
 
 	expect(parent.getTask(created.taskId)?.status).toBe("completed");
 	expect(parent.getTask(created.taskId)?.events.map((event) => event.type).slice(0, 4)).toEqual(["task.created", "task.delivery_receipt", "task.information", "task.completed"]);
 	expect(parentStore.getReceiveCursor()).toBe("4");
 	expect(parentEntries).toEqual([]);
 
-	await deliverTaskInbox(parentPi, parent, parentContext);
+	await deliverTaskInbox(parentPi, parent, parentContext, pendingInsertions);
 
 	expect(parentEntries).toEqual(expect.arrayContaining([
 		expect.objectContaining({ type: "custom_message", content: expect.stringContaining("progress") }),
@@ -94,7 +95,7 @@ test("origin acknowledges raw receiver intents and renders their canonical messa
 	};
 	const parentContext = { hasPendingMessages: (): boolean => false, sessionManager: { getEntries: (): readonly unknown[] => parentEntries } };
 
-	await deliverTaskInbox(parentPi, parent, parentContext);
+	await deliverTaskInbox(parentPi, parent, parentContext, new Set());
 
 	expect(parentEntries).toEqual(expect.arrayContaining([
 		expect.objectContaining({ type: "custom_message", content: expect.stringContaining("progress") }),
@@ -116,8 +117,8 @@ test("fails closed on an unknown canonical event without advancing the relay del
 	const pi = { sendMessage() { throw new Error("must not insert an unknown event"); }, appendEntry() { throw new Error("must not advance cursor"); } };
 	const context = { hasPendingMessages: (): boolean => false, sessionManager: { getEntries: (): readonly unknown[] => [] } };
 
-	await expect(deliverTaskInbox(pi, child, context)).rejects.toThrow("canonical event envelope headers or payload are invalid");
-	await expect(deliverTaskInbox(pi, child, context)).rejects.toThrow("canonical event envelope headers or payload are invalid");
+	await expect(deliverTaskInbox(pi, child, context, new Set())).rejects.toThrow("canonical event envelope headers or payload are invalid");
+	await expect(deliverTaskInbox(pi, child, context, new Set())).rejects.toThrow("canonical event envelope headers or payload are invalid");
 });
 
 function ids(prefix: string): () => string {

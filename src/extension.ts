@@ -58,6 +58,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 	let inboxContext: ExtensionContext | undefined;
 	let backgroundTimer: ReturnType<typeof setInterval> | undefined;
 	let lifecycleEpoch = 0;
+	const pendingInsertions = new Set<string>();
 	const configuredCore: ConfiguredCoreFactory = core === undefined ? createConfiguredCoreLoader(createCore) : async (): Promise<TaskCore> => core;
 	const refreshInbox = createSingleFlightInboxRefresh(async (signal) => {
 		const context = inboxContext;
@@ -97,7 +98,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		}, guardedCore, {
 			hasPendingMessages: (): boolean => !isCurrent() || context.hasPendingMessages(),
 			sessionManager: context.sessionManager,
-		}, signal);
+		}, pendingInsertions, signal);
 		return outboxError;
 	});
 	const refreshLifecycle = async (context: ExtensionContext, epoch: number): Promise<void> => {
@@ -122,6 +123,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 	};
 
 	pi.on("session_start", async (_event, context) => {
+		pendingInsertions.clear();
 		const epoch = ++lifecycleEpoch;
 		inboxContext = context;
 		if (backgroundTimer) clearInterval(backgroundTimer);
@@ -137,6 +139,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		await refreshLifecycle(context, epoch);
 	});
 	pi.on("session_shutdown", () => {
+		pendingInsertions.clear();
 		lifecycleEpoch += 1;
 		if (backgroundTimer) clearInterval(backgroundTimer);
 		backgroundTimer = undefined;

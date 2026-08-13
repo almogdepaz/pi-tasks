@@ -21,7 +21,7 @@ interface TaskEventDetails {
 }
 
 /** Inserts durable Pi evidence before allowing the relay mailbox cursor to advance. */
-export async function deliverTaskInbox(pi: InboxPi, core: TaskCore, context: InboxContext, signal?: AbortSignal): Promise<void> {
+export async function deliverTaskInbox(pi: InboxPi, core: TaskCore, context: InboxContext, pendingInsertions: Set<string>, signal?: AbortSignal): Promise<void> {
 	if (context.hasPendingMessages()) return;
 	const deliveries = await core.receive(signal);
 	for (const delivery of deliveries) {
@@ -34,14 +34,20 @@ export async function deliverTaskInbox(pi: InboxPi, core: TaskCore, context: Inb
 		if (!isKnownEvent(event.type)) throw new TaskProtocolError("UNKNOWN_EVENT", `unknown task inbox event type: ${event.type}`);
 		if (context.hasPendingMessages()) return;
 		const eventKey = key(event.taskId, event.eventId);
-		if (!incorporatedEvents(context.sessionManager.getEntries()).has(eventKey) && isModelVisible(event.type)) {
-			pi.sendMessage({
-				customType: TASK_EVENT_CUSTOM_TYPE,
-				content: renderTaskEvent(event),
-				display: true,
-				details: { taskId: event.taskId, eventId: event.eventId },
-			}, { triggerTurn: true, deliverAs: "followUp" });
+		const incorporated = incorporatedEvents(context.sessionManager.getEntries()).has(eventKey);
+		if (incorporated) pendingInsertions.delete(eventKey);
+		if (!incorporated && isModelVisible(event.type)) {
+			if (!pendingInsertions.has(eventKey)) {
+				pi.sendMessage({
+					customType: TASK_EVENT_CUSTOM_TYPE,
+					content: renderTaskEvent(event),
+					display: true,
+					details: { taskId: event.taskId, eventId: event.eventId },
+				}, { triggerTurn: true, deliverAs: "followUp" });
+				pendingInsertions.add(eventKey);
+			}
 			if (!incorporatedEvents(context.sessionManager.getEntries()).has(eventKey)) return;
+			pendingInsertions.delete(eventKey);
 		}
 		if (isModelVisible(event.type)) await core.recordInsertion({ taskId: event.taskId, eventId: event.eventId }, signal);
 		await core.acknowledgeRelayDelivery(delivery.cursor, signal);

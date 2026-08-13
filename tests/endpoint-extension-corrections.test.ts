@@ -383,6 +383,70 @@ test("continues autonomous polling after Pi replaces the extension context at ag
 	}
 });
 
+test("reserves an accepted insertion across live-session polls and retries it in the next session", async () => {
+	let sessionStart: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
+	let agentEnd: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
+	let sessionShutdown: (() => void) | undefined;
+	let deliveries = 0;
+	let recordedInsertions = 0;
+	let acknowledgements = 0;
+	const source = { relay: "memory", id: "parent" };
+	const target = { relay: "memory", id: "receiver" };
+	const delivery = {
+		cursor: "1",
+		envelope: {
+			envelopeId: "event-envelope", protocolVersion: TASK_PROTOCOL_VERSION, source, target, taskId: "task-1", kind: TaskEnvelopeKind.canonicalEvent,
+			payload: JSON.stringify({ eventId: "event-1", taskId: "task-1", type: "task.information", sequence: "1", source, target, occurredAt: 1, payload: { message: "pending persistence" } }),
+		},
+	} as const;
+	const core = {
+		async connect(): Promise<void> { undefined; },
+		async flushOutbox(): Promise<void> { undefined; },
+		async evaluateTimeouts(): Promise<void> { undefined; },
+		async receive() { return [delivery]; },
+		async recordInsertion(): Promise<void> { recordedInsertions += 1; },
+		async acknowledgeRelayDelivery(): Promise<void> { acknowledgements += 1; },
+	} as unknown as TaskCore;
+	const context = (entries: readonly unknown[]) => ({
+		hasPendingMessages: (): boolean => false,
+		sessionManager: { getEntries: (): readonly unknown[] => entries },
+		ui: { setStatus: (): void => undefined, theme: { fg: (_color: string, text: string): string => text } },
+	});
+	registerAgentTaskTools({
+		on(event: string, handler: unknown): void {
+			if (event === "session_start") sessionStart = handler as (event: unknown, context: unknown) => Promise<unknown>;
+			if (event === "agent_end") agentEnd = handler as (event: unknown, context: unknown) => Promise<unknown>;
+			if (event === "session_shutdown") sessionShutdown = handler as () => void;
+		},
+		registerTool(): void { undefined; },
+		sendMessage(): void { deliveries += 1; },
+	} as unknown as ExtensionAPI, core);
+
+	try {
+		const firstSessionEntries: unknown[] = [];
+		const firstSession = context(firstSessionEntries);
+		await sessionStart!({}, firstSession);
+		await agentEnd!({}, firstSession);
+		expect(deliveries).toBe(1);
+		expect(recordedInsertions).toBe(0);
+		expect(acknowledgements).toBe(0);
+
+		const secondSessionEntries: unknown[] = [];
+		const secondSession = context(secondSessionEntries);
+		await sessionStart!({}, secondSession);
+		expect(deliveries).toBe(2);
+		expect(recordedInsertions).toBe(0);
+		expect(acknowledgements).toBe(0);
+
+		secondSessionEntries.push({ type: "custom_message", customType: "pi-tasks-event", details: { taskId: "task-1", eventId: "event-1" } });
+		await agentEnd!({}, secondSession);
+		expect(recordedInsertions).toBe(1);
+		expect(acknowledgements).toBe(1);
+	} finally {
+		sessionShutdown?.();
+	}
+});
+
 test("invalidates a pending lifecycle poll when the session shuts down", async () => {
 	let sessionStart: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
 	let agentEnd: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;

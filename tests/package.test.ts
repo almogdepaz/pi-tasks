@@ -39,44 +39,41 @@ describe("gateway package documentation", () => {
 		expect(readme).toContain("deterministic per-session path");
 	});
 
-	test("documents local and peer gateway delegation without legacy transport guidance", async () => {
+	test("makes endpoint-owned v2 guidance primary and scopes v1 addressing to compatibility docs", async () => {
 		const [readme, skill] = await Promise.all([readFile(readmePath, "utf8"), readFile(delegationSkillPath, "utf8")]);
-		const normalized = `${readme}\n${skill}`.replace(/\s+/g, " ");
-		for (const detail of [
-			"{ machine, sessionId }",
-			"agent_task_message",
-			"agent_task_ack({ taskId })",
-			"WOLFPACK_PORT",
-			"structured custom messages",
-			"canonical HTTPS Tailnet origin",
-			"trusted local processes and trusted Tailnet machines",
-			"one initial attempt",
-			"four total attempts",
-			"specific live peer",
-			"read-only analyzers",
-		]) expect(normalized).toContain(detail);
-		expect(normalized).toContain("task-adapter-contract.md");
-		expect(normalized).not.toContain("agent_task_inbox({ ack: true })");
-		expect(normalized).not.toContain("wolfpack session send");
-		expect(normalized).not.toContain("createFilesystemTaskStore");
+		const defaultReadme = readme.split("## v1 gateway adapter (retained)")[0] ?? readme;
+		const defaultSkill = skill.split("## v1 compatibility")[0] ?? skill;
+		for (const document of [defaultReadme, defaultSkill]) {
+			expect(document).toContain("wolfpack-pi-tasks-v2");
+			expect(document).toContain("{ relay, id }");
+			expect(document).toContain("taskEndpoint");
+			expect(document).not.toContain("{ machine, sessionId }");
+			expect(document).not.toContain('"machine"');
+			expect(document).not.toContain('"sessionId"');
+		}
+		const compatibility = `${readme.split("## v1 gateway adapter (retained)")[1] ?? ""}\n${skill.split("## v1 compatibility")[1] ?? ""}`;
+		expect(compatibility).toContain("@sgtbeatdown/pi-tasks/v1-compat-extension");
+		expect(compatibility).toContain("{ machine, sessionId }");
+		expect(compatibility).toContain("canonical HTTPS Tailnet origin");
+		expect(`${readme}\n${skill}`).not.toContain("task-adapter-contract.md");
 	});
 
-	test("documents idle worker spawning and active-turn follow-up insertion", async () => {
+	test("documents prompt-free disposable workers and safe active-turn insertion", async () => {
 		const [readme, skill] = await Promise.all([readFile(readmePath, "utf8"), readFile(delegationSkillPath, "utf8")]);
 		for (const document of [readme, skill]) {
-			expect(document).toContain("delivery remains pending until `task.delivered`");
+			expect(document).toContain("wolfpack agent spawn <project> --name <task-role> --json");
+			expect(document).toContain("agent_task_send.task");
 			expect(document).toContain('`deliverAs: "followUp"`');
 		}
-		expect(skill).toContain("omit `--prompt`");
 		expect(skill).toContain("Do not start a disposable worker with a blocking");
 	});
 
-	test("documents the structured correction path for invalid sends", async () => {
+	test("documents the exact default v2 send schema and retains v1 correction guidance", async () => {
 		const readme = await readFile(readmePath, "utf8");
-		const minimalEnvelope = readme.match(/### minimal valid send envelope\n\n```json\n([\s\S]+?)\n```/);
+		const minimalEnvelope = readme.match(/### minimal valid v2 send envelope\n\n```json\n([\s\S]+?)\n```/);
 
 		expect(minimalEnvelope?.[1]).toBe(JSON.stringify({
-			to: { machine: "local", sessionId: "receiver-broker-id" },
+			to: { relay: "wolfpack-pi-tasks-v2", id: "target-opaque-endpoint-id" },
 			task: "implement the narrow change and run focused tests",
 		}, null, 2));
 		expect(readme).toContain("`INVALID_REQUEST.error.path`");
@@ -85,6 +82,13 @@ describe("gateway package documentation", () => {
 		expect(readme).toContain("pre-persistence validation rejection creates no task");
 		expect(readme).toContain("idempotency remains necessary");
 		expect(readme).toContain("creation status is uncertain");
+	});
+
+	test("references only existing canonical Wolfpack documents", async () => {
+		const documents = await Promise.all([readFile(readmePath, "utf8"), readFile(delegationSkillPath, "utf8")]);
+		const links = documents.flatMap((document) => [...document.matchAll(/https:\/\/github\.com\/almogdepaz\/wolfpack\/blob\/main\/docs\/([^\s)#]+\.md)(?:#[^\s)]+)?/g)].map((match) => match[1]));
+		expect(links.length).toBeGreaterThan(0);
+		expect(new Set(links)).toEqual(new Set(["control-api-schema.md", "task-gateway.md"]));
 	});
 
 	test("separates changed-file reporting from receiver-project artifact declarations", async () => {

@@ -4,9 +4,10 @@ import { dirname, join } from "node:path";
 
 import { openSqliteDatabase } from "./sqlite-database";
 import type { SqliteDatabase } from "./sqlite-database";
-import type { RelayEnvelope, TaskEndpoint, TaskEvent, TaskRecord } from "./task-protocol";
+import { PARENT_ACKNOWLEDGMENT_OPERATION, TERMINAL_INTENT_OPERATION } from "./task-protocol";
+import type { RelayEnvelope, TaskEndpoint, TaskEvent, TaskRecord, TaskSnapshot, TerminalDeliveryState, TerminalTaskIntentType } from "./task-protocol";
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 const OWNER_ONLY_MODE = 0o700;
 const OWNER_ONLY_FILE_MODE = 0o600;
 const ENDPOINT_GENERATION_STATE_KEY = "endpoint_generation";
@@ -33,11 +34,19 @@ export interface OutboxQuarantineRecord extends OutboxQuarantineInput {
 	readonly priorState: OutboxRecord["state"];
 }
 
+export interface TaskOperationRecord {
+	readonly taskId: string;
+	readonly operation: string;
+	readonly logicalId: string;
+	readonly logicalType: string;
+	readonly envelopeIds: readonly string[];
+}
+
 export interface TaskStore {
 	transaction<T>(operation: () => T): T;
 	putTask(task: Omit<TaskRecord, "events">): void;
-	getTask(taskId: string): TaskRecord | undefined;
-	listTasks(): readonly TaskRecord[];
+	getTask(taskId: string): TaskSnapshot | undefined;
+	listTasks(): readonly TaskSnapshot[];
 	setStatus(taskId: string, status: TaskRecord["status"]): void;
 	appendEvent(event: TaskEvent): boolean;
 	putOutbox(envelope: RelayEnvelope): void;
@@ -50,6 +59,7 @@ export interface TaskStore {
 	setReceiveCursor(cursor: string): void;
 	putIntent(intentId: string, taskId: string, envelopeId: string): void;
 	putInsertionReceipt(taskId: string, eventId: string): boolean;
+	reserveTaskOperation(input: TaskOperationRecord): { readonly created: boolean; readonly record: TaskOperationRecord };
 	getEndpointGeneration(): string | undefined;
 	setEndpointGeneration(generation: string): void;
 	getEndpointBinding(): TaskEndpoint | undefined;
@@ -77,7 +87,7 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
 			const row = database.query("SELECT * FROM tasks WHERE task_id = ?").get(taskId) as TaskRow | null;
 			if (!row) return undefined;
 			const eventRows = database.query("SELECT * FROM events WHERE task_id = ? ORDER BY CAST(sequence AS INTEGER), event_id").all(taskId) as EventRow[];
-			return taskFromRow(row, eventRows);
+			return taskFromRow(database, row, eventRows);
 		},
 		listTasks() {
 			const rows = database.query("SELECT * FROM tasks ORDER BY created_at, task_id").all() as TaskRow[];
@@ -88,7 +98,7 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
 				current.push(event);
 				eventsByTask.set(event.task_id, current);
 			}
-			return rows.map((row) => taskFromRow(row, eventsByTask.get(row.task_id) ?? []));
+			return rows.map((row) => taskFromRow(database, row, eventsByTask.get(row.task_id) ?? []));
 		},
 		setStatus(taskId, status) {
 			database.query("UPDATE tasks SET status = ? WHERE task_id = ?").run(status, taskId);
@@ -147,6 +157,13 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
 			const result = database.query("INSERT INTO insertion_receipts (task_id, event_id) VALUES (?, ?) ON CONFLICT(task_id, event_id) DO NOTHING").run(taskId, eventId);
 			return result.changes === 1;
 		},
+		reserveTaskOperation(input) {
+			const result = database.query(`INSERT INTO task_operations (task_id, operation, logical_id, logical_type, envelope_ids)
+				VALUES (?, ?, ?, ?, ?) ON CONFLICT(task_id, operation) DO NOTHING`).run(input.taskId, input.operation, input.logicalId, input.logicalType, JSON.stringify(input.envelopeIds));
+			const row = database.query("SELECT task_id, operation, logical_id, logical_type, envelope_ids FROM task_operations WHERE task_id = ? AND operation = ?").get(input.taskId, input.operation) as TaskOperationRow | null;
+			if (!row) throw new Error("task operation reservation was not persisted");
+			return { created: result.changes === 1, record: taskOperationFromRow(row) };
+		},
 		getEndpointGeneration() {
 			const row = database.query("SELECT value FROM relay_state WHERE name = ?").get(ENDPOINT_GENERATION_STATE_KEY) as { readonly value: string } | null;
 			return row?.value;
@@ -186,6 +203,25 @@ interface OutboxQuarantineRow {
 	readonly details: string;
 	readonly quarantined_at: number;
 	readonly prior_state: OutboxRecord["state"];
+}
+
+interface TaskOperationRow {
+	readonly task_id: string;
+	readonly operation: string;
+	readonly logical_id: string;
+	readonly logical_type: string;
+	readonly envelope_ids: string;
+}
+
+interface LegacyIntentRow {
+	readonly intent_id: string;
+	readonly task_id: string;
+	readonly envelope_id: string;
+}
+
+interface LegacyEnvelopeRow {
+	readonly envelope_id: string;
+	readonly envelope: string;
 }
 
 interface EventRow {
@@ -246,6 +282,98 @@ function migrate(database: SqliteDatabase): void {
 		ensureColumn(database, "outbox_quarantine", "prior_state", "TEXT NOT NULL DEFAULT 'pending'");
 		database.exec("PRAGMA user_version = 4;");
 	}
+	if (version.user_version <= 4) {
+		database.transaction(() => {
+			database.exec(`CREATE TABLE IF NOT EXISTS task_operations (
+				task_id TEXT NOT NULL REFERENCES tasks(task_id),
+				operation TEXT NOT NULL,
+				logical_id TEXT NOT NULL,
+				logical_type TEXT NOT NULL,
+				envelope_ids TEXT NOT NULL,
+				PRIMARY KEY (task_id, operation)
+			);`);
+			backfillTaskOperations(database);
+			database.exec("PRAGMA user_version = 5;");
+		})();
+	}
+}
+
+function backfillTaskOperations(database: SqliteDatabase): void {
+	const envelopes = legacyEnvelopes(database);
+	const terminalTasks = new Set<string>();
+	const intents = database.query("SELECT intent_id, task_id, envelope_id FROM intents ORDER BY rowid").all() as LegacyIntentRow[];
+	for (const intent of intents) {
+		if (terminalTasks.has(intent.task_id)) continue;
+		const serializedEnvelope = envelopes.get(intent.envelope_id);
+		if (!serializedEnvelope) throw new Error(`legacy intent ${intent.intent_id} has no durable envelope`);
+		const envelope = legacyEnvelope(intent.envelope_id, serializedEnvelope);
+		const payload = legacyEnvelopePayload(envelope);
+		if (envelope.kind !== "intent" || envelope.taskId !== intent.task_id || !isRecord(payload) || payload.intentId !== intent.intent_id || payload.taskId !== intent.task_id || typeof payload.type !== "string") {
+			throw new Error(`legacy intent ${intent.intent_id} has malformed structured state`);
+		}
+		if (!isTerminalIntentType(payload.type)) continue;
+		insertTaskOperation(database, { taskId: intent.task_id, operation: TERMINAL_INTENT_OPERATION, logicalId: intent.intent_id, logicalType: payload.type, envelopeIds: [intent.envelope_id] });
+		terminalTasks.add(intent.task_id);
+	}
+
+	const acknowledgments = database.query("SELECT * FROM events WHERE type = 'task.parent_acknowledged' ORDER BY task_id, CAST(sequence AS INTEGER), rowid").all() as EventRow[];
+	const acknowledgedTasks = new Set<string>();
+	for (const acknowledgment of acknowledgments) {
+		if (acknowledgedTasks.has(acknowledgment.task_id)) continue;
+		const envelopeIds = [...envelopes]
+			.flatMap(([envelopeId, serializedEnvelope]) => {
+				const envelope = optionalLegacyEnvelope(envelopeId, serializedEnvelope);
+				return envelope?.kind === "canonical_event" && envelope.taskId === acknowledgment.task_id && eventIdFromLegacyEnvelope(envelope) === acknowledgment.event_id ? [envelopeId] : [];
+			})
+			.sort();
+		if (envelopeIds.length === 0) throw new Error(`legacy parent acknowledgment ${acknowledgment.event_id} has no durable envelope`);
+		insertTaskOperation(database, { taskId: acknowledgment.task_id, operation: PARENT_ACKNOWLEDGMENT_OPERATION, logicalId: acknowledgment.event_id, logicalType: acknowledgment.type, envelopeIds });
+		acknowledgedTasks.add(acknowledgment.task_id);
+	}
+}
+
+function legacyEnvelopes(database: SqliteDatabase): Map<string, string> {
+	const envelopes = new Map<string, string>();
+	const live = database.query("SELECT envelope_id, envelope FROM outbox ORDER BY rowid").all() as LegacyEnvelopeRow[];
+	const quarantined = database.query("SELECT envelope_id, envelope FROM outbox_quarantine ORDER BY rowid").all() as LegacyEnvelopeRow[];
+	for (const row of [...live, ...quarantined]) {
+		if (row.envelope_id.length === 0) throw new Error("legacy durable envelope identity is malformed");
+		if (!envelopes.has(row.envelope_id)) envelopes.set(row.envelope_id, row.envelope);
+	}
+	return envelopes;
+}
+
+function legacyEnvelope(envelopeId: string, serializedEnvelope: string): RelayEnvelope {
+	const envelope = parseEnvelope(serializedEnvelope);
+	if (envelope.envelopeId !== envelopeId) throw new Error(`legacy envelope ${envelopeId} identity is malformed`);
+	return envelope;
+}
+
+function optionalLegacyEnvelope(envelopeId: string, serializedEnvelope: string): RelayEnvelope | undefined {
+	try {
+		return legacyEnvelope(envelopeId, serializedEnvelope);
+	} catch {
+		// Unrelated operator quarantine rows are audit data, not lifecycle state.
+		return undefined;
+	}
+}
+
+function legacyEnvelopePayload(envelope: RelayEnvelope): unknown {
+	try {
+		return JSON.parse(envelope.payload) as unknown;
+	} catch {
+		throw new Error(`legacy envelope ${envelope.envelopeId} payload is malformed`);
+	}
+}
+
+function eventIdFromLegacyEnvelope(envelope: RelayEnvelope): string | undefined {
+	const payload = legacyEnvelopePayload(envelope);
+	return isRecord(payload) && typeof payload.eventId === "string" ? payload.eventId : undefined;
+}
+
+function insertTaskOperation(database: SqliteDatabase, input: TaskOperationRecord): void {
+	database.query(`INSERT INTO task_operations (task_id, operation, logical_id, logical_type, envelope_ids)
+		VALUES (?, ?, ?, ?, ?) ON CONFLICT(task_id, operation) DO NOTHING`).run(input.taskId, input.operation, input.logicalId, input.logicalType, JSON.stringify(input.envelopeIds));
 }
 
 function ensureColumn(database: SqliteDatabase, table: string, name: string, definition: string): void {
@@ -275,7 +403,7 @@ function taskRow(task: Omit<TaskRecord, "events">): Record<string, string | numb
 	};
 }
 
-function taskFromRow(row: TaskRow, events: readonly EventRow[]): TaskRecord {
+function taskFromRow(database: SqliteDatabase, row: TaskRow, events: readonly EventRow[]): TaskSnapshot {
 	return {
 		taskId: row.task_id,
 		protocolVersion: row.protocol_version,
@@ -286,6 +414,7 @@ function taskFromRow(row: TaskRow, events: readonly EventRow[]): TaskRecord {
 		expiresAt: row.expires_at,
 		status: row.status as TaskRecord["status"],
 		events: events.map(eventFromRow),
+		terminalDelivery: terminalDeliveryFromDatabase(database, row),
 	};
 }
 
@@ -307,6 +436,42 @@ function eventFromRow(row: EventRow): TaskEvent {
 
 function parseEnvelope(value: string): RelayEnvelope {
 	return JSON.parse(value) as RelayEnvelope;
+}
+
+function taskOperationFromRow(row: TaskOperationRow): TaskOperationRecord {
+	const envelopeIds = JSON.parse(row.envelope_ids) as unknown;
+	if (!Array.isArray(envelopeIds) || !envelopeIds.every((value) => typeof value === "string" && value.length > 0)) throw new Error("task operation envelope identities are malformed");
+	return { taskId: row.task_id, operation: row.operation, logicalId: row.logical_id, logicalType: row.logical_type, envelopeIds };
+}
+
+function terminalDeliveryFromDatabase(database: SqliteDatabase, task: TaskRow): TerminalDeliveryState {
+	const operation = database.query("SELECT task_id, operation, logical_id, logical_type, envelope_ids FROM task_operations WHERE task_id = ? AND operation = ?").get(task.task_id, TERMINAL_INTENT_OPERATION) as TaskOperationRow | null;
+	if (!operation) return { state: "not_submitted" };
+	const record = taskOperationFromRow(operation);
+	if (!isTerminalIntentType(record.logicalType) || record.envelopeIds.length !== 1) throw new Error("terminal task operation is malformed");
+	const envelopeId = record.envelopeIds[0];
+	if (envelopeId === undefined) throw new Error("terminal task operation has no envelope identity");
+	const identity = {
+		intentId: record.logicalId,
+		intentType: record.logicalType,
+		envelopeId,
+		origin: { relay: task.origin_relay, id: task.origin_id },
+	};
+	const outbox = database.query("SELECT state FROM outbox WHERE envelope_id = ?").get(identity.envelopeId) as { readonly state: OutboxRecord["state"] } | null;
+	if (outbox?.state === "pending") return { state: "pending", ...identity };
+	if (outbox?.state === "accepted") return { state: "accepted", ...identity };
+	const blocked = database.query("SELECT error_code, details, quarantined_at FROM outbox_quarantine WHERE envelope_id = ?").get(identity.envelopeId) as Pick<OutboxQuarantineRow, "error_code" | "details" | "quarantined_at"> | null;
+	if (!blocked) throw new Error("terminal task operation has no durable delivery record");
+	return {
+		state: "delivery_blocked",
+		...identity,
+		blockedAt: blocked.quarantined_at,
+		error: { code: blocked.error_code, retryable: false, details: parseRecord(blocked.details) },
+	};
+}
+
+function isTerminalIntentType(value: string): value is TerminalTaskIntentType {
+	return value === "task.completed" || value === "task.failed" || value === "task.cancelled";
 }
 
 function parseEndpoint(value: string): TaskEndpoint {

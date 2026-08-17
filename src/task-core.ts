@@ -1,6 +1,8 @@
 import {
 	MAX_RELAY_PAYLOAD_BYTES,
+	PARENT_ACKNOWLEDGMENT_OPERATION,
 	TASK_PROTOCOL_VERSION,
+	TERMINAL_INTENT_OPERATION,
 	TaskEnvelopeKind,
 	TaskOutboxDeliveryError,
 	TaskProtocolError,
@@ -13,6 +15,7 @@ import type {
 	TaskIntent,
 	TaskRecord,
 	TaskRelay,
+	TaskSnapshot,
 } from "./task-protocol";
 import type { TaskStore } from "./task-store";
 
@@ -50,10 +53,11 @@ export interface SubmitIntentInput {
 }
 
 export interface TaskCore {
+	readonly endpoint: TaskEndpoint;
 	connect(signal?: AbortSignal): Promise<void>;
 	createTask(input: CreateTaskInput, signal?: AbortSignal): Promise<{ readonly taskId: string }>;
-	getTask(taskId: string): TaskRecord | undefined;
-	listTasks(): readonly TaskRecord[];
+	getTask(taskId: string): TaskSnapshot | undefined;
+	listTasks(): readonly TaskSnapshot[];
 	flushOutbox(signal?: AbortSignal): Promise<void>;
 	receive(signal?: AbortSignal): Promise<readonly RelayDelivery[]>;
 	acknowledgeRelayDelivery(cursor: string, signal?: AbortSignal): Promise<void>;
@@ -73,6 +77,7 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 	const ids = options.ids ?? (() => crypto.randomUUID());
 
 	return {
+		endpoint: options.endpoint,
 		async connect(signal) {
 			const connection = await options.relay.connect({ endpoint: options.endpoint, protocolVersion: TASK_PROTOCOL_VERSION, receiveCursor: options.store.getReceiveCursor() }, signal);
 			if (!sameEndpoint(connection.endpoint, options.endpoint)) throw new TaskProtocolError("INVALID_CONNECTION", "relay connected a different endpoint");
@@ -134,12 +139,15 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 		},
 		async submitIntent(input, signal) {
 			if (!RECEIVER_INTENT_TYPES.has(input.type) || !isRecord(input.payload)) throw new TaskProtocolError("INVALID_INTENT", "intent type or payload is invalid");
-			const task = requiredTask(options.store, input.taskId);
 			let persistedEnvelopeIds: readonly string[] = [];
+			let receiverTerminal = false;
 			options.store.transaction(() => {
+				const task = requiredTask(options.store, input.taskId);
+				receiverTerminal = !sameEndpoint(options.endpoint, task.origin) && TERMINAL_EVENTS.has(input.type);
 				persistedEnvelopeIds = persistIntent(options, clock.now, ids, task, input);
 			});
 			await flush(options, signal, new Set(persistedEnvelopeIds));
+			if (receiverTerminal) throwIfTerminalDeliveryBlocked(options.store, input.taskId);
 		},
 		async recordInsertion(input, signal) {
 			const task = requiredTask(options.store, input.taskId);
@@ -164,11 +172,12 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 			if (persistedEnvelopeIds.length > 0) await flush(options, signal, new Set(persistedEnvelopeIds));
 		},
 		async acknowledgeParent(taskId, signal) {
-			const task = requiredTask(options.store, taskId);
-			if (!sameEndpoint(task.origin, options.endpoint)) throw new TaskProtocolError("NOT_ORIGIN", "only origin may acknowledge a task");
 			let persistedEnvelopeIds: readonly string[] = [];
 			options.store.transaction(() => {
-				persistedEnvelopeIds = canonicalize(options, clock.now, ids, task, { intentId: ids(), taskId, type: "task.information", payload: {} }, "task.parent_acknowledged");
+				const task = requiredTask(options.store, taskId);
+				if (!sameEndpoint(task.origin, options.endpoint)) throw new TaskProtocolError("NOT_ORIGIN", "only origin may acknowledge a task");
+				if (!TERMINAL_STATUSES.has(task.status)) throw new TaskProtocolError("TASK_NOT_TERMINAL", "only a terminal task may be acknowledged", { retryable: false });
+				persistedEnvelopeIds = canonicalize(options, clock.now, ids, task, { intentId: ids(), taskId, type: "task.information", payload: {} }, "task.parent_acknowledged", PARENT_ACKNOWLEDGMENT_OPERATION);
 			});
 			await flush(options, signal, new Set(persistedEnvelopeIds));
 		},
@@ -237,27 +246,45 @@ function persistIntent(options: TaskCoreOptions, now: () => number, ids: () => s
 	}
 	const envelopeId = ids();
 	const intent: TaskIntent = { intentId: ids(), taskId: input.taskId, type: input.type, payload: input.payload };
+	if (TERMINAL_EVENTS.has(input.type)) {
+		const reservation = options.store.reserveTaskOperation({
+			taskId: input.taskId,
+			operation: TERMINAL_INTENT_OPERATION,
+			logicalId: intent.intentId,
+			logicalType: intent.type,
+			envelopeIds: [envelopeId],
+		});
+		if (!reservation.created) {
+			if (reservation.record.logicalType !== intent.type) {
+				throw new TaskProtocolError("TERMINAL_INTENT_CONFLICT", "terminal task intent conflicts with the existing terminal action", {
+					retryable: false,
+					details: { taskId: input.taskId, existingType: reservation.record.logicalType, requestedType: intent.type },
+				});
+			}
+			return reservation.record.envelopeIds;
+		}
+	}
 	options.store.putIntent(intent.intentId, input.taskId, envelopeId);
 	options.store.putOutbox(envelope(envelopeId, options.endpoint, task.origin, input.taskId, TaskEnvelopeKind.intent, intent));
 	return [envelopeId];
 }
 
-function canonicalize(options: TaskCoreOptions, now: () => number, ids: () => string, task: TaskRecord, intent: TaskIntent, requestedType: string): readonly string[] {
+function canonicalize(options: TaskCoreOptions, now: () => number, ids: () => string, task: TaskRecord, intent: TaskIntent, requestedType: string, operation?: string): readonly string[] {
 	const terminal = TERMINAL_EVENTS.has(requestedType);
 	const type = terminal && TERMINAL_STATUSES.has(task.status) ? "task.late_terminal" : requestedType;
 	const sequence = String(task.events.length + 1);
 	const canonical = event(task, ids(), type, sequence, options.endpoint, task.target, now(), { intentId: intent.intentId, ...intent.payload });
-	const persistedEnvelopeIds: string[] = [];
+	const targetEnvelope = envelope(ids(), options.endpoint, task.target, task.taskId, TaskEnvelopeKind.canonicalEvent, canonical);
+	const originEnvelope = sameEndpoint(task.origin, task.target) ? undefined : envelope(ids(), options.endpoint, task.origin, task.taskId, TaskEnvelopeKind.canonicalEvent, canonical);
+	const persistedEnvelopeIds = originEnvelope === undefined ? [targetEnvelope.envelopeId] : [targetEnvelope.envelopeId, originEnvelope.envelopeId];
+	if (operation !== undefined) {
+		const reservation = options.store.reserveTaskOperation({ taskId: task.taskId, operation, logicalId: canonical.eventId, logicalType: canonical.type, envelopeIds: persistedEnvelopeIds });
+		if (!reservation.created) return reservation.record.envelopeIds;
+	}
 	options.store.appendEvent(canonical);
 	if (TERMINAL_EVENTS.has(type)) options.store.setStatus(task.taskId, statusFor(type));
-	const targetEnvelope = envelope(ids(), options.endpoint, task.target, task.taskId, TaskEnvelopeKind.canonicalEvent, canonical);
 	options.store.putOutbox(targetEnvelope);
-	persistedEnvelopeIds.push(targetEnvelope.envelopeId);
-	if (!sameEndpoint(task.origin, task.target)) {
-		const originEnvelope = envelope(ids(), options.endpoint, task.origin, task.taskId, TaskEnvelopeKind.canonicalEvent, canonical);
-		options.store.putOutbox(originEnvelope);
-		persistedEnvelopeIds.push(originEnvelope.envelopeId);
-	}
+	if (originEnvelope !== undefined) options.store.putOutbox(originEnvelope);
 	return persistedEnvelopeIds;
 }
 
@@ -312,7 +339,16 @@ function parsePayload(envelope: RelayEnvelope): unknown {
 	try { return JSON.parse(envelope.payload) as unknown; } catch { throw new TaskProtocolError("INVALID_PAYLOAD", "relay envelope payload is not valid task protocol JSON"); }
 }
 
-function requiredTask(store: TaskStore, taskId: string): TaskRecord {
+function throwIfTerminalDeliveryBlocked(store: TaskStore, taskId: string): void {
+	const delivery = requiredTask(store, taskId).terminalDelivery;
+	if (delivery.state !== "delivery_blocked") return;
+	throw new TaskOutboxDeliveryError(delivery.error.code, "terminal task delivery is blocked", {
+		retryable: false,
+		details: { ...delivery.error.details, taskId, envelopeId: delivery.envelopeId, origin: delivery.origin, blockedAt: delivery.blockedAt },
+	});
+}
+
+function requiredTask(store: TaskStore, taskId: string): TaskSnapshot {
 	const task = store.getTask(taskId);
 	if (!task) throw new TaskProtocolError("UNKNOWN_TASK", `unknown task: ${taskId}`);
 	return task;

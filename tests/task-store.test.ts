@@ -4,7 +4,8 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 import { createTaskStore } from "../src/task-store";
-import type { RelayEnvelope } from "../src/task-protocol";
+import { TaskEnvelopeKind } from "../src/task-protocol";
+import type { RelayEnvelope, TaskEvent, TaskIntent } from "../src/task-protocol";
 
 const temporaryDirectories: string[] = [];
 
@@ -52,8 +53,73 @@ test("migrates an operator-created quarantine table without losing audit rows", 
 	const audit = checked.query("SELECT envelope_id, reason, quarantined_at, error_code, details, prior_state FROM outbox_quarantine").get();
 	expect(columns.map((column) => column.name)).toEqual(["envelope_id", "envelope", "reason", "quarantined_at", "error_code", "details", "prior_state"]);
 	expect(audit).toEqual({ envelope_id: "audit-envelope", reason: "operator quarantine", quarantined_at: 123, error_code: "UNKNOWN", details: "{}", prior_state: "pending" });
-	expect((checked.query("PRAGMA user_version").get() as { readonly user_version: number }).user_version).toBe(4);
+	expect((checked.query("PRAGMA user_version").get() as { readonly user_version: number }).user_version).toBe(5);
 	checked.close();
+});
+
+test("v4 migration adopts existing terminal intents and parent acknowledgment identities", () => {
+	const directory = mkdtempSync("/tmp/pi-tasks-store-");
+	temporaryDirectories.push(directory);
+	chmodSync(directory, 0o700);
+	const path = join(directory, "tasks.sqlite");
+	const store = createTaskStore({ path });
+	const origin = { relay: "relay", id: "origin" };
+	const receiver = { relay: "relay", id: "receiver" };
+	for (const [index, state] of (["pending", "accepted", "blocked"] as const).entries()) {
+		const taskId = `terminal-${state}`;
+		const intent: TaskIntent = { intentId: `intent-${state}`, taskId, type: "task.completed", payload: { summary: state } };
+		const envelope = protocolEnvelope(`envelope-${state}`, receiver, origin, taskId, TaskEnvelopeKind.intent, intent);
+		store.putTask({ taskId, protocolVersion: "pi-tasks/v2", origin, target: receiver, task: state, createdAt: index + 1, expiresAt: 100, status: "active" });
+		store.putIntent(intent.intentId, taskId, envelope.envelopeId);
+		store.putOutbox(envelope);
+		if (state === "accepted") store.markOutboxAccepted(envelope.envelopeId);
+		if (state === "blocked") {
+			store.transaction(() => store.quarantineOutbox(envelope.envelopeId, {
+				errorCode: "TARGET_NOT_REGISTERED", reason: "origin inactive", details: { targetId: origin.id }, quarantinedAt: 50,
+			}));
+		}
+	}
+	const taskId = "acknowledged-task";
+	const acknowledgment: TaskEvent = {
+		eventId: "legacy-ack", taskId, type: "task.parent_acknowledged", sequence: "3", source: origin, target: receiver, occurredAt: 20, payload: { intentId: "legacy-ack-intent" },
+	};
+	store.putTask({ taskId, protocolVersion: "pi-tasks/v2", origin, target: receiver, task: "ack", createdAt: 1, expiresAt: 100, status: "completed" });
+	store.appendEvent(acknowledgment);
+	for (const [envelopeId, target] of [["ack-target", receiver], ["ack-origin", origin]] as const) {
+		const envelope = protocolEnvelope(envelopeId, origin, target, taskId, TaskEnvelopeKind.canonicalEvent, acknowledgment);
+		store.putOutbox(envelope);
+		store.markOutboxAccepted(envelopeId);
+	}
+	store.close();
+
+	const legacy = new Database(path);
+	legacy.exec("DROP TABLE task_operations; PRAGMA user_version = 4;");
+	legacy.close();
+	const migrated = createTaskStore({ path });
+
+	expect(migrated.getTask("terminal-pending")?.terminalDelivery).toMatchObject({ state: "pending", intentId: "intent-pending", envelopeId: "envelope-pending" });
+	expect(migrated.getTask("terminal-accepted")?.terminalDelivery).toMatchObject({ state: "accepted", intentId: "intent-accepted", envelopeId: "envelope-accepted" });
+	expect(migrated.getTask("terminal-blocked")?.terminalDelivery).toMatchObject({ state: "delivery_blocked", intentId: "intent-blocked", envelopeId: "envelope-blocked" });
+	expect(migrated.reserveTaskOperation({ taskId, operation: "parent_acknowledgment", logicalId: "new-ack", logicalType: "task.parent_acknowledged", envelopeIds: ["new-envelope"] })).toEqual({
+		created: false,
+		record: { taskId, operation: "parent_acknowledgment", logicalId: "legacy-ack", logicalType: "task.parent_acknowledged", envelopeIds: ["ack-origin", "ack-target"] },
+	});
+	migrated.close();
+});
+
+test("atomically reserves one durable task operation identity", () => {
+	const store = createTaskStore({ path: ":memory:" });
+	store.putTask({
+		taskId: "task-1", protocolVersion: "pi-tasks/v2", origin: { relay: "relay", id: "origin" }, target: { relay: "relay", id: "target" },
+		task: "reserve", createdAt: 1, expiresAt: 2, status: "completed",
+	});
+
+	const first = store.reserveTaskOperation({ taskId: "task-1", operation: "parent_acknowledgment", logicalId: "event-1", logicalType: "task.parent_acknowledged", envelopeIds: ["target-envelope", "origin-envelope"] });
+	const repeated = store.reserveTaskOperation({ taskId: "task-1", operation: "parent_acknowledgment", logicalId: "event-2", logicalType: "task.parent_acknowledged", envelopeIds: ["new-target-envelope", "new-origin-envelope"] });
+
+	expect(first).toEqual({ created: true, record: { taskId: "task-1", operation: "parent_acknowledgment", logicalId: "event-1", logicalType: "task.parent_acknowledged", envelopeIds: ["target-envelope", "origin-envelope"] } });
+	expect(repeated).toEqual({ created: false, record: first.record });
+	store.close();
 });
 
 test("persists endpoint binding and structured quarantine while removing live outbox work", () => {
@@ -142,9 +208,13 @@ test("migrates a file-backed v1 store without losing task records", () => {
 	expect(migrated.getTask("task-1")?.task).toBe("preserve");
 	migrated.close();
 	const checked = new Database(path, { readonly: true });
-	expect((checked.query("PRAGMA user_version").get() as { readonly user_version: number }).user_version).toBe(4);
+	expect((checked.query("PRAGMA user_version").get() as { readonly user_version: number }).user_version).toBe(5);
 	checked.close();
 });
+
+function protocolEnvelope(envelopeId: string, source: { readonly relay: string; readonly id: string }, target: { readonly relay: string; readonly id: string }, taskId: string, kind: RelayEnvelope["kind"], payload: TaskIntent | TaskEvent): RelayEnvelope {
+	return { envelopeId, protocolVersion: "pi-tasks/v2", source, target, taskId, kind, payload: JSON.stringify(payload) };
+}
 
 function assignment(envelopeId: string, source: { readonly relay: string; readonly id: string }, targetId: string): RelayEnvelope {
 	return {

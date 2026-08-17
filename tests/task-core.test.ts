@@ -54,7 +54,7 @@ describe("endpoint-owned task core", () => {
 		expect(value.relay.envelopesFor(RECEIVER)).toHaveLength(1);
 	});
 
-	test("origin alone canonically sequences receiver intents and first terminal wins across replay", async () => {
+	test("origin canonically sequences receiver intents and rejects a conflicting receiver terminal retry", async () => {
 		const value = fixture();
 		await value.origin.connect();
 		await value.receiver.connect();
@@ -62,16 +62,18 @@ describe("endpoint-owned task core", () => {
 		await value.receiver.receive();
 
 		await value.receiver.submitIntent({ taskId: created.taskId, type: "task.completed", payload: { summary: "finished" } });
-		await value.receiver.submitIntent({ taskId: created.taskId, type: "task.failed", payload: { summary: "late" } });
+		const receiverOutboxIds = value.receiverStore.outbox("accepted").map((record) => record.envelope.envelopeId);
+		await expect(value.receiver.submitIntent({ taskId: created.taskId, type: "task.failed", payload: { summary: "late" } })).rejects.toMatchObject({ code: "TERMINAL_INTENT_CONFLICT", retryable: false });
 		await value.origin.receive();
 
 		const task = value.origin.getTask(created.taskId);
 		expect(task?.status).toBe("completed");
-		expect(task?.events.map((event) => event.type)).toEqual(["task.created", "task.completed", "task.late_terminal"]);
-		expect(task?.events.map((event) => event.sequence)).toEqual(["1", "2", "3"]);
+		expect(task?.events.map((event) => event.type)).toEqual(["task.created", "task.completed"]);
+		expect(value.receiverStore.outbox("accepted").map((record) => record.envelope.envelopeId)).toEqual(receiverOutboxIds);
+		expect(task?.events.map((event) => event.sequence)).toEqual(["1", "2"]);
 
 		await value.origin.receive();
-		expect(value.origin.getTask(created.taskId)?.events).toHaveLength(3);
+		expect(value.origin.getTask(created.taskId)?.events).toHaveLength(2);
 	});
 
 	test("receiver persists an intent before an uncertain send and recovers it with its stable envelope id", async () => {
@@ -104,6 +106,57 @@ describe("endpoint-owned task core", () => {
 		await value.origin.receive();
 
 		expect(value.origin.getTask(created.taskId)?.events.map((event) => event.type)).toEqual(["task.created", "task.delivery_receipt"]);
+	});
+
+	test("rejects parent acknowledgment before the task is terminal without mutating durable state", async () => {
+		const value = fixture();
+		await value.origin.connect();
+		await value.receiver.connect();
+		const created = await value.origin.createTask({ target: RECEIVER, task: "implement narrowly", timeoutMs: 500 });
+		const acceptedBefore = value.originStore.outbox("accepted").map((record) => record.envelope.envelopeId);
+
+		await expect(value.origin.acknowledgeParent(created.taskId)).rejects.toMatchObject({ code: "TASK_NOT_TERMINAL" });
+
+		expect(value.origin.getTask(created.taskId)?.events.map((event) => event.type)).toEqual(["task.created"]);
+		expect(value.originStore.outbox("accepted").map((record) => record.envelope.envelopeId)).toEqual(acceptedBefore);
+		expect(value.originStore.outbox("pending")).toEqual([]);
+	});
+
+	test("reuses one parent acknowledgment event and its fan-out envelopes across sequential retries", async () => {
+		const value = fixture();
+		await value.origin.connect();
+		await value.receiver.connect();
+		const created = await value.origin.createTask({ target: RECEIVER, task: "implement narrowly", timeoutMs: 500 });
+		await value.receiver.receive();
+		await value.receiver.submitIntent({ taskId: created.taskId, type: "task.completed", payload: { summary: "finished" } });
+		await value.origin.receive();
+
+		await value.origin.acknowledgeParent(created.taskId);
+		const eventIds = value.origin.getTask(created.taskId)?.events.filter((event) => event.type === "task.parent_acknowledged").map((event) => event.eventId);
+		const outboxIds = value.originStore.outbox("accepted").map((record) => record.envelope.envelopeId);
+		await value.origin.acknowledgeParent(created.taskId);
+
+		expect(value.origin.getTask(created.taskId)?.events.filter((event) => event.type === "task.parent_acknowledged").map((event) => event.eventId)).toEqual(eventIds);
+		expect(value.originStore.outbox("accepted").map((record) => record.envelope.envelopeId)).toEqual(outboxIds);
+	});
+
+	test("reserves one parent acknowledgment across concurrent retries", async () => {
+		const value = fixture();
+		await value.origin.connect();
+		await value.receiver.connect();
+		const created = await value.origin.createTask({ target: RECEIVER, task: "implement narrowly", timeoutMs: 500 });
+		await value.receiver.receive();
+		await value.receiver.submitIntent({ taskId: created.taskId, type: "task.completed", payload: { summary: "finished" } });
+		await value.origin.receive();
+
+		const outboxIdsBefore = new Set(value.originStore.outbox("accepted").map((record) => record.envelope.envelopeId));
+		await Promise.all([
+			value.origin.acknowledgeParent(created.taskId),
+			value.origin.acknowledgeParent(created.taskId),
+		]);
+
+		expect(value.origin.getTask(created.taskId)?.events.filter((event) => event.type === "task.parent_acknowledged")).toHaveLength(1);
+		expect(value.originStore.outbox("accepted").filter((record) => !outboxIdsBefore.has(record.envelope.envelopeId))).toHaveLength(2);
 	});
 
 	test("only the resumed origin evaluates timeout and acknowledgement plus insertion receipts remain logical events", async () => {

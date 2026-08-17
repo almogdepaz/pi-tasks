@@ -3,10 +3,11 @@ import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import { deliverTaskInbox } from "./task-inbox";
+import { deliverTaskInbox, incorporatedTaskEvents } from "./task-inbox";
 import { TaskOutboxDeliveryError, TaskProtocolError } from "./task-protocol";
 import { createWolfpackTaskCore } from "./wolfpack-task-relay";
 import type { TaskCore } from "./task-core";
+import type { TaskEndpoint, TaskSnapshot } from "./task-protocol";
 
 const DEFAULT_TASK_TIMEOUT_MS = 30 * 60 * 1_000;
 const MIN_TASK_TIMEOUT_MS = 1_000;
@@ -15,6 +16,8 @@ const BACKGROUND_POLL_MS = 5_000;
 const TARGET_NOT_REGISTERED_CODE = "TARGET_NOT_REGISTERED";
 const WAIT_POLL_MS = 250;
 const SUMMARY_MAX_CHARS = 1_200;
+const PRE_ASSIGNMENT_TOOLS = new Set(["agent_task_inbox", "agent_task_status", "agent_task_wait"]);
+export const WORKER_GATE_DENIAL_CODE = "PI_TASK_WORKER_ASSIGNMENT_REQUIRED";
 
 const EndpointParams = Type.Object({
 	relay: Type.String({ minLength: 1, description: "relay identifier" }),
@@ -59,6 +62,8 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 	let backgroundTimer: ReturnType<typeof setInterval> | undefined;
 	let lifecycleEpoch = 0;
 	const pendingInsertions = new Set<string>();
+	const closingTaskIds = new Set<string>();
+	const workerGateEnabled = process.env.PI_TASK_WORKER === "1";
 	const configuredCore: ConfiguredCoreFactory = core === undefined ? createConfiguredCoreLoader(createCore) : async (): Promise<TaskCore> => core;
 	const refreshInbox = createSingleFlightInboxRefresh(async (signal) => {
 		const context = inboxContext;
@@ -122,8 +127,30 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		}
 	};
 
+	pi.on("tool_call", async (event, context) => {
+		if (!workerGateEnabled || PRE_ASSIGNMENT_TOOLS.has(event.toolName)) return undefined;
+		try {
+			const activeCore = await configuredCore(context.signal);
+			const assignments = assignedWorkerTasks(activeCore, context.sessionManager.getEntries());
+			if (event.toolName === "agent_task_done") {
+				const taskId = isRecord(event.input) && typeof event.input.taskId === "string" ? event.input.taskId : undefined;
+				const assigned = taskId === undefined ? undefined : assignments.find((task) => task.taskId === taskId);
+				if (assigned === undefined || (!eligibleWorkerTask(assigned, closingTaskIds) && assigned.terminalDelivery.state === "not_submitted" && !closingTaskIds.has(assigned.taskId))) {
+					return { block: true, reason: WORKER_GATE_DENIAL_CODE };
+				}
+				closingTaskIds.add(assigned.taskId);
+				return undefined;
+			}
+			if (assignments.some((task) => eligibleWorkerTask(task, closingTaskIds))) return undefined;
+		} catch {
+			// Authorization evidence unavailable or malformed: fail closed with the stable public reason.
+		}
+		return { block: true, reason: WORKER_GATE_DENIAL_CODE };
+	});
+
 	pi.on("session_start", async (_event, context) => {
 		pendingInsertions.clear();
+		closingTaskIds.clear();
 		const epoch = ++lifecycleEpoch;
 		inboxContext = context;
 		if (backgroundTimer) clearInterval(backgroundTimer);
@@ -140,6 +167,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 	});
 	pi.on("session_shutdown", () => {
 		pendingInsertions.clear();
+		closingTaskIds.clear();
 		lifecycleEpoch += 1;
 		if (backgroundTimer) clearInterval(backgroundTimer);
 		backgroundTimer = undefined;
@@ -253,6 +281,30 @@ function outboxFailureStatus(error: unknown): "tasks: relay unavailable" | "task
 
 function terminal(status: string): boolean {
 	return ["completed", "failed", "cancelled", "timed_out"].includes(status);
+}
+
+function assignedWorkerTasks(core: TaskCore, entries: readonly unknown[]): readonly TaskSnapshot[] {
+	const assignments = new Map<string, TaskSnapshot>();
+	for (const evidence of incorporatedTaskEvents(entries)) {
+		const task = core.getTask(evidence.taskId);
+		if (!task || !sameEndpoint(task.target, core.endpoint)) continue;
+		const created = task.events.find((event) => event.eventId === evidence.eventId);
+		if (!created || created.type !== "task.created" || !sameEndpoint(created.target, core.endpoint) || !sameEndpoint(created.source, task.origin)) continue;
+		assignments.set(task.taskId, task);
+	}
+	return [...assignments.values()];
+}
+
+function eligibleWorkerTask(task: TaskSnapshot, closingTaskIds: ReadonlySet<string>): boolean {
+	return task.status === "active" && task.terminalDelivery.state === "not_submitted" && !closingTaskIds.has(task.taskId);
+}
+
+function sameEndpoint(left: TaskEndpoint, right: TaskEndpoint): boolean {
+	return left.relay === right.relay && left.id === right.id;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function text(result: { readonly content?: readonly unknown[] }): string {

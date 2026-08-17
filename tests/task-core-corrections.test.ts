@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { createInMemoryTaskRelay } from "../src/in-memory-task-relay";
 import { createTaskCore } from "../src/task-core";
 import { createTaskStore } from "../src/task-store";
-import { TASK_PROTOCOL_VERSION, TaskProtocolError } from "../src/task-protocol";
+import { TASK_PROTOCOL_VERSION, TaskEnvelopeKind, TaskProtocolError } from "../src/task-protocol";
 import type { RelayEnvelope, TaskEndpoint, TaskRelay } from "../src/task-protocol";
 
 const ORIGIN: TaskEndpoint = { relay: "memory", id: "origin" };
@@ -172,6 +172,142 @@ test("keeps retryable target registration failures pending and reports them on l
 	expect(store.quarantinedOutbox()).toEqual([]);
 });
 
+test("exposes a permanently blocked receiver terminal delivery without changing canonical task status", async () => {
+	const state = { blocked: false, retryable: false };
+	const relay = expiringOriginRelay(state);
+	const origin = createTaskCore({ endpoint: ORIGIN, relay, store: createTaskStore({ path: ":memory:" }), ids: sequence("origin") });
+	const receiverStore = createTaskStore({ path: ":memory:" });
+	const receiver = createTaskCore({ endpoint: RECEIVER, relay, store: receiverStore, ids: sequence("receiver") });
+	await origin.connect();
+	await receiver.connect();
+	const created = await origin.createTask({ target: RECEIVER, task: "complete after origin expiry", timeoutMs: 1_000 });
+	await receiver.receive();
+	state.blocked = true;
+
+	await expect(receiver.submitIntent({ taskId: created.taskId, type: "task.completed", payload: { summary: "finished" } })).rejects.toMatchObject({ code: "TARGET_NOT_REGISTERED", retryable: false });
+	const blocked = receiver.getTask(created.taskId)?.terminalDelivery;
+
+	expect(receiver.getTask(created.taskId)?.status).toBe("active");
+	expect(blocked).toEqual({
+		state: "delivery_blocked",
+		intentId: expect.any(String),
+		intentType: "task.completed",
+		envelopeId: expect.any(String),
+		origin: ORIGIN,
+		blockedAt: expect.any(Number),
+		error: { code: "TARGET_NOT_REGISTERED", retryable: false, details: { targetId: ORIGIN.id } },
+	});
+	await expect(receiver.submitIntent({ taskId: created.taskId, type: "task.completed", payload: { summary: "finished" } })).rejects.toMatchObject({ code: "TARGET_NOT_REGISTERED", retryable: false });
+	expect(receiver.getTask(created.taskId)?.terminalDelivery).toEqual(blocked);
+	expect(receiverStore.quarantinedOutbox()).toHaveLength(1);
+});
+
+test("reuses one pending receiver terminal intent across concurrent retryable failures", async () => {
+	const state = { blocked: false, retryable: true };
+	const relay = expiringOriginRelay(state);
+	const origin = createTaskCore({ endpoint: ORIGIN, relay, store: createTaskStore({ path: ":memory:" }), ids: sequence("origin") });
+	const receiverStore = createTaskStore({ path: ":memory:" });
+	const receiver = createTaskCore({ endpoint: RECEIVER, relay, store: receiverStore, ids: sequence("receiver") });
+	await origin.connect();
+	await receiver.connect();
+	const created = await origin.createTask({ target: RECEIVER, task: "retry terminal", timeoutMs: 1_000 });
+	await receiver.receive();
+	state.blocked = true;
+
+	const attempts = await Promise.allSettled([
+		receiver.submitIntent({ taskId: created.taskId, type: "task.completed", payload: { summary: "finished" } }),
+		receiver.submitIntent({ taskId: created.taskId, type: "task.completed", payload: { summary: "finished" } }),
+	]);
+
+	expect(attempts.every((attempt) => attempt.status === "rejected")).toBe(true);
+	expect(receiverStore.outbox("pending")).toHaveLength(1);
+	const pendingEnvelopeId = receiverStore.outbox("pending")[0]?.envelope.envelopeId;
+	if (pendingEnvelopeId === undefined) throw new Error("expected one pending terminal envelope");
+	expect(receiver.getTask(created.taskId)?.terminalDelivery).toEqual({
+		state: "pending",
+		intentId: expect.any(String),
+		intentType: "task.completed",
+		envelopeId: pendingEnvelopeId,
+		origin: ORIGIN,
+	});
+});
+
+test("reserves one receiver terminal action across conflicting concurrent calls", async () => {
+	const state = { blocked: false, retryable: true };
+	const relay = expiringOriginRelay(state);
+	const origin = createTaskCore({ endpoint: ORIGIN, relay, store: createTaskStore({ path: ":memory:" }), ids: sequence("origin") });
+	const receiverStore = createTaskStore({ path: ":memory:" });
+	const receiver = createTaskCore({ endpoint: RECEIVER, relay, store: receiverStore, ids: sequence("receiver") });
+	await origin.connect();
+	await receiver.connect();
+	const created = await origin.createTask({ target: RECEIVER, task: "conflicting terminal", timeoutMs: 1_000 });
+	await receiver.receive();
+	state.blocked = true;
+
+	const attempts = await Promise.allSettled([
+		receiver.submitIntent({ taskId: created.taskId, type: "task.completed", payload: { summary: "finished" } }),
+		receiver.submitIntent({ taskId: created.taskId, type: "task.failed", payload: { summary: "failed" } }),
+	]);
+
+	expect(attempts[0]).toMatchObject({ status: "rejected", reason: { code: "TARGET_NOT_REGISTERED", retryable: true } });
+	expect(attempts[1]).toMatchObject({ status: "rejected", reason: { code: "TERMINAL_INTENT_CONFLICT", retryable: false } });
+	expect(receiverStore.outbox("pending")).toHaveLength(1);
+	expect(receiver.getTask(created.taskId)?.terminalDelivery).toMatchObject({ state: "pending", intentType: "task.completed" });
+});
+
+test("keeps one accepted receiver terminal identity across sequential retries", async () => {
+	const relay = createInMemoryTaskRelay("memory");
+	const origin = createTaskCore({ endpoint: ORIGIN, relay, store: createTaskStore({ path: ":memory:" }), ids: sequence("origin") });
+	const receiverStore = createTaskStore({ path: ":memory:" });
+	const receiver = createTaskCore({ endpoint: RECEIVER, relay, store: receiverStore, ids: sequence("receiver") });
+	await origin.connect();
+	await receiver.connect();
+	const created = await origin.createTask({ target: RECEIVER, task: "accept terminal", timeoutMs: 1_000 });
+	await receiver.receive();
+
+	await receiver.submitIntent({ taskId: created.taskId, type: "task.completed", payload: { summary: "finished" } });
+	const accepted = receiver.getTask(created.taskId)?.terminalDelivery;
+	await receiver.submitIntent({ taskId: created.taskId, type: "task.completed", payload: { summary: "finished" } });
+
+	expect(accepted).toEqual({
+		state: "accepted",
+		intentId: expect.any(String),
+		intentType: "task.completed",
+		envelopeId: expect.any(String),
+		origin: ORIGIN,
+	});
+	expect(receiver.getTask(created.taskId)?.terminalDelivery).toEqual(accepted);
+	expect(receiverStore.outbox("accepted").filter((record) => record.envelope.kind === TaskEnvelopeKind.intent)).toHaveLength(1);
+});
+
+test("preserves blocked receiver terminal identity across restart", async () => {
+	const directory = mkdtempSync("/tmp/pi-tasks-core-");
+	temporaryDirectories.push(directory);
+	const path = join(directory, "tasks.sqlite");
+	const state = { blocked: false, retryable: false };
+	const relay = expiringOriginRelay(state);
+	const origin = createTaskCore({ endpoint: ORIGIN, relay, store: createTaskStore({ path: ":memory:" }), ids: sequence("origin") });
+	const receiverStore = createTaskStore({ path });
+	const receiver = createTaskCore({ endpoint: RECEIVER, relay, store: receiverStore, ids: sequence("receiver") });
+	await origin.connect();
+	await receiver.connect();
+	const created = await origin.createTask({ target: RECEIVER, task: "restart blocked terminal", timeoutMs: 1_000 });
+	await receiver.receive();
+	state.blocked = true;
+	await expect(receiver.submitIntent({ taskId: created.taskId, type: "task.completed", payload: { summary: "finished" } })).rejects.toMatchObject({ code: "TARGET_NOT_REGISTERED" });
+	const blocked = receiver.getTask(created.taskId)?.terminalDelivery;
+	const quarantine = receiverStore.quarantinedOutbox();
+	receiverStore.close();
+
+	const restartedStore = createTaskStore({ path });
+	const restarted = createTaskCore({ endpoint: RECEIVER, relay, store: restartedStore, ids: sequence("restart") });
+	await expect(restarted.submitIntent({ taskId: created.taskId, type: "task.completed", payload: { summary: "finished" } })).rejects.toMatchObject({ code: "TARGET_NOT_REGISTERED" });
+
+	expect(restarted.getTask(created.taskId)?.terminalDelivery).toEqual(blocked);
+	expect(restartedStore.quarantinedOutbox()).toEqual(quarantine);
+	restartedStore.close();
+});
+
 test("evaluates every expired task when one timeout envelope is undeliverable", async () => {
 	const state = { blockedTargetId: undefined as string | undefined, sent: [] as string[], receiveCalls: 0 };
 	const relay = selectiveRelay(state);
@@ -221,6 +357,39 @@ test("receives inbox deliveries while an unrelated outbox envelope remains undel
 	expect(state.receiveCalls).toBe(1);
 });
 
+test("reuses a pending parent acknowledgment event and outbox identity after restart", async () => {
+	const directory = mkdtempSync("/tmp/pi-tasks-core-");
+	temporaryDirectories.push(directory);
+	const path = join(directory, "tasks.sqlite");
+	const relay = createInMemoryTaskRelay("memory");
+	const originStore = createTaskStore({ path });
+	const receiverStore = createTaskStore({ path: ":memory:" });
+	const origin = createTaskCore({ endpoint: ORIGIN, relay, store: originStore, ids: sequence("origin") });
+	const receiver = createTaskCore({ endpoint: RECEIVER, relay, store: receiverStore, ids: sequence("receiver") });
+	await origin.connect();
+	await receiver.connect();
+	const created = await origin.createTask({ target: RECEIVER, task: "implement", timeoutMs: 1_000 });
+	await receiver.receive();
+	await receiver.submitIntent({ taskId: created.taskId, type: "task.completed", payload: { summary: "finished" } });
+	await origin.receive();
+
+	relay.failNextSend();
+	await expect(origin.acknowledgeParent(created.taskId)).rejects.toThrow("in-memory relay send failed");
+	const eventId = origin.getTask(created.taskId)?.events.find((event) => event.type === "task.parent_acknowledged")?.eventId;
+	if (eventId === undefined) throw new Error("expected the parent acknowledgment event to persist before delivery");
+	const outboxIds = [...originStore.outbox("pending"), ...originStore.outbox("accepted")].map((record) => record.envelope.envelopeId);
+	originStore.close();
+
+	const restartedStore = createTaskStore({ path });
+	const restarted = createTaskCore({ endpoint: ORIGIN, relay, store: restartedStore, ids: sequence("restart") });
+	await restarted.acknowledgeParent(created.taskId);
+
+	expect(restarted.getTask(created.taskId)?.events.filter((event) => event.type === "task.parent_acknowledged").map((event) => event.eventId)).toEqual([eventId]);
+	expect([...restartedStore.outbox("pending"), ...restartedStore.outbox("accepted")].map((record) => record.envelope.envelopeId).sort()).toEqual(outboxIds.sort());
+	expect(restartedStore.outbox("pending")).toEqual([]);
+	restartedStore.close();
+});
+
 test("scans every locally-owned origin task for timeout after relay acceptance fails and survives restart", async () => {
 	const directory = mkdtempSync("/tmp/pi-tasks-core-");
 	temporaryDirectories.push(directory);
@@ -245,6 +414,21 @@ test("scans every locally-owned origin task for timeout after relay acceptance f
 	expect(restarted.getTask("origin-1")?.events.map((event) => event.type)).toEqual(["task.created", "task.timed_out"]);
 	restartedStore.close();
 });
+
+function expiringOriginRelay(state: { blocked: boolean; retryable: boolean }): TaskRelay {
+	const relay = createInMemoryTaskRelay("memory");
+	return {
+		id: relay.id,
+		async connect(input) { return relay.connect(input); },
+		async resolve(input) { return relay.resolve(input); },
+		async send(input) {
+			if (state.blocked && input.target.id === ORIGIN.id) throw new TaskProtocolError("TARGET_NOT_REGISTERED", "origin is inactive", { retryable: state.retryable, details: { targetId: input.target.id } });
+			return relay.send(input);
+		},
+		async receive(input) { return relay.receive(input); },
+		async acknowledgeDelivery(input) { await relay.acknowledgeDelivery(input); },
+	};
+}
 
 function selectiveRelay(state: { blockedTargetId: string | undefined; sent: string[]; receiveCalls: number; retryable?: boolean }): TaskRelay {
 	return {

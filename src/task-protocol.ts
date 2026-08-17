@@ -1,5 +1,7 @@
 export const TASK_PROTOCOL_VERSION = "pi-tasks/v2" as const;
 export const MAX_RELAY_PAYLOAD_BYTES = 48 * 1024;
+export const PARENT_ACKNOWLEDGMENT_OPERATION = "parent_acknowledgment";
+export const TERMINAL_INTENT_OPERATION = "terminal_intent";
 
 export interface TaskEndpoint {
 	readonly relay: string;
@@ -100,11 +102,44 @@ export interface TaskRecord {
 	readonly events: readonly TaskEvent[];
 }
 
+export type TerminalTaskIntentType = "task.completed" | "task.failed" | "task.cancelled";
+
 export interface TaskIntent {
 	readonly intentId: string;
 	readonly taskId: string;
-	readonly type: "task.completed" | "task.failed" | "task.cancelled" | "task.information" | "task.question" | "task.answer" | "task.delivery_receipt";
+	readonly type: TerminalTaskIntentType | "task.information" | "task.question" | "task.answer" | "task.delivery_receipt";
 	readonly payload: Record<string, unknown>;
+}
+
+interface TerminalDeliveryIdentity {
+	readonly intentId: string;
+	readonly intentType: TerminalTaskIntentType;
+	readonly envelopeId: string;
+	readonly origin: TaskEndpoint;
+}
+
+interface TerminalDeliveryPending extends TerminalDeliveryIdentity {
+	readonly state: "pending";
+}
+
+interface TerminalDeliveryAccepted extends TerminalDeliveryIdentity {
+	readonly state: "accepted";
+}
+
+interface TerminalDeliveryBlocked extends TerminalDeliveryIdentity {
+	readonly state: "delivery_blocked";
+	readonly blockedAt: number;
+	readonly error: { readonly code: string; readonly retryable: false; readonly details: Readonly<Record<string, unknown>> };
+}
+
+export type TerminalDeliveryState =
+	| { readonly state: "not_submitted" }
+	| TerminalDeliveryPending
+	| TerminalDeliveryAccepted
+	| TerminalDeliveryBlocked;
+
+export interface TaskSnapshot extends TaskRecord {
+	readonly terminalDelivery: TerminalDeliveryState;
 }
 
 export class TaskProtocolError extends Error {

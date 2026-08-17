@@ -15,7 +15,7 @@ interface InboxPi {
 	appendEntry(customType: string, data: { readonly cursor: string }): void;
 }
 
-interface TaskEventDetails {
+export interface TaskEventDetails {
 	readonly taskId: string;
 	readonly eventId: string;
 }
@@ -89,13 +89,17 @@ function renderTaskEvent(event: TaskEvent): string {
 	return `## task ${event.type.replace(/^task\./, "").replaceAll("_", " ")}\ntask: \`${event.taskId}\` · event: \`${event.eventId}\`${body}${summary}`;
 }
 
-function incorporatedEvents(entries: readonly unknown[]): Set<string> {
-	const events = new Set<string>();
+export function incorporatedTaskEvents(entries: readonly unknown[]): readonly TaskEventDetails[] {
+	const events: TaskEventDetails[] = [];
 	for (const entry of entries) {
 		if (!isRecord(entry) || entry.type !== "custom_message" || entry.customType !== TASK_EVENT_CUSTOM_TYPE || !isRecord(entry.details) || typeof entry.details.taskId !== "string" || typeof entry.details.eventId !== "string") continue;
-		events.add(key(entry.details.taskId, entry.details.eventId));
+		events.push({ taskId: entry.details.taskId, eventId: entry.details.eventId });
 	}
 	return events;
+}
+
+function incorporatedEvents(entries: readonly unknown[]): Set<string> {
+	return new Set(incorporatedTaskEvents(entries).map((event) => key(event.taskId, event.eventId)));
 }
 
 function isTaskEvent(value: unknown): value is TaskEvent {

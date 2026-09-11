@@ -6,7 +6,8 @@ import { Type } from "typebox";
 import { abortableSleep } from "./abortable-sleep";
 import { deliverTaskInbox, incorporatedTaskEvents } from "./task-inbox";
 import { TaskDeliveryEvidenceState, TaskDeliveryStage, TaskOutboxDeliveryError, TaskProtocolError } from "./task-protocol";
-import { createWolfpackTaskCore } from "./wolfpack-task-relay";
+import { createConfiguredTaskCore } from "./configured-task-core";
+import type { OwnedTaskCore } from "./configured-task-core";
 import type { SubmitIntentInput, SubmitIntentOutcome, TaskCore } from "./task-core";
 import type { TaskEndpoint, TaskSnapshot } from "./task-protocol";
 
@@ -41,51 +42,87 @@ const DoneParams = Type.Object({
 	artifacts: Type.Optional(Type.Array(Type.Object({ path: Type.String({ minLength: 1, description: "artifact paths are receiver-project-relative regular files" }), mimeType: Type.Optional(Type.String()), description: Type.Optional(Type.String()) }))),
 });
 
-export type ConfiguredCoreFactory = (signal?: AbortSignal) => Promise<TaskCore>;
+export type ConfiguredCoreFactory = (signal?: AbortSignal, rebind?: boolean) => Promise<TaskCore & Partial<Pick<OwnedTaskCore, "close">>>;
+export interface ConfiguredCoreLoader extends ConfiguredCoreFactory {
+	close(): Promise<void>;
+	start(): Promise<void>;
+}
+const defaultCoreFactory: ConfiguredCoreFactory = (signal, rebind) => createConfiguredTaskCore({ rebind }, signal);
 
-/** Reuses a successful configured core while allowing the next lifecycle operation to retry a failed setup. */
-export function createConfiguredCoreLoader(factory: ConfiguredCoreFactory): ConfiguredCoreFactory {
-	let corePromise: Promise<TaskCore> | undefined;
-	return async (signal?: AbortSignal): Promise<TaskCore> => {
+/** One lifecycle owns setup and its core. Late setup cannot resurrect a closed lifecycle. */
+export function createConfiguredCoreLoader(factory: ConfiguredCoreFactory): ConfiguredCoreLoader {
+	let corePromise: ReturnType<ConfiguredCoreFactory> | undefined;
+	let controller = new AbortController();
+	let epoch = 0, closed = false;
+	let closing: Promise<void> = Promise.resolve();
+	const load: ConfiguredCoreLoader = async (signal, rebind) => {
+		if (closed) throw new TaskProtocolError("RELAY_CLOSED", "task lifecycle is closed", { retryable: false });
 		if (corePromise) return corePromise;
-		const candidate = Promise.resolve().then(() => factory(signal));
+		const current = epoch;
+		const lifetimeSignal = controller.signal;
+		const combined = signal ? AbortSignal.any([signal, lifetimeSignal]) : lifetimeSignal;
+		const candidate = Promise.resolve().then(async () => {
+			if (combined.aborted) throw new TaskProtocolError("ABORTED", "task setup was cancelled");
+			const value = await factory(combined, rebind);
+			if (current !== epoch || closed || combined.aborted) {
+				await value.close?.();
+				throw new TaskProtocolError("RELAY_CLOSED", "task lifecycle was replaced", { retryable: false });
+			}
+			return value;
+		});
 		corePromise = candidate;
-		try {
-			return await candidate;
-		} catch (error) {
-			if (corePromise === candidate) corePromise = undefined;
-			throw error;
-		}
+		try { return await candidate; }
+		catch (error) { if (corePromise === candidate) corePromise = undefined; throw error; }
 	};
+	load.start = async () => {
+		const current = epoch;
+		await closing;
+		if (current !== epoch) throw new TaskProtocolError("RELAY_CLOSED", "task lifecycle was stopped during startup", { retryable: false });
+		if (closed) { closed = false; controller = new AbortController(); }
+	};
+	load.close = () => {
+		closed = true; epoch++; controller.abort();
+		const prior = corePromise; corePromise = undefined;
+		const dispose = async () => {
+			let value: Awaited<ReturnType<ConfiguredCoreFactory>> | undefined;
+			try { value = await prior; } catch { /* Setup failure already owns cleanup. */ }
+			await value?.close?.();
+		};
+		closing = Promise.all([closing, dispose()]).then(() => undefined);
+		return closing;
+	};
+	return load;
 }
 
-/** Registers v2 endpoint-owned tools using a configured durable Wolfpack relay by default. */
-export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefined = undefined, createCore: ConfiguredCoreFactory = (signal) => createWolfpackTaskCore({}, signal)): void {
+/** Registers endpoint-owned tools using the memory-owned Wolfpack transport by default. */
+export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefined = undefined, createCore: ConfiguredCoreFactory = defaultCoreFactory): void {
 	let inboxContext: ExtensionContext | undefined;
 	let backgroundTimer: ReturnType<typeof setInterval> | undefined;
 	let lifecycleEpoch = 0;
 	const closingTaskIds = new Set<string>();
 	const workerGateEnabled = process.env.PI_TASK_WORKER === "1";
-	const configuredCore: ConfiguredCoreFactory = core === undefined ? createConfiguredCoreLoader(createCore) : async (): Promise<TaskCore> => core;
+	const ownedLoader = core === undefined ? createConfiguredCoreLoader(createCore) : undefined;
+	const configuredCore: ConfiguredCoreFactory = ownedLoader ?? (async (): Promise<TaskCore> => core!);
 	const refreshInbox = createSingleFlightInboxRefresh(async (signal) => {
 		const context = inboxContext;
+		const epoch = lifecycleEpoch;
+		const isCurrent = (): boolean => inboxContext === context && lifecycleEpoch === epoch;
 		if (!context) return undefined;
 		const activeCore = await configuredCore(signal);
-		if (inboxContext !== context) return undefined;
+		if (!isCurrent()) return undefined;
 		let outboxError: unknown;
 		try {
 			await activeCore.flushOutbox(signal);
 		} catch (error) {
 			outboxError = error;
 		}
-		if (inboxContext !== context) return undefined;
+		if (!isCurrent()) return undefined;
 		try {
 			await activeCore.evaluateTimeouts(signal);
 		} catch (error) {
 			outboxError ??= error;
 		}
-		if (inboxContext !== context) return undefined;
-		const isCurrent = (): boolean => inboxContext === context;
+		if (!isCurrent()) return undefined;
 		const guardedCore: TaskCore = {
 			...activeCore,
 			async receive(receiveSignal) {
@@ -159,6 +196,8 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 	pi.on("session_start", async (_event, context) => {
 		closingTaskIds.clear();
 		const epoch = ++lifecycleEpoch;
+		await ownedLoader?.start();
+		if (epoch !== lifecycleEpoch) return;
 		inboxContext = context;
 		if (backgroundTimer) clearInterval(backgroundTimer);
 		backgroundTimer = setInterval(() => {
@@ -168,25 +207,58 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		await refreshLifecycle(context, epoch);
 	});
 	pi.on("agent_end", async (_event, context) => {
+		if (!inboxContext) return;
 		const epoch = lifecycleEpoch;
 		inboxContext = context;
 		await refreshLifecycle(context, epoch);
 	});
 	pi.on("agent_settled", async (_event, context) => {
+		if (!inboxContext) return;
 		const epoch = lifecycleEpoch;
 		inboxContext = context;
 		await refreshLifecycle(context, epoch);
 	});
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", async () => {
 		closingTaskIds.clear();
 		lifecycleEpoch += 1;
 		if (backgroundTimer) clearInterval(backgroundTimer);
 		backgroundTimer = undefined;
 		inboxContext = undefined;
+		await ownedLoader?.close();
+	});
+
+	if (ownedLoader && createCore === defaultCoreFactory) pi.registerCommand("task-relay-rebind", {
+		description: "Accept relay loss, discard active task state and bind a fresh endpoint",
+		async handler(args, context) {
+			if (args.trim() !== "--accept-relay-loss") {
+				context.ui.notify("Relay restart can lose accepted mail. Rebind discards this lifetime's task state; Pi session history remains, but is never replayed. Run /task-relay-rebind --accept-relay-loss to continue with a fresh endpoint.", "warning");
+				return;
+			}
+			const epoch = ++lifecycleEpoch;
+			inboxContext = undefined;
+			if (backgroundTimer) clearInterval(backgroundTimer);
+			backgroundTimer = undefined;
+			await ownedLoader.close();
+			if (epoch !== lifecycleEpoch) return;
+			try {
+				await ownedLoader.start();
+				if (epoch !== lifecycleEpoch) return;
+				await ownedLoader(undefined, true);
+				if (epoch !== lifecycleEpoch) return;
+				closingTaskIds.clear();
+				context.ui.notify("Fresh task endpoint bound with empty state. Prior tasks remain only in session history.", "info");
+			} catch (error) {
+				if (epoch === lifecycleEpoch) context.ui.notify(outboxFailureStatus(error), "error");
+			}
+			if (epoch !== lifecycleEpoch) return;
+			inboxContext = context;
+			backgroundTimer = setInterval(() => { if (inboxContext) void refreshLifecycle(inboxContext, epoch); }, BACKGROUND_POLL_MS);
+			await refreshLifecycle(context, epoch);
+		},
 	});
 
 	pi.registerTool({
-		name: "agent_task_send", label: "Send Agent Task", description: "Persist an endpoint-owned task and submit its opaque assignment envelope to a relay.", parameters: SendParams,
+		name: "agent_task_send", label: "Send Agent Task", description: "Create a task in this endpoint's RAM and submit its assignment; restart loses active state.", parameters: SendParams,
 		async execute(_id, params, signal) {
 			try {
 				const sent = await (await configuredCore(signal)).createTask({ target: params.to, task: params.task, timeoutMs: params.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS }, signal);
@@ -201,7 +273,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 			try {
 				const activeCore = await configuredCore(signal);
 				const task = activeCore.getTask(params.taskId);
-				if (!task) return taskError(new Error("unknown local task"));
+				if (!task) return taskError(new TaskProtocolError("UNKNOWN_TASK", `unknown task: ${params.taskId}`, { retryable: false }));
 				const deliveryEvidence = taskDeliveryEvidence(task);
 				return toolResult({ ...task, deliveryEvidence }, `## task status\n- task: \`${task.taskId}\`\n- status: ${task.status}${receiverAssignment(activeCore, task, context)}${deliveryEvidenceText(deliveryEvidence)}`);
 			} catch (error) { return taskError(error); }
@@ -215,7 +287,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 				for (;;) {
 					await refreshInbox(signal);
 					const task = (await configuredCore(signal)).getTask(params.taskId);
-					if (!task) return taskError(new Error("unknown local task"));
+					if (!task) return taskError(new TaskProtocolError("UNKNOWN_TASK", `unknown task: ${params.taskId}`, { retryable: false }));
 					if (terminal(task.status)) return toolResult(task, `## task status\n- task: \`${task.taskId}\`\n- status: ${task.status}`);
 					if (Date.now() >= deadline) return toolResult({ taskId: params.taskId, status: task.status }, `## task wait\n- task: \`${params.taskId}\`\n- status: ${task.status}\n- wait timed out`);
 					onUpdate?.({ content: [{ type: "text", text: `waiting for ${params.taskId}...` }], details: {} });
@@ -237,12 +309,12 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
 	});
 	pi.registerTool({
-		name: "agent_task_message", label: "Message Agent Task", description: "Persist a message intent before relay submission.", parameters: MessageParams,
+		name: "agent_task_message", label: "Message Agent Task", description: "Record a message intent in this lifetime before relay submission.", parameters: MessageParams,
 		async execute(_id, params, signal) { try { await (await configuredCore(signal)).submitIntent({ taskId: params.taskId, type: `task.${params.type}`, payload: { message: params.message } }, signal); return toolResult({ taskId: params.taskId }, `## task ${params.type}\n- task: \`${params.taskId}\``); } catch (error) { return taskError(error); } },
 		renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
 	});
 	pi.registerTool({
-		name: "agent_task_cancel", label: "Cancel Agent Task", description: "Persist cancellation before relay submission.", parameters: TaskIdParams,
+		name: "agent_task_cancel", label: "Cancel Agent Task", description: "Record cancellation in this lifetime before relay submission.", parameters: TaskIdParams,
 		async execute(_id, params, signal) {
 			try {
 				const activeCore = await configuredCore(signal);
@@ -262,7 +334,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
 	});
 	pi.registerTool({
-		name: "agent_task_done", label: "Complete Agent Task", description: "Persist a terminal task intent before relay submission.", parameters: DoneParams,
+		name: "agent_task_done", label: "Complete Agent Task", description: "Record a terminal intent in this lifetime before relay submission.", parameters: DoneParams,
 		async execute(_id, params, signal) {
 			try {
 				const activeCore = await configuredCore(signal);
@@ -275,7 +347,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 					return blockedDoneResult(activeCore, params.taskId, params.status, error) ?? taskError(error);
 				}
 				const task = activeCore.getTask(params.taskId);
-				if (!task) return taskError(new Error("unknown local task"));
+				if (!task) return taskError(new TaskProtocolError("UNKNOWN_TASK", `unknown task: ${params.taskId}`, { retryable: false }));
 				if (submission?.authority === "origin" && submission.canonicalEvent.type === "task.late_terminal") {
 					return {
 						...toolResult({ taskId: params.taskId, requestedStatus: params.status, observedCanonicalStatus: task.status, canonicalEvent: submission.canonicalEvent }, `## canonical late terminal recorded\n- task: \`${params.taskId}\`\n- requested status: ${params.status}\n- canonical status remains: ${task.status}\n- ${params.summary}`),
@@ -313,34 +385,34 @@ export default function piTasks(pi: ExtensionAPI): void {
 }
 
 interface TaskDeliveryEvidence {
-	readonly receiverPersistence: "not_confirmed" | "confirmed";
+	readonly receiverReceipt: "not_confirmed" | "confirmed";
 	readonly piInsertion: "not_confirmed" | "blocked" | "confirmed";
 	readonly wakeAcceptance: "not_confirmed" | "pending" | "confirmed";
 	readonly modelExecution: "not_evidenced";
 }
 
 function taskDeliveryEvidence(task: TaskSnapshot): TaskDeliveryEvidence {
-	let receiverPersistence: TaskDeliveryEvidence["receiverPersistence"] = "not_confirmed";
+	let receiverReceipt: TaskDeliveryEvidence["receiverReceipt"] = "not_confirmed";
 	let piInsertion: TaskDeliveryEvidence["piInsertion"] = "not_confirmed";
 	let wakeAcceptance: TaskDeliveryEvidence["wakeAcceptance"] = "not_confirmed";
 	const assignmentEventId = task.events.find((event) => event.type === "task.created")?.eventId;
 	for (const event of task.events) {
 		if (event.type !== "task.delivery_receipt" || event.payload.eventId !== assignmentEventId) continue;
-		if (event.payload.stage === TaskDeliveryStage.receiverPersisted) receiverPersistence = "confirmed";
+		if (event.payload.stage === TaskDeliveryStage.receiverRecorded) receiverReceipt = "confirmed";
 		if (event.payload.stage === TaskDeliveryStage.piInsertion && event.payload.state === TaskDeliveryEvidenceState.blocked) piInsertion = "blocked";
 		if (event.payload.stage === TaskDeliveryStage.piInserted || event.payload.stage === undefined) {
-			receiverPersistence = "confirmed";
+			receiverReceipt = "confirmed";
 			piInsertion = "confirmed";
 		}
 		if (event.payload.stage === TaskDeliveryStage.wakeRequested) wakeAcceptance = "pending";
 		if (event.payload.stage === TaskDeliveryStage.wakeAccepted) wakeAcceptance = "confirmed";
 	}
-	return { receiverPersistence, piInsertion, wakeAcceptance, modelExecution: "not_evidenced" };
+	return { receiverReceipt, piInsertion, wakeAcceptance, modelExecution: "not_evidenced" };
 }
 
 function deliveryEvidenceText(evidence: TaskDeliveryEvidence): string {
 	const insertion = evidence.piInsertion === "blocked" ? "blocked; retryable" : evidence.piInsertion;
-	return `\n- receiver persistence: ${evidence.receiverPersistence}\n- Pi insertion: ${insertion}\n- wake acceptance: ${evidence.wakeAcceptance}\n- model execution: ${evidence.modelExecution}`;
+	return `\n- receiver receipt (RAM): ${evidence.receiverReceipt}\n- Pi insertion: ${insertion}\n- wake acceptance: ${evidence.wakeAcceptance}\n- model execution: ${evidence.modelExecution}`;
 }
 
 function toolResult(details: unknown, markdown: string): AgentToolResult<unknown> {
@@ -393,7 +465,12 @@ function blockedDeliveryWarning(error: TaskOutboxDeliveryError, target: TaskEndp
 	return { code: error.code, message: error.message, retryable: false, delivery: "blocked", target, details };
 }
 
-function outboxFailureStatus(error: unknown): "tasks: relay unavailable" | "tasks: outbox degraded" {
+function outboxFailureStatus(error: unknown): string {
+	if (error instanceof TaskProtocolError) {
+		if (["RELAY_RESET", "RELAY_REBIND_REQUIRED"].includes(error.code)) return "tasks: relay reset; /task-relay-rebind";
+		if (error.code === "RELAY_PROFILE_REQUIRED") return "tasks: compatible memory-owned relay required";
+		if (error.code === "RELAY_AUTH_REQUIRED") return "tasks: Wolfpack authentication required";
+	}
 	return error instanceof TaskOutboxDeliveryError && error.code === TARGET_NOT_REGISTERED_CODE ? "tasks: outbox degraded" : "tasks: relay unavailable";
 }
 

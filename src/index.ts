@@ -1,13 +1,11 @@
 export { createInMemoryTaskRelay, InMemoryTaskRelay } from "./in-memory-task-relay";
 export { createTaskCore } from "./task-core";
+export { createConfiguredTaskCore } from "./configured-task-core";
+export type { ConfiguredTaskCoreOptions, OwnedTaskCore } from "./configured-task-core";
 export { createTaskStore } from "./task-store";
-export {
-	createWolfpackTaskCore,
-	createWolfpackTaskRelay,
-	WOLFPACK_TASK_RELAY_ID,
-	WOLFPACK_TASK_RELAY_LEASE_MS,
-	WOLFPACK_TASK_RELAY_PROTOCOL_VERSION,
-} from "./wolfpack-task-relay";
+export { createVolatileTaskSession, VOLATILE_PROFILE } from "./volatile-task-session";
+export type { VolatileTaskSession, VolatileTaskSessionOptions } from "./volatile-task-session";
+export { WOLFPACK_TASK_RELAY_ID } from "./wolfpack-endpoint-view";
 export { runTaskRelayConformance } from "./task-relay-conformance";
 export {
 	MAX_RELAY_PAYLOAD_BYTES,
@@ -25,6 +23,7 @@ export type {
 	RelayInboxPage,
 	RelayReceiveRequest,
 	RelayTargetReference,
+	RelayTransportBinding,
 	TaskEndpoint,
 	TaskEvent,
 	TaskIntent,

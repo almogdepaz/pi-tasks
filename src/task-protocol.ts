@@ -6,7 +6,7 @@ export const PARENT_ACKNOWLEDGMENT_OPERATION = "parent_acknowledgment";
 export const TERMINAL_INTENT_OPERATION = "terminal_intent";
 
 export const TaskDeliveryStage = {
-	receiverPersisted: "receiver_persisted",
+	receiverRecorded: "receiver_recorded",
 	piInsertion: "pi_insertion",
 	piInserted: "pi_inserted",
 	wakeRequested: "wake_requested",
@@ -21,6 +21,17 @@ export const TaskDeliveryEvidenceState = {
 export interface TaskEndpoint {
 	readonly relay: string;
 	readonly id: string;
+}
+
+/** Endpoint-owned transport binding; not task lifecycle or relay replay state. */
+export interface RelayTransportBinding {
+	readonly profile: "volatile-v1";
+	readonly epoch: string;
+	readonly endpoint: TaskEndpoint;
+	readonly generation: string;
+	readonly callerSession: string;
+	readonly url: string;
+	readonly reset?: true;
 }
 
 /** A provider-defined reference which core resolves without interpreting. */

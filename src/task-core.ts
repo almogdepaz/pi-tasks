@@ -25,7 +25,7 @@ import type { TaskStore } from "./task-store";
 
 const RECEIVE_PAGE_SIZE = 100;
 const DELIVERY_EVIDENCE_OPERATION = "delivery_evidence";
-const TARGET_NOT_REGISTERED_CODE = "TARGET_NOT_REGISTERED";
+const TERMINAL_DELIVERY_CODES = new Set(["TARGET_NOT_REGISTERED", INVALID_RELAY_METADATA, "DELIVERY_UNCONFIRMED", "ENVELOPE_EXPIRED", "ENVELOPE_CONFLICT", "CROSS_RELAY_ENDPOINT"]);
 const TERMINAL_STATUSES = new Set<TaskRecord["status"]>(["completed", "failed", "cancelled", "timed_out"]);
 const TERMINAL_EVENTS = new Set(["task.completed", "task.failed", "task.cancelled", "task.timed_out"]);
 const CANONICAL_EVENTS = new Set([
@@ -301,6 +301,7 @@ interface PersistedIntent {
 }
 
 function persistIntent(options: TaskCoreOptions, now: () => number, ids: () => string, task: TaskRecord, input: SubmitIntentInput, reservedOperation?: string): PersistedIntent {
+	if (!sameEndpoint(options.endpoint, task.origin) && !sameEndpoint(options.endpoint, task.target)) throw new TaskProtocolError("NOT_PARTICIPANT", "historical task belongs to a different endpoint", { retryable: false });
 	if (sameEndpoint(options.endpoint, task.origin)) {
 		const operation = input.type === "task.cancelled" ? ORIGIN_CANCELLATION_OPERATION : reservedOperation;
 		const canonical = canonicalize(options, now, ids, task, { intentId: ids(), taskId: input.taskId, type: input.type, payload: input.payload }, input.type, operation);
@@ -346,7 +347,7 @@ function deliveryEvidence(input: SubmitIntentInput): DeliveryEvidence | undefine
 	if (stage === TaskDeliveryStage.piInsertion && state === TaskDeliveryEvidenceState.blocked && input.payload.retryable === true) {
 		return { eventId: input.payload.eventId, stage, state, retryable: true };
 	}
-	if ((stage === TaskDeliveryStage.receiverPersisted || stage === TaskDeliveryStage.piInserted || stage === TaskDeliveryStage.wakeRequested || stage === TaskDeliveryStage.wakeAccepted)
+	if ((stage === TaskDeliveryStage.receiverRecorded || stage === TaskDeliveryStage.piInserted || stage === TaskDeliveryStage.wakeRequested || stage === TaskDeliveryStage.wakeAccepted)
 		&& state === TaskDeliveryEvidenceState.confirmed) {
 		return { eventId: input.payload.eventId, stage, state };
 	}
@@ -400,7 +401,7 @@ async function flush(options: TaskCoreOptions, signal: AbortSignal | undefined, 
 			options.store.transaction(() => { options.store.markOutboxAccepted(record.envelope.envelopeId); });
 		} catch (error) {
 			if (signal?.aborted || (error instanceof TaskProtocolError && error.code === "ABORTED")) throw error;
-			if (error instanceof TaskProtocolError && (error.code === TARGET_NOT_REGISTERED_CODE || error.code === INVALID_RELAY_METADATA) && !error.retryable) {
+			if (error instanceof TaskProtocolError && TERMINAL_DELIVERY_CODES.has(error.code) && !error.retryable) {
 				options.store.transaction(() => {
 					options.store.quarantineOutbox(record.envelope.envelopeId, {
 						errorCode: error.code,
@@ -482,7 +483,7 @@ function throwIfTerminalDeliveryBlocked(store: TaskStore, taskId: string): void 
 
 function requiredTask(store: TaskStore, taskId: string): TaskSnapshot {
 	const task = store.getTask(taskId);
-	if (!task) throw new TaskProtocolError("UNKNOWN_TASK", `unknown task: ${taskId}`);
+	if (!task) throw new TaskProtocolError("UNKNOWN_TASK", `unknown task: ${taskId}`, { retryable: false });
 	return task;
 }
 

@@ -16,6 +16,9 @@ const MIN_TASK_TIMEOUT_MS = 1_000;
 const MAX_TASK_TIMEOUT_MS = 86_400_000;
 const BACKGROUND_POLL_MS = 5_000;
 const TARGET_NOT_REGISTERED_CODE = "TARGET_NOT_REGISTERED";
+const RELAY_STATE_LOST_CODE = "RELAY_STATE_LOST";
+const RELAY_LOSS_CUSTOM_TYPE = "pi-tasks-relay-loss";
+const RELAY_LOSS_CODES = new Set(["RELAY_RESET", "RELAY_REBIND_REQUIRED"]);
 const WAIT_POLL_MS = 250;
 const SUMMARY_MAX_CHARS = 1_200;
 const PRE_ASSIGNMENT_TOOLS = new Set(["agent_task_inbox", "agent_task_status", "agent_task_wait"]);
@@ -103,6 +106,8 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 	const workerGateEnabled = process.env.PI_TASK_WORKER === "1";
 	const ownedLoader = core === undefined ? createConfiguredCoreLoader(createCore) : undefined;
 	const configuredCore: ConfiguredCoreFactory = ownedLoader ?? (async (): Promise<TaskCore> => core!);
+	let relayLossRecovery: Promise<void> | undefined;
+	let pendingRelayLossCount: number | undefined;
 	const refreshInbox = createSingleFlightInboxRefresh(async (signal) => {
 		const context = inboxContext;
 		const epoch = lifecycleEpoch;
@@ -114,12 +119,14 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		try {
 			await activeCore.flushOutbox(signal);
 		} catch (error) {
+			if (isRelayLoss(error)) return error;
 			outboxError = error;
 		}
 		if (!isCurrent()) return undefined;
 		try {
 			await activeCore.evaluateTimeouts(signal);
 		} catch (error) {
+			if (isRelayLoss(error)) return error;
 			outboxError ??= error;
 		}
 		if (!isCurrent()) return undefined;
@@ -146,10 +153,64 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		}, signal);
 		return outboxError;
 	});
+	const startBackgroundRefresh = (context: ExtensionContext, epoch: number): void => {
+		inboxContext = context;
+		if (backgroundTimer) clearInterval(backgroundTimer);
+		backgroundTimer = setInterval(() => {
+			const currentContext = inboxContext;
+			if (currentContext) void refreshLifecycle(currentContext, epoch);
+		}, BACKGROUND_POLL_MS);
+	};
+	const announceFreshBinding = (context: ExtensionContext): void => {
+		if (pendingRelayLossCount === undefined) return;
+		const count = pendingRelayLossCount;
+		pendingRelayLossCount = undefined;
+		const taskSummary = count === 0 ? "No active tasks required local failure records." : `${count} active ${count === 1 ? "task was" : "tasks were"} marked locally failed with unknown remote outcome.`;
+		context.ui.notify(`Relay state was lost; automatically bound a fresh endpoint. ${taskSummary}`, "warning");
+	};
+	const recoverRelayLoss = async (context: ExtensionContext, epoch: number, activeCore: TaskCore | undefined): Promise<boolean> => {
+		if (!ownedLoader || lifecycleEpoch !== epoch || inboxContext !== context) return false;
+		if (relayLossRecovery) { await relayLossRecovery; return true; }
+		const pending = (async (): Promise<void> => {
+			const recoveryEpoch = ++lifecycleEpoch;
+			const activeTasks = activeCore?.listTasks().filter((task) => task.status === "active") ?? [];
+			inboxContext = undefined;
+			if (backgroundTimer) clearInterval(backgroundTimer);
+			backgroundTimer = undefined;
+			await ownedLoader.close();
+			if (recoveryEpoch !== lifecycleEpoch) return;
+			for (const task of activeTasks) {
+				pi.sendMessage({
+					customType: RELAY_LOSS_CUSTOM_TYPE,
+					content: `## task failed locally\ntask: \`${task.taskId}\`\n\nRelay state was lost; the remote outcome is unknown.`,
+					display: true,
+					details: { taskId: task.taskId, status: "failed", error: { code: RELAY_STATE_LOST_CODE, message: "relay state was lost; remote outcome is unknown", retryable: false }, remoteOutcome: "unknown" },
+				}, { triggerTurn: false });
+			}
+			pendingRelayLossCount = (pendingRelayLossCount ?? 0) + activeTasks.length;
+			closingTaskIds.clear();
+			try {
+				await ownedLoader.start();
+				if (recoveryEpoch !== lifecycleEpoch) return;
+				await ownedLoader(undefined, true);
+				if (recoveryEpoch !== lifecycleEpoch) return;
+				announceFreshBinding(context);
+				context.ui.setStatus("pi-tasks", undefined);
+			} catch (error) {
+				if (recoveryEpoch !== lifecycleEpoch) return;
+				context.ui.setStatus("pi-tasks", context.ui.theme.fg("warning", outboxFailureStatus(error)));
+			}
+			if (recoveryEpoch === lifecycleEpoch) startBackgroundRefresh(context, recoveryEpoch);
+		})();
+		relayLossRecovery = pending;
+		try { await pending; } finally { if (relayLossRecovery === pending) relayLossRecovery = undefined; }
+		return true;
+	};
 	const refreshLifecycle = async (context: ExtensionContext, epoch: number): Promise<void> => {
 		const isCurrent = (): boolean => lifecycleEpoch === epoch && inboxContext === context;
+		let activeCore: (TaskCore & Partial<Pick<OwnedTaskCore, "close">>) | undefined;
 		try {
-			const activeCore = await configuredCore();
+			activeCore = await configuredCore();
 			let connectionError: unknown;
 			try {
 				await activeCore.connect();
@@ -157,12 +218,16 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 				connectionError = error;
 			}
 			if (!isCurrent()) return;
+			if (isRelayLoss(connectionError) && await recoverRelayLoss(context, epoch, activeCore)) return;
 			const outboxError = await refreshInbox();
 			if (!isCurrent()) return;
+			if (isRelayLoss(outboxError) && await recoverRelayLoss(context, epoch, activeCore)) return;
 			const lifecycleError = outboxError ?? connectionError;
 			const status = lifecycleError === undefined ? undefined : outboxFailureStatus(lifecycleError);
 			context.ui.setStatus("pi-tasks", status === undefined ? undefined : context.ui.theme.fg("warning", status));
+			if (lifecycleError === undefined) announceFreshBinding(context);
 		} catch (error) {
+			if (isCurrent() && isRelayLoss(error) && await recoverRelayLoss(context, epoch, activeCore)) return;
 			if (isCurrent()) context.ui.setStatus("pi-tasks", context.ui.theme.fg("warning", outboxFailureStatus(error)));
 		}
 	};
@@ -198,12 +263,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		const epoch = ++lifecycleEpoch;
 		await ownedLoader?.start();
 		if (epoch !== lifecycleEpoch) return;
-		inboxContext = context;
-		if (backgroundTimer) clearInterval(backgroundTimer);
-		backgroundTimer = setInterval(() => {
-			const currentContext = inboxContext;
-			if (currentContext) void refreshLifecycle(currentContext, epoch);
-		}, BACKGROUND_POLL_MS);
+		startBackgroundRefresh(context, epoch);
 		await refreshLifecycle(context, epoch);
 	});
 	pi.on("agent_end", async (_event, context) => {
@@ -224,37 +284,8 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		if (backgroundTimer) clearInterval(backgroundTimer);
 		backgroundTimer = undefined;
 		inboxContext = undefined;
+		pendingRelayLossCount = undefined;
 		await ownedLoader?.close();
-	});
-
-	if (ownedLoader && createCore === defaultCoreFactory) pi.registerCommand("task-relay-rebind", {
-		description: "Accept relay loss, discard active task state and bind a fresh endpoint",
-		async handler(args, context) {
-			if (args.trim() !== "--accept-relay-loss") {
-				context.ui.notify("Relay restart can lose accepted mail. Rebind discards this lifetime's task state; Pi session history remains, but is never replayed. Run /task-relay-rebind --accept-relay-loss to continue with a fresh endpoint.", "warning");
-				return;
-			}
-			const epoch = ++lifecycleEpoch;
-			inboxContext = undefined;
-			if (backgroundTimer) clearInterval(backgroundTimer);
-			backgroundTimer = undefined;
-			await ownedLoader.close();
-			if (epoch !== lifecycleEpoch) return;
-			try {
-				await ownedLoader.start();
-				if (epoch !== lifecycleEpoch) return;
-				await ownedLoader(undefined, true);
-				if (epoch !== lifecycleEpoch) return;
-				closingTaskIds.clear();
-				context.ui.notify("Fresh task endpoint bound with empty state. Prior tasks remain only in session history.", "info");
-			} catch (error) {
-				if (epoch === lifecycleEpoch) context.ui.notify(outboxFailureStatus(error), "error");
-			}
-			if (epoch !== lifecycleEpoch) return;
-			inboxContext = context;
-			backgroundTimer = setInterval(() => { if (inboxContext) void refreshLifecycle(inboxContext, epoch); }, BACKGROUND_POLL_MS);
-			await refreshLifecycle(context, epoch);
-		},
 	});
 
 	pi.registerTool({
@@ -467,11 +498,15 @@ function blockedDeliveryWarning(error: TaskOutboxDeliveryError, target: TaskEndp
 
 function outboxFailureStatus(error: unknown): string {
 	if (error instanceof TaskProtocolError) {
-		if (["RELAY_RESET", "RELAY_REBIND_REQUIRED"].includes(error.code)) return "tasks: relay reset; /task-relay-rebind";
+		if (RELAY_LOSS_CODES.has(error.code)) return "tasks: relay state lost; rebinding automatically";
 		if (error.code === "RELAY_PROFILE_REQUIRED") return "tasks: compatible memory-owned relay required";
 		if (error.code === "RELAY_AUTH_REQUIRED") return "tasks: Wolfpack authentication required";
 	}
 	return error instanceof TaskOutboxDeliveryError && error.code === TARGET_NOT_REGISTERED_CODE ? "tasks: outbox degraded" : "tasks: relay unavailable";
+}
+
+function isRelayLoss(error: unknown): error is TaskProtocolError {
+	return error instanceof TaskProtocolError && RELAY_LOSS_CODES.has(error.code);
 }
 
 function terminal(status: string): boolean {

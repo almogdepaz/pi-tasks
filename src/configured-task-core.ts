@@ -13,7 +13,7 @@ export interface ConfiguredTaskCoreOptions {
   readonly baseUrl?: string;
   readonly fetch?: typeof fetch;
   readonly requestTimeoutMs?: number;
-  /** Explicit operator acceptance of loss/unknown outcomes; never set on automatic retry. */
+  /** Fresh-lifetime registration after accepted state loss; the extension uses it only for structured relay-loss evidence. */
   readonly rebind?: boolean;
 }
 

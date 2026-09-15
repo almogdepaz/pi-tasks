@@ -30,13 +30,13 @@ The `agent_task_send` schema is exactly `to`, `task`, and optional `timeoutMs`. 
 - Active tasks, outbox intentions, individual ACK checkpoints, deduplication and delivery-blocked evidence are RAM-owned. Each endpoint has lower-only limits of16,384 records/32MiB encoded state. Admission fails before exceeding those bounds; they are not a process-RSS guarantee.
 - `agent_task_send` confirms relay acceptance, **not execution**. `receiver_recorded` confirms receiver RAM receipt, **not durable persistence**. Pi insertion and wake acceptance are separate evidence, never proof of model execution.
 - Session history is not an operational journal. A new process/lifecycle starts empty with a fresh endpoint/generation; it does not reconstruct tasks, replay envelopes, reuse old ACKs or reopen a worker gate from old history.
-- A relay restart can lose even accepted mail. A Pi restart loses that endpoint's active task state. Prior outcomes can be unknown; do not label them delivered, failed or recovered without evidence.
+- A relay restart can lose even accepted mail. A Pi restart loses that endpoint's active task state. Relay-loss evidence marks affected work failed only in the discarded local lifetime; its remote outcome remains explicitly unknown and is never presented as canonical delivery or completion evidence.
 
 ## memory-owned lifecycle
 
 `createConfiguredTaskCore()` owns its transport and `createTaskStore()` RAM state. Startup registers; polling runs every five seconds and at agent settlement. Shutdown fences new work, aborts requests, drains active calls and discards state. Late callbacks cannot mutate a successor lifetime.
 
-A live endpoint detecting relay reset stops. `/task-relay-rebind` explains the loss boundary; only `/task-relay-rebind --accept-relay-loss` explicitly discards old state and binds a fresh scope. Automatic polling never invokes rebind. Session history remains untouched, but no historical task becomes active again.
+The default extension automatically replaces a lifetime only after a structured `RELAY_RESET` or `RELAY_REBIND_REQUIRED`. It fences and discards the unusable RAM state, records each active task in session history as locally failed with `RELAY_STATE_LOST` and an explicitly unknown remote outcome, then binds a fresh empty endpoint. The loss record does not wake the model by itself. Transient availability, authentication, capacity, abort, profile and malformed-response failures never trigger replacement. Historical tasks are not adopted into the successor lifetime.
 
 `createVolatileTaskSession({ url, callerSession, store })` is the lower-level API for a caller-owned RAM store. Transport reconnect within that same lifetime retains pending immutable retries; `rebind()` clears the store, while `close()` stops transport and the caller then closes its state. Persistence/path options are rejected. Old database files are neither read nor deleted.
 
@@ -98,4 +98,4 @@ PI_TASKS_WOLFPACK_REVISION=<full-commit-id> \
 bun test tests/volatile-real-worker.test.ts tests/volatile-extension-worker.test.ts
 ```
 
-Wolfpack worker tests require its supported Bun runtime (currently stable>=1.4.2). Optional source-selected checks use private HTTP/workers, not installed services. They test same-lifetime retry/ACK, explicit reset/rebind, fresh endpoint state and history-only evidence. `createInMemoryTaskRelay` is a deterministic conformance fixture, never the default runtime transport. Physical two-machine qualification, final-path performance, release packaging and live activation remain separate gates.
+Wolfpack worker tests require its supported Bun runtime (currently stable>=1.4.2). Optional source-selected checks use private HTTP/workers, not installed services. They test same-lifetime retry/ACK, automatic default-extension reset recovery, explicit lower-level session replacement, fresh endpoint state and history-only evidence. `createInMemoryTaskRelay` is a deterministic conformance fixture, never the default runtime transport. Physical two-machine qualification, final-path performance, release packaging and live activation remain separate gates.

@@ -50,7 +50,9 @@ describe("v2-only package", () => {
 			// The volatile-v1 transport and legacy cutover warning are not the removed v1 task runtime.
 			expect(document).not.toMatch(/\b(?:pi-tasks\/v1|v1-compat-extension|legacy-extension|task-metrics|task board|historical reporting)\b/i);
 			expect(document).toContain("volatile-v1");
-			expect(document).toContain("/task-relay-rebind --accept-relay-loss");
+			expect(document).toContain("RELAY_STATE_LOST");
+			expect(document).toContain("unknown remote outcome");
+			expect(document).not.toContain("/task-relay-rebind");
 			expect(document).toContain("can lose even accepted mail");
 		}
 		expect(readme).toContain("requires a compatible Wolfpack memory-owned server");

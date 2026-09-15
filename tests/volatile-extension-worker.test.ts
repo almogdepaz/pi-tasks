@@ -9,7 +9,7 @@ import { createConfiguredTaskCore, type OwnedTaskCore } from "../src/configured-
 
 const wolfpack = process.env.PI_TASKS_WOLFPACK_SOURCE, revision = process.env.PI_TASKS_WOLFPACK_REVISION;
 
-test.skipIf(!wolfpack)("normal extension starts, polls, closes, reopens and explicitly rebinds against actual memory worker", async () => {
+test.skipIf(!wolfpack)("normal extension starts, polls, closes, reopens and automatically replaces a reset memory worker lifetime", async () => {
   if (!process.env.PI_TASKS_EXTENSION_FIXTURE_HOME) {
     // Bun may cache homedir(): a HOME change after imports is not isolation.
     const home = mkdtempSync(join(tmpdir(), "tasks-extension-home-"));
@@ -81,19 +81,19 @@ test.skipIf(!wolfpack)("normal extension starts, polls, closes, reopens and expl
     await events.agent_end!({}, context); await events.agent_settled!({}, context);
     expect(frames).toHaveLength(calls);
     await events.session_start!({}, context);
-    expect(registrations.at(-1).endpoint).not.toEqual(prior.endpoint);
+    const resetEndpoint = registrations.at(-1).endpoint;
+    expect(resetEndpoint).not.toEqual(prior.endpoint);
     expect(messages.some(message => message.details?.taskId === result.details.taskId)).toBe(true);
+    const lost = await tools.agent_task_send.execute("lost-task", { to: resetEndpoint, task: "active when relay resets", timeoutMs: 60_000 }, undefined);
+    expect(lost.isError).not.toBe(true);
     await worker.close(); worker = makeWorker(); await worker.initialize();
     await events.agent_settled!({}, context);
-    expect(statuses.at(-1)).toContain("relay reset");
-    const resetCalls = frames.length;
-    expect(statuses.at(-1)).toContain("relay reset");
-    await commands["task-relay-rebind"].handler("", context);
-    expect(frames).toHaveLength(resetCalls); expect(notifications.at(-1)).toContain("can lose accepted mail");
-    await commands["task-relay-rebind"].handler("--accept-relay-loss", context);
+    expect(commands["task-relay-rebind"]).toBeUndefined();
     expect(registrations.at(-1).epoch).not.toBe(prior.epoch);
-    expect(registrations.at(-1).endpoint).not.toEqual(prior.endpoint);
-    expect(messages.some(message => message.details?.taskId === result.details.taskId)).toBe(true);
+    expect(registrations.at(-1).endpoint).not.toEqual(resetEndpoint);
+    expect(messages.some(message => message.customType === "pi-tasks-relay-loss" && message.details?.taskId === lost.details.taskId)).toBe(true);
+    expect(notifications.at(-1)).toContain("automatically bound a fresh endpoint");
+    expect(statuses.at(-1)).toBeUndefined();
     expect(existsSync(join(process.env.HOME!, ".pi", "tasks"))).toBe(false);
     const historical = await tools.agent_task_message.execute("old", { taskId: result.details.taskId, type: "information", message: "must not adopt" }, undefined);
     expect(historical.details.error.code).toBe("UNKNOWN_TASK");

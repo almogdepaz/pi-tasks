@@ -664,6 +664,120 @@ test("contains agent_end relay failures and leaves the unavailable warning", asy
 	}
 });
 
+test.each(["RELAY_RESET", "RELAY_REBIND_REQUIRED"] as const)("automatically replaces a relay-loss lifetime and records active tasks as locally lost: %s", async (relayLossCode) => {
+	let sessionStart: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
+	let agentSettled: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
+	let sessionShutdown: (() => Promise<void>) | undefined;
+	let oldConnects = 0;
+	let oldFlushes = 0;
+	let oldEvaluations = 0;
+	let oldReceives = 0;
+	let oldCloses = 0;
+	let oldClosing: Promise<void> | undefined;
+	let freshCreates = 0;
+	let freshConnectionError: TaskProtocolError | undefined;
+	const factoryModes: boolean[] = [];
+	const tools: Record<string, Tool> = {};
+	const messages: Array<{ readonly message: Record<string, unknown>; readonly options: Record<string, unknown> }> = [];
+	const notifications: Array<{ readonly message: string; readonly level: string }> = [];
+	const statuses: Array<string | undefined> = [];
+	const oldCore = {
+		endpoint: { relay: "wolfpack-pi-tasks-v2", id: "old-endpoint" },
+		async connect(): Promise<void> {
+			oldConnects += 1;
+			if (oldConnects > 1 && relayLossCode === "RELAY_RESET") throw new TaskProtocolError(relayLossCode, "relay lifetime was replaced", { retryable: false });
+		},
+		async flushOutbox(): Promise<void> {
+			oldFlushes += 1;
+			if (oldFlushes > 1 && relayLossCode === "RELAY_REBIND_REQUIRED") throw new TaskProtocolError(relayLossCode, "relay lifetime was replaced", { retryable: false });
+		},
+		async evaluateTimeouts(): Promise<void> { oldEvaluations += 1; },
+		async receive(): Promise<readonly []> { oldReceives += 1; return []; },
+		listTasks: () => [
+			{ taskId: "active-task", status: "active" },
+			{ taskId: "completed-task", status: "completed" },
+		],
+		close(): Promise<void> { if (!oldClosing) { oldCloses += 1; oldClosing = Promise.resolve(); } return oldClosing; },
+	} as unknown as TaskCore & { close(): Promise<void> };
+	const freshCore = {
+		endpoint: { relay: "wolfpack-pi-tasks-v2", id: "fresh-endpoint" },
+		async connect(): Promise<void> { if (freshConnectionError) throw freshConnectionError; },
+		async flushOutbox(): Promise<void> { undefined; },
+		async evaluateTimeouts(): Promise<void> { undefined; },
+		async receive(): Promise<readonly []> { return []; },
+		listTasks: () => [],
+		getTask: () => undefined,
+		async createTask(): Promise<{ readonly taskId: string }> { freshCreates += 1; return { taskId: "fresh-task" }; },
+		async close(): Promise<void> { undefined; },
+	} as unknown as TaskCore & { close(): Promise<void> };
+	const context = {
+		isIdle: (): boolean => true,
+		hasPendingMessages: (): boolean => false,
+		sessionManager: { getEntries: (): readonly unknown[] => [] },
+		ui: {
+			setStatus: (_key: string, value: string | undefined): void => { statuses.push(value); },
+			theme: { fg: (_color: string, text: string): string => text },
+			notify: (message: string, level: string): void => { notifications.push({ message, level }); },
+		},
+	};
+	registerAgentTaskTools({
+		on(event: string, handler: unknown): void {
+			if (event === "session_start") sessionStart = handler as (event: unknown, context: unknown) => Promise<unknown>;
+			if (event === "agent_settled") agentSettled = handler as (event: unknown, context: unknown) => Promise<unknown>;
+			if (event === "session_shutdown") sessionShutdown = handler as () => Promise<void>;
+		},
+		registerTool(tool: unknown): void { const value = tool as Tool; tools[value.name] = value; },
+		sendMessage(message: Record<string, unknown>, options: Record<string, unknown>): void { messages.push({ message, options }); },
+	} as unknown as ExtensionAPI, undefined, async (_signal, rebind) => {
+		factoryModes.push(rebind === true);
+		if (factoryModes.length === 1) return oldCore;
+		if (factoryModes.length === 2) throw new TaskProtocolError("RELAY_UNAVAILABLE", "fresh registration unavailable");
+		return freshCore;
+	});
+
+	try {
+		await sessionStart!({}, context);
+		await agentSettled!({}, context);
+
+		expect(factoryModes).toEqual([false, true]);
+		expect(oldEvaluations).toBe(1);
+		expect(oldReceives).toBe(1);
+		expect(oldCloses).toBe(1);
+		expect(messages).toEqual([{
+			message: {
+				customType: "pi-tasks-relay-loss",
+				content: "## task failed locally\ntask: `active-task`\n\nRelay state was lost; the remote outcome is unknown.",
+				display: true,
+				details: { taskId: "active-task", status: "failed", error: { code: "RELAY_STATE_LOST", message: "relay state was lost; remote outcome is unknown", retryable: false }, remoteOutcome: "unknown" },
+			},
+			options: { triggerTurn: false },
+		}]);
+		expect(notifications).toEqual([]);
+		expect(statuses.at(-1)).toBe("tasks: relay unavailable");
+
+		await agentSettled!({}, context);
+		expect(factoryModes).toEqual([false, true, false]);
+		expect(messages).toHaveLength(1);
+		expect(notifications).toEqual([{ message: "Relay state was lost; automatically bound a fresh endpoint. 1 active task was marked locally failed with unknown remote outcome.", level: "warning" }]);
+		expect(statuses.at(-1)).toBeUndefined();
+		const historical = await tools.agent_task_status!.execute("status", { taskId: "active-task" }, new AbortController().signal, undefined, context);
+		expect((historical.details as { readonly error: { readonly code: string } }).error.code).toBe("UNKNOWN_TASK");
+
+		const sent = await tools.agent_task_send!.execute("fresh", { to: freshCore.endpoint, task: "new work" }, new AbortController().signal, undefined, context);
+		expect(sent.details).toEqual({ taskId: "fresh-task" });
+		expect(freshCreates).toBe(1);
+
+		freshConnectionError = new TaskProtocolError("RELAY_AUTH_REQUIRED", "authentication required", { retryable: false });
+		await agentSettled!({}, context);
+		expect(factoryModes).toEqual([false, true, false]);
+		expect(messages).toHaveLength(1);
+		expect(notifications).toHaveLength(1);
+		expect(statuses.at(-1)).toBe("tasks: Wolfpack authentication required");
+	} finally {
+		await sessionShutdown?.();
+	}
+});
+
 test("retries a rejected configured core during a later lifecycle inbox refresh", async () => {
 	let sessionStart: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
 	let agentEnd: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;

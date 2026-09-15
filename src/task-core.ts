@@ -1,6 +1,5 @@
 import {
 	MAX_RELAY_PAYLOAD_BYTES,
-	INVALID_RELAY_METADATA,
 	ORIGIN_CANCELLATION_OPERATION,
 	PARENT_ACKNOWLEDGMENT_OPERATION,
 	TASK_PROTOCOL_VERSION,
@@ -10,6 +9,7 @@ import {
 	TaskEnvelopeKind,
 	TaskOutboxDeliveryError,
 	TaskProtocolError,
+	isBlockedOutboxDeliveryCode,
 } from "./task-protocol";
 import type {
 	RelayDelivery,
@@ -25,7 +25,6 @@ import type { TaskStore } from "./task-store";
 
 const RECEIVE_PAGE_SIZE = 100;
 const DELIVERY_EVIDENCE_OPERATION = "delivery_evidence";
-const TERMINAL_DELIVERY_CODES = new Set(["TARGET_NOT_REGISTERED", INVALID_RELAY_METADATA, "DELIVERY_UNCONFIRMED", "ENVELOPE_EXPIRED", "ENVELOPE_CONFLICT", "CROSS_RELAY_ENDPOINT"]);
 const TERMINAL_STATUSES = new Set<TaskRecord["status"]>(["completed", "failed", "cancelled", "timed_out"]);
 const TERMINAL_EVENTS = new Set(["task.completed", "task.failed", "task.cancelled", "task.timed_out"]);
 const CANONICAL_EVENTS = new Set([
@@ -401,7 +400,7 @@ async function flush(options: TaskCoreOptions, signal: AbortSignal | undefined, 
 			options.store.transaction(() => { options.store.markOutboxAccepted(record.envelope.envelopeId); });
 		} catch (error) {
 			if (signal?.aborted || (error instanceof TaskProtocolError && error.code === "ABORTED")) throw error;
-			if (error instanceof TaskProtocolError && TERMINAL_DELIVERY_CODES.has(error.code) && !error.retryable) {
+			if (error instanceof TaskProtocolError && isBlockedOutboxDeliveryCode(error.code) && !error.retryable) {
 				options.store.transaction(() => {
 					options.store.quarantineOutbox(record.envelope.envelopeId, {
 						errorCode: error.code,

@@ -5,6 +5,19 @@ export const ORIGIN_CANCELLATION_OPERATION = "origin_cancellation";
 export const PARENT_ACKNOWLEDGMENT_OPERATION = "parent_acknowledgment";
 export const TERMINAL_INTENT_OPERATION = "terminal_intent";
 
+const BLOCKED_OUTBOX_DELIVERY_CODES: ReadonlySet<string> = new Set([
+	"TARGET_NOT_REGISTERED",
+	INVALID_RELAY_METADATA,
+	"DELIVERY_UNCONFIRMED",
+	"ENVELOPE_EXPIRED",
+	"ENVELOPE_CONFLICT",
+	"CROSS_RELAY_ENDPOINT",
+]);
+
+export function isBlockedOutboxDeliveryCode(code: string): boolean {
+	return BLOCKED_OUTBOX_DELIVERY_CODES.has(code);
+}
+
 export const TaskDeliveryStage = {
 	receiverRecorded: "receiver_recorded",
 	piInsertion: "pi_insertion",

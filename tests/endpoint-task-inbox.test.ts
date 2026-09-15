@@ -4,7 +4,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { createInMemoryTaskRelay } from "../src/in-memory-task-relay";
 import { createTaskCore } from "../src/task-core";
 import { createTaskStore } from "../src/task-store";
-import { TASK_PROTOCOL_VERSION } from "../src/task-protocol";
+import { TASK_PROTOCOL_VERSION, TaskProtocolError } from "../src/task-protocol";
+import type { TaskRelay } from "../src/task-protocol";
 import { deliverTaskInbox } from "../src/task-inbox";
 
 const origin = { relay: "memory", id: "origin" };
@@ -173,6 +174,66 @@ test("origin acknowledges raw receiver intents before rendering their canonical 
 		expect.objectContaining({ type: "custom_message", content: expect.stringContaining("progress") }),
 		expect.objectContaining({ type: "custom_message", content: expect.stringContaining("finished") }),
 	]));
+});
+
+test("retains retryable delivery evidence before advancing past preserved nonretryable evidence", async () => {
+	const backing = createInMemoryTaskRelay("memory");
+	let peerFailure: "retryable" | "blocked" | undefined;
+	const relay: TaskRelay = {
+		id: backing.id,
+		connect: (input) => backing.connect(input),
+		resolve: (input) => backing.resolve(input),
+		send: async (input) => {
+			if (peerFailure !== undefined && input.source.id === origin.id && input.target.id === receiver.id && input.kind === "canonical_event") {
+				if (peerFailure === "retryable") throw new TaskProtocolError("RELAY_UNAVAILABLE", "relay is temporarily unavailable");
+				throw new TaskProtocolError("DELIVERY_UNCONFIRMED", "peer delivery outcome is unknown", {
+					retryable: false,
+					details: { mayHaveBeenDelivered: true },
+				});
+			}
+			return backing.send(input);
+		},
+		receive: (input) => backing.receive(input),
+		acknowledgeDelivery: (input) => backing.acknowledgeDelivery(input),
+	};
+	const parentStore = createTaskStore();
+	const childStore = createTaskStore();
+	const parent = createTaskCore({ endpoint: origin, relay, store: parentStore, ids: ids("parent") });
+	const child = createTaskCore({ endpoint: receiver, relay, store: childStore, ids: ids("child") });
+	const entries: unknown[] = [];
+	const pi = {
+		sendMessage(message: { readonly customType: string; readonly content: string; readonly details: unknown }) {
+			entries.push({ type: "custom_message", customType: message.customType, content: message.content, details: message.details });
+		},
+		appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); },
+	};
+	const context = { isIdle: (): boolean => true, hasPendingMessages: (): boolean => false, sessionManager: { getEntries: (): readonly unknown[] => entries } };
+
+	try {
+		await parent.connect();
+		await child.connect();
+		const created = await parent.createTask({ target: receiver, task: "implement", timeoutMs: 1_000 });
+		await child.receive();
+		await child.submitIntent({ taskId: created.taskId, type: "task.information", payload: { message: "first" } });
+		await child.submitIntent({ taskId: created.taskId, type: "task.information", payload: { message: "second" } });
+		expect(await parent.receive()).toEqual([]); // Canonicalize both raw intents before the peer disappears.
+		const cursorBeforeEvidence = parentStore.getReceiveCursor();
+		peerFailure = "retryable";
+
+		await expect(deliverTaskInbox(pi, parent, context)).rejects.toMatchObject({ code: "RELAY_UNAVAILABLE", retryable: true });
+		expect(parentStore.getReceiveCursor()).toBe(cursorBeforeEvidence);
+
+		peerFailure = "blocked";
+		const degradation = await deliverTaskInbox(pi, parent, context);
+
+		expect(degradation).toMatchObject({ code: "DELIVERY_UNCONFIRMED", retryable: false });
+		expect(entries.filter((entry) => typeof entry === "object" && entry !== null && "customType" in entry && entry.customType === "pi-tasks-event")).toHaveLength(2);
+		expect(parentStore.quarantinedOutbox()).not.toHaveLength(0);
+		await expect(deliverTaskInbox(pi, parent, context)).resolves.toBeUndefined();
+	} finally {
+		parentStore.close();
+		childStore.close();
+	}
 });
 
 test("origin acknowledges raw receiver intents and renders their canonical message and completion once", async () => {

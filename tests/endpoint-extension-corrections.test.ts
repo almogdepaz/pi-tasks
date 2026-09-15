@@ -196,6 +196,66 @@ test("reports receive-created delivery failures as outbox degradation", async ()
 	}
 });
 
+test("reports inbox delivery evidence failure as outbox degradation after advancing the event", async () => {
+	let sessionStart: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
+	let sessionShutdown: (() => void) | undefined;
+	const statuses: Array<string | undefined> = [];
+	const entries: unknown[] = [];
+	let acknowledgements = 0;
+	const source = { relay: "memory", id: "receiver" };
+	const target = { relay: "memory", id: "origin" };
+	const delivery = {
+		cursor: "1",
+		envelope: {
+			envelopeId: "event-envelope", protocolVersion: TASK_PROTOCOL_VERSION, source, target, taskId: "task-1", kind: TaskEnvelopeKind.canonicalEvent,
+			payload: JSON.stringify({ eventId: "event-1", taskId: "task-1", type: "task.information", sequence: "2", source: target, target: source, occurredAt: 1, payload: { message: "peer reply" } }),
+		},
+	} as const;
+	const core = {
+		async connect(): Promise<void> { undefined; },
+		async flushOutbox(): Promise<void> { undefined; },
+		async evaluateTimeouts(): Promise<void> { undefined; },
+		async receive() { return acknowledgements === 0 ? [delivery] : []; },
+		async recordInsertion(): Promise<never> {
+			throw new TaskOutboxDeliveryError("DELIVERY_UNCONFIRMED", "peer delivery outcome is unknown", {
+				retryable: false,
+				details: { mayHaveBeenDelivered: true },
+			});
+		},
+		async submitIntent(): Promise<void> { undefined; },
+		async acknowledgeRelayDelivery(): Promise<void> { acknowledgements += 1; },
+	} as unknown as TaskCore;
+	const context = {
+		isIdle: (): boolean => true,
+		hasPendingMessages: (): boolean => false,
+		sessionManager: { getEntries: (): readonly unknown[] => entries },
+		ui: {
+			setStatus: (_key: string, value: string | undefined): void => { statuses.push(value); },
+			theme: { fg: (_color: string, text: string): string => text },
+		},
+	};
+	registerAgentTaskTools({
+		on(event: string, handler: unknown): void {
+			if (event === "session_start") sessionStart = handler as (event: unknown, context: unknown) => Promise<unknown>;
+			if (event === "session_shutdown") sessionShutdown = handler as () => void;
+		},
+		registerTool(): void { undefined; },
+		sendMessage(message: { readonly customType: string; readonly details: unknown }): void {
+			entries.push({ type: "custom_message", customType: message.customType, details: message.details });
+		},
+		appendEntry(customType: string, data: unknown): void { entries.push({ type: "custom", customType, data }); },
+	} as unknown as ExtensionAPI, core);
+
+	try {
+		await sessionStart!({}, context);
+		expect(acknowledgements).toBe(1);
+		expect(statuses.at(-1)).toBe("tasks: outbox degraded");
+		expect(entries).toContainEqual(expect.objectContaining({ type: "custom_message", customType: "pi-tasks-event" }));
+	} finally {
+		sessionShutdown?.();
+	}
+});
+
 test("does not mislabel relay failures during outbox delivery as degradation", async () => {
 	let sessionStart: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
 	let sessionShutdown: (() => void) | undefined;

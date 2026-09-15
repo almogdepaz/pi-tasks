@@ -1,5 +1,5 @@
 import type { TaskCore } from "./task-core";
-import { TaskDeliveryEvidenceState, TaskDeliveryStage, TaskEnvelopeKind, TaskProtocolError } from "./task-protocol";
+import { TaskDeliveryEvidenceState, TaskDeliveryStage, TaskEnvelopeKind, TaskOutboxDeliveryError, TaskProtocolError, isBlockedOutboxDeliveryCode } from "./task-protocol";
 import type { RelayDelivery, TaskEvent } from "./task-protocol";
 
 const TASK_EVENT_CUSTOM_TYPE = "pi-tasks-event";
@@ -33,9 +33,10 @@ type DeliveryEvidencePayload =
 	| { readonly stage: typeof TaskDeliveryStage.piInsertion; readonly state: typeof TaskDeliveryEvidenceState.blocked; readonly retryable: true };
 
 /** Persists model-visible Pi evidence before advancing the relay cursor, then starts one separate turn. */
-export async function deliverTaskInbox(pi: InboxPi, core: TaskCore, context: InboxContext, signal?: AbortSignal): Promise<void> {
-	if (context.hasPendingMessages()) return;
+export async function deliverTaskInbox(pi: InboxPi, core: TaskCore, context: InboxContext, signal?: AbortSignal): Promise<TaskOutboxDeliveryError | undefined> {
+	if (context.hasPendingMessages()) return undefined;
 	const deliveries = await core.receive(signal);
+	let outboxError: TaskOutboxDeliveryError | undefined;
 	for (const delivery of deliveries) {
 		if (delivery.envelope.kind === TaskEnvelopeKind.intent) {
 			await core.acknowledgeRelayDelivery(delivery.cursor, signal);
@@ -44,7 +45,7 @@ export async function deliverTaskInbox(pi: InboxPi, core: TaskCore, context: Inb
 		}
 		const event = inboxEvent(delivery);
 		if (!isKnownEvent(event.type)) throw new TaskProtocolError("UNKNOWN_EVENT", `unknown task inbox event type: ${event.type}`);
-		if (context.hasPendingMessages()) return;
+		if (context.hasPendingMessages()) return outboxError;
 		const eventDetails = { taskId: event.taskId, eventId: event.eventId };
 		const eventKey = key(event.taskId, event.eventId);
 		if (!isModelVisible(event.type) && !recordedEventKeys(context.sessionManager.getEntries()).has(eventKey)) {
@@ -53,11 +54,12 @@ export async function deliverTaskInbox(pi: InboxPi, core: TaskCore, context: Inb
 			pi.appendEntry(TASK_RECORD_CUSTOM_TYPE, { ...eventDetails, event });
 		}
 		if (event.type === "task.created") {
-			await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.receiverRecorded, state: TaskDeliveryEvidenceState.confirmed }, signal);
+			const evidenceError = await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.receiverRecorded, state: TaskDeliveryEvidenceState.confirmed }, signal);
+			outboxError ??= evidenceError;
 		}
 		let incorporated = incorporatedEvents(context.sessionManager.getEntries()).has(eventKey);
 		if (!incorporated && isModelVisible(event.type)) {
-			if (!context.isIdle()) return;
+			if (!context.isIdle()) return outboxError;
 			pi.sendMessage({
 				customType: TASK_EVENT_CUSTOM_TYPE,
 				content: renderTaskEvent(event),
@@ -66,16 +68,19 @@ export async function deliverTaskInbox(pi: InboxPi, core: TaskCore, context: Inb
 			}, { triggerTurn: false });
 			incorporated = incorporatedEvents(context.sessionManager.getEntries()).has(eventKey);
 			if (!incorporated) {
-				await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.piInsertion, state: TaskDeliveryEvidenceState.blocked, retryable: true }, signal);
-				return;
+				const evidenceError = await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.piInsertion, state: TaskDeliveryEvidenceState.blocked, retryable: true }, signal);
+				outboxError ??= evidenceError;
+				return outboxError;
 			}
 		}
 		if (isModelVisible(event.type)) {
-			await core.recordInsertion(eventDetails, signal);
+			const insertionError = await settleDeliveryEvidence(() => core.recordInsertion(eventDetails, signal));
+			outboxError ??= insertionError;
 			let wakeAccepted = taskMessageKeys(context.sessionManager.getEntries(), TASK_WAKE_CUSTOM_TYPE).has(eventKey);
 			if (!wakeAccepted) {
-				if (!context.isIdle()) return;
-				await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.wakeRequested, state: TaskDeliveryEvidenceState.confirmed }, signal);
+				if (!context.isIdle()) return outboxError;
+				const wakeRequestError = await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.wakeRequested, state: TaskDeliveryEvidenceState.confirmed }, signal);
+				outboxError ??= wakeRequestError;
 				pi.sendMessage({
 					customType: TASK_WAKE_CUSTOM_TYPE,
 					content: "Process the pending Pi task event.",
@@ -83,17 +88,29 @@ export async function deliverTaskInbox(pi: InboxPi, core: TaskCore, context: Inb
 					details: eventDetails,
 				}, { triggerTurn: true, deliverAs: "followUp" });
 				wakeAccepted = taskMessageKeys(context.sessionManager.getEntries(), TASK_WAKE_CUSTOM_TYPE).has(eventKey);
-				if (!wakeAccepted) return;
+				if (!wakeAccepted) return outboxError;
 			}
-			await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.wakeAccepted, state: TaskDeliveryEvidenceState.confirmed }, signal);
+			const wakeAcceptanceError = await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.wakeAccepted, state: TaskDeliveryEvidenceState.confirmed }, signal);
+			outboxError ??= wakeAcceptanceError;
 		}
 		await core.acknowledgeRelayDelivery(delivery.cursor, signal);
 		pi.appendEntry(TASK_CURSOR_CUSTOM_TYPE, { cursor: delivery.cursor });
 	}
+	return outboxError;
 }
 
-async function recordDeliveryEvidence(core: TaskCore, event: TaskEventDetails, evidence: DeliveryEvidencePayload, signal?: AbortSignal): Promise<void> {
-	await core.submitIntent({ taskId: event.taskId, type: "task.delivery_receipt", payload: { eventId: event.eventId, ...evidence } }, signal);
+async function recordDeliveryEvidence(core: TaskCore, event: TaskEventDetails, evidence: DeliveryEvidencePayload, signal?: AbortSignal): Promise<TaskOutboxDeliveryError | undefined> {
+	return settleDeliveryEvidence(() => core.submitIntent({ taskId: event.taskId, type: "task.delivery_receipt", payload: { eventId: event.eventId, ...evidence } }, signal));
+}
+
+async function settleDeliveryEvidence(operation: () => Promise<void>): Promise<TaskOutboxDeliveryError | undefined> {
+	try {
+		await operation();
+		return undefined;
+	} catch (error) {
+		if (error instanceof TaskOutboxDeliveryError && !error.retryable && isBlockedOutboxDeliveryCode(error.code)) return error;
+		throw error;
+	}
 }
 
 function inboxEvent(delivery: RelayDelivery): TaskEvent {

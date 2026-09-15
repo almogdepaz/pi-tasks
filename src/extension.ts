@@ -5,7 +5,7 @@ import { Type } from "typebox";
 
 import { abortableSleep } from "./abortable-sleep";
 import { deliverTaskInbox, incorporatedTaskEvents } from "./task-inbox";
-import { TaskDeliveryEvidenceState, TaskDeliveryStage, TaskOutboxDeliveryError, TaskProtocolError } from "./task-protocol";
+import { TaskDeliveryEvidenceState, TaskDeliveryStage, TaskOutboxDeliveryError, TaskProtocolError, isBlockedOutboxDeliveryCode } from "./task-protocol";
 import { createConfiguredTaskCore } from "./configured-task-core";
 import type { OwnedTaskCore } from "./configured-task-core";
 import type { SubmitIntentInput, SubmitIntentOutcome, TaskCore } from "./task-core";
@@ -143,7 +143,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 				if (isCurrent()) await activeCore.recordInsertion(input, insertionSignal);
 			},
 		};
-		await deliverTaskInbox({
+		const inboxOutboxError = await deliverTaskInbox({
 			sendMessage(message, options) { if (isCurrent()) pi.sendMessage(message, options); },
 			appendEntry(customType, data) { if (isCurrent()) pi.appendEntry(customType, data); },
 		}, guardedCore, {
@@ -151,7 +151,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 			hasPendingMessages: (): boolean => !isCurrent() || context.hasPendingMessages(),
 			sessionManager: context.sessionManager,
 		}, signal);
-		return outboxError;
+		return outboxError ?? inboxOutboxError;
 	});
 	const startBackgroundRefresh = (context: ExtensionContext, epoch: number): void => {
 		inboxContext = context;
@@ -502,7 +502,7 @@ function outboxFailureStatus(error: unknown): string {
 		if (error.code === "RELAY_PROFILE_REQUIRED") return "tasks: compatible memory-owned relay required";
 		if (error.code === "RELAY_AUTH_REQUIRED") return "tasks: Wolfpack authentication required";
 	}
-	return error instanceof TaskOutboxDeliveryError && error.code === TARGET_NOT_REGISTERED_CODE ? "tasks: outbox degraded" : "tasks: relay unavailable";
+	return error instanceof TaskOutboxDeliveryError && isBlockedOutboxDeliveryCode(error.code) ? "tasks: outbox degraded" : "tasks: relay unavailable";
 }
 
 function isRelayLoss(error: unknown): error is TaskProtocolError {

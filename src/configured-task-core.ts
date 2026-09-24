@@ -1,4 +1,4 @@
-import type { TaskCore } from "./task-core";
+import type { TaskCore, WakeRequest } from "./task-core";
 import { TaskProtocolError } from "./task-protocol";
 import { createTaskStore } from "./task-store";
 import { createVolatileTaskSession } from "./volatile-task-session";
@@ -36,6 +36,11 @@ export async function createConfiguredTaskCore(options: ConfiguredTaskCoreOption
     const active = new Set<Promise<unknown>>();
     let closed = false, closing: Promise<void> | undefined;
     const owned = { ...core } as OwnedTaskCore;
+    const track = <T>(result: Promise<T>): Promise<T> => {
+      active.add(result);
+      void result.then(() => active.delete(result), () => active.delete(result));
+      return result;
+    };
     for (const [key, value] of Object.entries(core)) {
       if (typeof value !== "function") continue;
       Object.defineProperty(owned, key, { enumerable: true, value: (...args: unknown[]) => {
@@ -43,10 +48,14 @@ export async function createConfiguredTaskCore(options: ConfiguredTaskCoreOption
         // Core methods may call sibling methods through `this` (notably intent ACK).
         // Keep their original receiver while the outer promise owns the full operation.
         const result: unknown = value.apply(core, args);
-        if (!(result instanceof Promise)) return result;
-        active.add(result);
-        void result.then(() => active.delete(result), () => active.delete(result));
-        return result;
+        if (key === "recordWakeRequest") {
+          const request = result as WakeRequest;
+          return { flush: (signal?: AbortSignal): Promise<void> => {
+            if (closed) throw new TaskProtocolError("RELAY_CLOSED", "task session is closed", { retryable: false });
+            return track(request.flush(signal));
+          } };
+        }
+        return result instanceof Promise ? track(result) : result;
       } });
     }
     owned.close = () => {

@@ -201,6 +201,9 @@ test("reports inbox delivery evidence failure as outbox degradation after advanc
 	let sessionShutdown: (() => void) | undefined;
 	const statuses: Array<string | undefined> = [];
 	const entries: unknown[] = [];
+	const wakeOrder: string[] = [];
+	let wakeRequests = 0;
+	let wakeFlushes = 0;
 	let acknowledgements = 0;
 	const source = { relay: "memory", id: "receiver" };
 	const target = { relay: "memory", id: "origin" };
@@ -211,7 +214,11 @@ test("reports inbox delivery evidence failure as outbox degradation after advanc
 			payload: JSON.stringify({ eventId: "event-1", taskId: "task-1", type: "task.information", sequence: "2", source: target, target: source, occurredAt: 1, payload: { message: "peer reply" } }),
 		},
 	} as const;
-	const core = {
+	const core: TaskCore = {
+		endpoint: source,
+		async createTask() { return { taskId: "created-task" }; },
+		getTask() { return undefined; },
+		listTasks() { return []; },
 		async connect(): Promise<void> { undefined; },
 		async flushOutbox(): Promise<void> { undefined; },
 		async evaluateTimeouts(): Promise<void> { undefined; },
@@ -223,8 +230,14 @@ test("reports inbox delivery evidence failure as outbox degradation after advanc
 			});
 		},
 		async submitIntent(): Promise<void> { undefined; },
+		recordWakeRequest() {
+			wakeRequests += 1;
+			wakeOrder.push("request");
+			return { async flush(): Promise<void> { wakeFlushes += 1; wakeOrder.push("flush"); } };
+		},
 		async acknowledgeRelayDelivery(): Promise<void> { acknowledgements += 1; },
-	} as unknown as TaskCore;
+		async acknowledgeParent(): Promise<void> { undefined; },
+	};
 	const context = {
 		isIdle: (): boolean => true,
 		hasPendingMessages: (): boolean => false,
@@ -241,6 +254,7 @@ test("reports inbox delivery evidence failure as outbox degradation after advanc
 		},
 		registerTool(): void { undefined; },
 		sendMessage(message: { readonly customType: string; readonly details: unknown }): void {
+			wakeOrder.push(message.customType === "pi-tasks-wake" ? "wake" : "event");
 			entries.push({ type: "custom_message", customType: message.customType, details: message.details });
 		},
 		appendEntry(customType: string, data: unknown): void { entries.push({ type: "custom", customType, data }); },
@@ -250,6 +264,9 @@ test("reports inbox delivery evidence failure as outbox degradation after advanc
 		await sessionStart!({}, context);
 		expect(acknowledgements).toBe(1);
 		expect(statuses.at(-1)).toBe("tasks: outbox degraded");
+		expect(wakeRequests).toBe(1);
+		expect(wakeFlushes).toBe(1);
+		expect(wakeOrder).toEqual(["event", "request", "wake", "flush"]);
 		expect(entries).toContainEqual(expect.objectContaining({ type: "custom_message", customType: "pi-tasks-event" }));
 	} finally {
 		sessionShutdown?.();
@@ -553,6 +570,11 @@ test("persists an idle task event before sending one separate wake", async () =>
 	let idle = false;
 	let acknowledgements = 0;
 	let recordedInsertions = 0;
+	let releaseWakeFlush!: () => void;
+	let signalWakeFlush!: () => void;
+	const wakeFlush = new Promise<void>((resolve) => { releaseWakeFlush = resolve; });
+	const wakeFlushObserved = new Promise<void>((resolve) => { signalWakeFlush = resolve; });
+	const wakeOrder: string[] = [];
 	const deliveryEvidence = new Set<string>();
 	const entries: unknown[] = [];
 	const sent: Array<{ readonly customType: string; readonly triggerTurn: boolean | undefined }> = [];
@@ -565,15 +587,32 @@ test("persists an idle task event before sending one separate wake", async () =>
 			payload: JSON.stringify({ eventId: "event-1", taskId: "task-1", type: "task.created", sequence: "1", source, target, occurredAt: 1, payload: { task: "implement safely" } }),
 		},
 	} as const;
-	const core = {
+	const core: TaskCore = {
+		endpoint: target,
+		async createTask() { return { taskId: "created-task" }; },
+		getTask() { return undefined; },
+		listTasks() { return []; },
 		async connect(): Promise<void> { undefined; },
 		async flushOutbox(): Promise<void> { undefined; },
 		async evaluateTimeouts(): Promise<void> { undefined; },
 		async receive() { return acknowledgements === 0 ? [delivery] : []; },
-		async submitIntent(input: { readonly payload: { readonly stage: string; readonly state: string } }): Promise<void> { deliveryEvidence.add(`${input.payload.stage}:${input.payload.state}`); },
+		async submitIntent(input): Promise<void> {
+			const { stage, state } = input.payload;
+			if (typeof stage === "string" && typeof state === "string") deliveryEvidence.add(`${stage}:${state}`);
+		},
 		async recordInsertion(): Promise<void> { recordedInsertions = 1; },
+		recordWakeRequest() {
+			deliveryEvidence.add("wake_requested:confirmed");
+			wakeOrder.push("request");
+			return { flush: async (): Promise<void> => {
+				wakeOrder.push("flush");
+				signalWakeFlush();
+				await wakeFlush;
+			} };
+		},
 		async acknowledgeRelayDelivery(): Promise<void> { acknowledgements += 1; },
-	} as unknown as TaskCore;
+		async acknowledgeParent(): Promise<void> { undefined; },
+	};
 	const context = {
 		isIdle: (): boolean => idle,
 		hasPendingMessages: (): boolean => false,
@@ -590,6 +629,7 @@ test("persists an idle task event before sending one separate wake", async () =>
 		sendMessage(message: { readonly customType: string; readonly details?: unknown }, options?: { readonly triggerTurn?: boolean }): void {
 			sent.push({ customType: message.customType, triggerTurn: options?.triggerTurn });
 			if (message.customType === "pi-tasks-event") entries.push({ type: "custom_message", customType: message.customType, details: message.details });
+			if (message.customType === "pi-tasks-wake") { wakeOrder.push("wake"); entries.push({ type: "custom_message", customType: message.customType, details: message.details }); }
 		},
 		appendEntry(customType: string, data: unknown): void { entries.push({ type: "custom", customType, data }); },
 	} as unknown as ExtensionAPI, core);
@@ -600,23 +640,88 @@ test("persists an idle task event before sending one separate wake", async () =>
 		expect(acknowledgements).toBe(0);
 
 		idle = true;
-		await agentSettled!({}, context);
+		const settled = agentSettled!({}, context);
+		await wakeFlushObserved;
 		expect(sent).toEqual([
 			{ customType: "pi-tasks-event", triggerTurn: false },
 			{ customType: "pi-tasks-wake", triggerTurn: true },
 		]);
 		expect(entries.filter((entry) => typeof entry === "object" && entry !== null && "customType" in entry && entry.customType === "pi-tasks-event")).toHaveLength(1);
 		expect(recordedInsertions).toBe(1);
+		expect(wakeOrder).toEqual(["request", "wake", "flush"]);
 		expect(acknowledgements).toBe(0);
 
-		entries.push({ type: "custom_message", customType: "pi-tasks-wake", details: { taskId: "task-1", eventId: "event-1" } });
-		await agentSettled!({}, context);
+		releaseWakeFlush();
+		await settled;
 		expect(sent).toHaveLength(2);
 		expect(recordedInsertions).toBe(1);
 		expect(acknowledgements).toBe(1);
 		expect([...deliveryEvidence]).toEqual(["receiver_recorded:confirmed", "wake_requested:confirmed", "wake_accepted:confirmed"]);
 	} finally {
 		sessionShutdown?.();
+	}
+});
+
+test("does not flush or acknowledge a captured wake request after session shutdown replaces its lifecycle", async () => {
+	let sessionStart: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
+	let sessionShutdown: (() => Promise<unknown>) | undefined;
+	let acknowledgements = 0;
+	let wakeRequests = 0;
+	let wakeFlushes = 0;
+	const entries: unknown[] = [];
+	const source = { relay: "memory", id: "parent" };
+	const target = { relay: "memory", id: "receiver" };
+	const delivery = {
+		cursor: "1",
+		envelope: {
+			envelopeId: "assignment-envelope", protocolVersion: TASK_PROTOCOL_VERSION, source, target, taskId: "task-1", kind: TaskEnvelopeKind.canonicalEvent,
+			payload: JSON.stringify({ eventId: "event-1", taskId: "task-1", type: "task.created", sequence: "1", source, target, occurredAt: 1, payload: { task: "stop before relay" } }),
+		},
+	} as const;
+	const core: TaskCore = {
+		endpoint: target,
+		async createTask() { return { taskId: "created-task" }; },
+		getTask() { return undefined; },
+		listTasks() { return []; },
+		async connect(): Promise<void> { undefined; },
+		async flushOutbox(): Promise<void> { undefined; },
+		async evaluateTimeouts(): Promise<void> { undefined; },
+		async receive() { return acknowledgements === 0 ? [delivery] : []; },
+		async recordInsertion(): Promise<void> { undefined; },
+		recordWakeRequest() {
+			wakeRequests += 1;
+			return { async flush(): Promise<void> { wakeFlushes += 1; } };
+		},
+		async submitIntent(): Promise<void> { undefined; },
+		async acknowledgeRelayDelivery(): Promise<void> { acknowledgements += 1; },
+		async acknowledgeParent(): Promise<void> { undefined; },
+	};
+	const context = {
+		isIdle: (): boolean => true,
+		hasPendingMessages: (): boolean => false,
+		sessionManager: { getEntries: (): readonly unknown[] => entries },
+		ui: { setStatus: (): void => undefined, theme: { fg: (_color: string, text: string): string => text } },
+	};
+	registerAgentTaskTools({
+		on(event: string, handler: unknown): void {
+			if (event === "session_start") sessionStart = handler as (event: unknown, context: unknown) => Promise<unknown>;
+			if (event === "session_shutdown") sessionShutdown = handler as () => Promise<unknown>;
+		},
+		registerTool(): void { undefined; },
+		sendMessage(message: { readonly customType: string; readonly details?: unknown }): void {
+			entries.push({ type: "custom_message", customType: message.customType, details: message.details });
+			if (message.customType === "pi-tasks-wake") void sessionShutdown?.();
+		},
+		appendEntry(customType: string, data: unknown): void { entries.push({ type: "custom", customType, data }); },
+	} as unknown as ExtensionAPI, core);
+
+	await sessionStart!({}, context);
+	try {
+		expect(wakeRequests).toBe(1);
+		expect(wakeFlushes).toBe(0);
+		expect(acknowledgements).toBe(0);
+	} finally {
+		await sessionShutdown?.();
 	}
 });
 

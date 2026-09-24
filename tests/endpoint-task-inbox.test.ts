@@ -133,6 +133,279 @@ test("keeps the relay delivery retryable until a separate wake is durably accept
 	]);
 });
 
+test.each(["task.completed", "task.failed", "task.cancelled", "task.timed_out"] as const)("retains an acknowledged %s event without waking the parent again", async (terminalType) => {
+	const relay = createInMemoryTaskRelay("memory");
+	const parentStore = createTaskStore(), childStore = createTaskStore();
+	const terminalStatus = {
+		"task.completed": "completed",
+		"task.failed": "failed",
+		"task.cancelled": "cancelled",
+		"task.timed_out": "timed_out",
+	} as const;
+	let now = 0;
+	const parent = createTaskCore({ endpoint: origin, relay, store: parentStore, ids: ids("parent"), clock: { now: (): number => now } });
+	const child = createTaskCore({ endpoint: receiver, relay, store: childStore, ids: ids("child") });
+	const entries: unknown[] = [];
+	const wakes: unknown[] = [];
+	const pi = {
+		sendMessage(message: { readonly customType: string; readonly details: unknown }, options: { readonly triggerTurn: boolean }) {
+			entries.push({ type: "custom_message", ...message });
+			if (options.triggerTurn) wakes.push(message);
+		},
+		appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); },
+	};
+	let idle = false;
+	const context = { isIdle: (): boolean => idle, hasPendingMessages: (): boolean => false, sessionManager: { getEntries: (): readonly unknown[] => entries } };
+	try {
+		await parent.connect(); await child.connect();
+		const created = await parent.createTask({ target: receiver, task: "report a blocker", timeoutMs: 1 });
+		await child.receive();
+		if (terminalType === "task.timed_out") {
+			now = 1;
+			await parent.evaluateTimeouts();
+		} else {
+			await child.submitIntent({ taskId: created.taskId, type: terminalType, payload: { summary: "blocked" } });
+		}
+
+		// Background receive exposes canonical status while the parent is busy;
+		// the terminal notification cannot be inserted until that turn ends.
+		await deliverTaskInbox(pi, parent, context);
+		await deliverTaskInbox(pi, parent, context);
+		const task = parent.getTask(created.taskId);
+		expect(task?.status).toBe(terminalStatus[terminalType]);
+		const terminal = task?.events.find(event => event.type === terminalType);
+		if (!terminal) throw new Error("expected the canonical terminal event before notification");
+		expect(entries).toEqual([]);
+		await parent.acknowledgeParent(created.taskId);
+
+		idle = true;
+		await deliverTaskInbox(pi, parent, context);
+		await deliverTaskInbox(pi, parent, context);
+		expect(entries).toEqual(expect.arrayContaining([
+			expect.objectContaining({ type: "custom_message", customType: "pi-tasks-event", details: expect.objectContaining({ taskId: created.taskId, eventId: terminal.eventId, event: terminal }) }),
+		]));
+		expect(wakes).toEqual([]);
+		expect(parent.getTask(created.taskId)?.events.filter(event => event.type === "task.delivery_receipt" && event.payload.eventId === terminal.eventId).map(event => event.payload.stage)).toEqual(["pi_inserted"]);
+		expect(await parent.receive()).toEqual([]);
+	} finally { parentStore.close(); childStore.close(); }
+});
+
+test("retries an acknowledged terminal relay ACK without creating a wake receipt", async () => {
+	const relay = createInMemoryTaskRelay("memory");
+	const parentStore = createTaskStore(), childStore = createTaskStore();
+	const parent = createTaskCore({ endpoint: origin, relay, store: parentStore, ids: ids("parent") });
+	const child = createTaskCore({ endpoint: receiver, relay, store: childStore, ids: ids("child") });
+	const entries: unknown[] = [];
+	const wakes: unknown[] = [];
+	const pi = {
+		sendMessage(message: { readonly customType: string; readonly details: unknown }, options: { readonly triggerTurn: boolean }) {
+			entries.push({ type: "custom_message", ...message });
+			if (options.triggerTurn) wakes.push(message);
+		},
+		appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); },
+	};
+	let idle = false;
+	const context = { isIdle: (): boolean => idle, hasPendingMessages: (): boolean => false, sessionManager: { getEntries: (): readonly unknown[] => entries } };
+	try {
+		await parent.connect(); await child.connect();
+		const created = await parent.createTask({ target: receiver, task: "report a blocker", timeoutMs: 60_000 });
+		await child.receive();
+		await child.submitIntent({ taskId: created.taskId, type: "task.failed", payload: { summary: "blocked" } });
+		await deliverTaskInbox(pi, parent, context);
+		await deliverTaskInbox(pi, parent, context);
+		const terminal = parent.getTask(created.taskId)?.events.find((event) => event.type === "task.failed");
+		if (terminal === undefined) throw new Error("expected the canonical failure before acknowledgment");
+		await parent.acknowledgeParent(created.taskId);
+
+		idle = true;
+		const acknowledge = parent.acknowledgeRelayDelivery.bind(parent);
+		let relayAckFailed = false;
+		const relayAck = spyOn(parent, "acknowledgeRelayDelivery").mockImplementation(async (cursor) => {
+			if (!relayAckFailed) {
+				relayAckFailed = true;
+				throw new Error("fixture relay ACK unavailable");
+			}
+			return acknowledge(cursor);
+		});
+		try {
+			await expect(deliverTaskInbox(pi, parent, context)).rejects.toThrow("fixture relay ACK unavailable");
+			await deliverTaskInbox(pi, parent, context);
+			await deliverTaskInbox(pi, parent, context);
+		} finally { relayAck.mockRestore(); }
+
+		expect(relayAckFailed).toBe(true);
+		expect(wakes).toEqual([]);
+		expect(parent.getTask(created.taskId)?.events.filter(event => event.type === "task.delivery_receipt" && event.payload.eventId === terminal.eventId).map(event => event.payload.stage)).toEqual(["pi_inserted"]);
+		expect(await parent.receive()).toEqual([]);
+	} finally { parentStore.close(); childStore.close(); }
+});
+
+test("retains an issued terminal wake when parent acknowledgment completes during deferred wake-request relay flush", async () => {
+	const backing = createInMemoryTaskRelay("memory");
+	let wakeRequestStarted!: () => void;
+	let releaseWakeRequest!: () => void;
+	const firstWakeRequest = new Promise<void>((resolve) => { wakeRequestStarted = resolve; });
+	const releaseFirstWakeRequest = new Promise<void>((resolve) => { releaseWakeRequest = resolve; });
+	let delayWakeRequest = true;
+	const relay: TaskRelay = {
+		id: backing.id,
+		connect: (input) => backing.connect(input),
+		resolve: (input) => backing.resolve(input),
+		send: async (input) => {
+			const payload = JSON.parse(input.payload) as { readonly type?: string; readonly payload?: { readonly stage?: string } };
+			if (delayWakeRequest && input.source.id === origin.id && input.kind === "canonical_event" && payload.type === "task.delivery_receipt" && payload.payload?.stage === "wake_requested") {
+				delayWakeRequest = false;
+				wakeRequestStarted();
+				await releaseFirstWakeRequest;
+			}
+			return backing.send(input);
+		},
+		receive: (input) => backing.receive(input),
+		acknowledgeDelivery: (input) => backing.acknowledgeDelivery(input),
+	};
+	const parentStore = createTaskStore(), childStore = createTaskStore();
+	const parent = createTaskCore({ endpoint: origin, relay, store: parentStore, ids: ids("parent") });
+	const child = createTaskCore({ endpoint: receiver, relay, store: childStore, ids: ids("child") });
+	const entries: unknown[] = [];
+	const pi = {
+		sendMessage(message: { readonly customType: string; readonly details: unknown }) { entries.push({ type: "custom_message", ...message }); },
+		appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); },
+	};
+	let idle = false;
+	const context = { isIdle: (): boolean => idle, hasPendingMessages: (): boolean => false, sessionManager: { getEntries: (): readonly unknown[] => entries } };
+	try {
+		await parent.connect(); await child.connect();
+		const created = await parent.createTask({ target: receiver, task: "report a blocker", timeoutMs: 60_000 });
+		await child.receive();
+		await child.submitIntent({ taskId: created.taskId, type: "task.failed", payload: { summary: "blocked" } });
+		await deliverTaskInbox(pi, parent, context);
+		await deliverTaskInbox(pi, parent, context);
+		idle = true;
+
+		const delivery = deliverTaskInbox(pi, parent, context);
+		await firstWakeRequest;
+		const wakesBeforeRelayFlush = entries.filter((entry) => typeof entry === "object" && entry !== null && "customType" in entry && entry.customType === "pi-tasks-wake");
+		await parent.acknowledgeParent(created.taskId);
+		releaseWakeRequest();
+		await delivery;
+
+		expect(wakesBeforeRelayFlush).toHaveLength(1);
+		expect(parent.getTask(created.taskId)?.events.some((event) => event.type === "task.parent_acknowledged")).toBe(true);
+		expect(entries.filter((entry) => typeof entry === "object" && entry !== null && "customType" in entry && entry.customType === "pi-tasks-wake")).toHaveLength(1);
+		expect(parent.getTask(created.taskId)?.events.filter((event) => event.type === "task.delivery_receipt").map((event) => event.payload.stage)).toEqual(["pi_inserted", "wake_requested", "wake_accepted"]);
+	} finally {
+		releaseWakeRequest();
+		parentStore.close();
+		childStore.close();
+	}
+});
+
+test("retries wake-request evidence after an ACK without duplicating the already-issued terminal wake", async () => {
+	const backing = createInMemoryTaskRelay("memory");
+	let rejectWakeRequest = true;
+	const relay: TaskRelay = {
+		id: backing.id,
+		connect: (input) => backing.connect(input),
+		resolve: (input) => backing.resolve(input),
+		send: async (input) => {
+			const payload = JSON.parse(input.payload) as { readonly type?: string; readonly payload?: { readonly stage?: string } };
+			if (rejectWakeRequest && input.source.id === origin.id && input.kind === "canonical_event" && payload.type === "task.delivery_receipt" && payload.payload?.stage === "wake_requested") {
+				throw new TaskProtocolError("RELAY_UNAVAILABLE", "wake request relay unavailable");
+			}
+			return backing.send(input);
+		},
+		receive: (input) => backing.receive(input),
+		acknowledgeDelivery: (input) => backing.acknowledgeDelivery(input),
+	};
+	const parentStore = createTaskStore(), childStore = createTaskStore();
+	const parent = createTaskCore({ endpoint: origin, relay, store: parentStore, ids: ids("parent") });
+	const child = createTaskCore({ endpoint: receiver, relay, store: childStore, ids: ids("child") });
+	const entries: unknown[] = [];
+	const pi = {
+		sendMessage(message: { readonly customType: string; readonly details: unknown }) { entries.push({ type: "custom_message", ...message }); },
+		appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); },
+	};
+	let idle = false;
+	const context = { isIdle: (): boolean => idle, hasPendingMessages: (): boolean => false, sessionManager: { getEntries: (): readonly unknown[] => entries } };
+	try {
+		await parent.connect(); await child.connect();
+		const created = await parent.createTask({ target: receiver, task: "report a blocker", timeoutMs: 60_000 });
+		await child.receive();
+		await child.submitIntent({ taskId: created.taskId, type: "task.failed", payload: { summary: "blocked" } });
+		await deliverTaskInbox(pi, parent, context);
+		await deliverTaskInbox(pi, parent, context);
+		idle = true;
+
+		await expect(deliverTaskInbox(pi, parent, context)).rejects.toMatchObject({ code: "RELAY_UNAVAILABLE", retryable: true });
+		expect(entries.filter((entry) => typeof entry === "object" && entry !== null && "customType" in entry && entry.customType === "pi-tasks-wake")).toHaveLength(1);
+		rejectWakeRequest = false;
+		await parent.acknowledgeParent(created.taskId);
+		await deliverTaskInbox(pi, parent, context);
+		await deliverTaskInbox(pi, parent, context);
+
+		expect(entries.filter((entry) => typeof entry === "object" && entry !== null && "customType" in entry && entry.customType === "pi-tasks-wake")).toHaveLength(1);
+		expect(parent.getTask(created.taskId)?.events.filter((event) => event.type === "task.delivery_receipt").map((event) => event.payload.stage)).toEqual(["pi_inserted", "wake_requested", "wake_accepted"]);
+	} finally { parentStore.close(); childStore.close(); }
+});
+
+test.each(["task.information", "task.question", "task.answer"] as const)("delivers parent-authored %s to the child without waking the parent through its own echo", async (type) => {
+	const relay = createInMemoryTaskRelay("memory");
+	const parentStore = createTaskStore(), childStore = createTaskStore();
+	const parent = createTaskCore({ endpoint: origin, relay, store: parentStore, ids: ids("parent") });
+	const child = createTaskCore({ endpoint: receiver, relay, store: childStore, ids: ids("child") });
+	const parentEntries: unknown[] = [];
+	const childEntries: unknown[] = [];
+	const pi = (entries: unknown[]) => ({
+		sendMessage(message: { readonly customType: string; readonly details: unknown }) { entries.push({ type: "custom_message", ...message }); },
+		appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); },
+	});
+	const context = (entries: unknown[]) => ({ isIdle: (): boolean => true, hasPendingMessages: (): boolean => false, sessionManager: { getEntries: (): readonly unknown[] => entries } });
+	try {
+		await parent.connect(); await child.connect();
+		const created = await parent.createTask({ target: receiver, task: "answer a question", timeoutMs: 60_000 });
+		await child.receive();
+		await parent.submitIntent({ taskId: created.taskId, type, payload: { message: "parent-authored" } });
+		const event = parent.getTask(created.taskId)?.events.at(-1);
+		if (event === undefined) throw new Error("expected parent-authored canonical event");
+
+		await deliverTaskInbox(pi(parentEntries), parent, context(parentEntries));
+		await deliverTaskInbox(pi(childEntries), child, context(childEntries));
+
+		expect(parentEntries).toEqual([]);
+		expect(parent.getTask(created.taskId)?.events).toContainEqual(event);
+		expect(childEntries).toEqual(expect.arrayContaining([
+			expect.objectContaining({ type: "custom_message", customType: "pi-tasks-event", details: expect.objectContaining({ taskId: created.taskId, eventId: event.eventId, event }) }),
+		]));
+	} finally { parentStore.close(); childStore.close(); }
+});
+
+test.each(["task.information", "task.question", "task.answer"] as const)("retains origin-authored self-target %s without echoing it into the local inbox", async (type) => {
+	const relay = createInMemoryTaskRelay("memory");
+	const store = createTaskStore();
+	const parent = createTaskCore({ endpoint: origin, relay, store, ids: ids("parent") });
+	const entries: unknown[] = [];
+	const pi = {
+		sendMessage(message: { readonly customType: string; readonly details: unknown }) { entries.push({ type: "custom_message", ...message }); },
+		appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); },
+	};
+	const context = { isIdle: (): boolean => true, hasPendingMessages: (): boolean => false, sessionManager: { getEntries: (): readonly unknown[] => entries } };
+	try {
+		await parent.connect();
+		const created = await parent.createTask({ target: origin, task: "answer locally", timeoutMs: 60_000 });
+		const assignment = (await parent.receive()).at(0);
+		if (assignment === undefined) throw new Error("expected self-target assignment");
+		await parent.acknowledgeRelayDelivery(assignment.cursor);
+		await parent.submitIntent({ taskId: created.taskId, type, payload: { message: "origin-authored" } });
+		const event = parent.getTask(created.taskId)?.events.at(-1);
+		if (event === undefined) throw new Error("expected origin-authored canonical event");
+
+		await deliverTaskInbox(pi, parent, context);
+
+		expect(parent.getTask(created.taskId)?.events).toContainEqual(event);
+		expect(entries).toEqual([]);
+	} finally { store.close(); }
+});
+
 test("origin acknowledges raw receiver intents before rendering their canonical message and completion", async () => {
 	const relay = createInMemoryTaskRelay("memory");
 	const parentStore = createTaskStore();

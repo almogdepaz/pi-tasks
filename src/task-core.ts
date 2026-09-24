@@ -27,6 +27,7 @@ const RECEIVE_PAGE_SIZE = 100;
 const DELIVERY_EVIDENCE_OPERATION = "delivery_evidence";
 const TERMINAL_STATUSES = new Set<TaskRecord["status"]>(["completed", "failed", "cancelled", "timed_out"]);
 const TERMINAL_EVENTS = new Set(["task.completed", "task.failed", "task.cancelled", "task.timed_out"]);
+const CONVERSATIONAL_EVENTS = new Set(["task.information", "task.question", "task.answer"]);
 const CANONICAL_EVENTS = new Set([
 	"task.created", "task.completed", "task.failed", "task.cancelled", "task.timed_out",
 	"task.information", "task.question", "task.answer", "task.delivery_receipt", "task.parent_acknowledged", "task.late_terminal",
@@ -60,6 +61,11 @@ export type SubmitIntentOutcome =
 	| { readonly authority: "origin"; readonly canonicalEvent: { readonly type: string; readonly reused: boolean } }
 	| { readonly authority: "receiver" };
 
+/** Local wake-request evidence is persisted before Pi wake emission; relay delivery is flushed afterward. */
+export interface WakeRequest {
+	flush(signal?: AbortSignal): Promise<void>;
+}
+
 export interface TaskCore {
 	readonly endpoint: TaskEndpoint;
 	connect(signal?: AbortSignal): Promise<void>;
@@ -72,6 +78,7 @@ export interface TaskCore {
 	submitIntent(input: SubmitIntentInput, signal?: AbortSignal): Promise<void>;
 	submitIntentWithOutcome?(input: SubmitIntentInput, signal?: AbortSignal): Promise<SubmitIntentOutcome>;
 	recordInsertion(input: { readonly taskId: string; readonly eventId: string }, signal?: AbortSignal): Promise<void>;
+	recordWakeRequest(input: { readonly taskId: string; readonly eventId: string }): WakeRequest;
 	evaluateTimeouts(signal?: AbortSignal): Promise<void>;
 	acknowledgeParent(taskId: string, signal?: AbortSignal): Promise<void>;
 }
@@ -213,6 +220,21 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 			});
 			await flushDeliveryEvidence(options, signal, input.taskId, persistedEnvelopeIds, evidence);
 		},
+		recordWakeRequest(input) {
+			const task = requiredTask(options.store, input.taskId);
+			const evidence: DeliveryEvidence = { eventId: input.eventId, stage: TaskDeliveryStage.wakeRequested, state: TaskDeliveryEvidenceState.confirmed };
+			let persistedEnvelopeIds: readonly string[] = [];
+			options.store.transaction(() => {
+				persistedEnvelopeIds = persistIntent(options, clock.now, ids, task, {
+					taskId: input.taskId,
+					type: "task.delivery_receipt",
+					payload: { eventId: input.eventId, stage: evidence.stage, state: evidence.state },
+				}, deliveryEvidenceOperation(evidence)).envelopeIds;
+			});
+			return { flush: async (signal?: AbortSignal): Promise<void> => {
+				await flushDeliveryEvidence(options, signal, input.taskId, persistedEnvelopeIds, evidence);
+			} };
+		},
 		async evaluateTimeouts(signal) {
 			const persistedEnvelopeIds: string[] = [];
 			for (const candidate of options.store.listTasks()) {
@@ -303,7 +325,9 @@ function persistIntent(options: TaskCoreOptions, now: () => number, ids: () => s
 	if (!sameEndpoint(options.endpoint, task.origin) && !sameEndpoint(options.endpoint, task.target)) throw new TaskProtocolError("NOT_PARTICIPANT", "historical task belongs to a different endpoint", { retryable: false });
 	if (sameEndpoint(options.endpoint, task.origin)) {
 		const operation = input.type === "task.cancelled" ? ORIGIN_CANCELLATION_OPERATION : reservedOperation;
-		const canonical = canonicalize(options, now, ids, task, { intentId: ids(), taskId: input.taskId, type: input.type, payload: input.payload }, input.type, operation);
+		// The origin already recorded its own conversational event; echo only peer-authored conversations back for model incorporation.
+		const echoCanonicalEventToOrigin = !CONVERSATIONAL_EVENTS.has(input.type);
+		const canonical = canonicalize(options, now, ids, task, { intentId: ids(), taskId: input.taskId, type: input.type, payload: input.payload }, input.type, operation, echoCanonicalEventToOrigin);
 		return { envelopeIds: canonical.envelopeIds, outcome: { authority: "origin", canonicalEvent: { type: canonical.eventType, reused: canonical.reused } } };
 	}
 	const envelopeId = ids();
@@ -363,21 +387,22 @@ interface Canonicalization {
 	readonly reused: boolean;
 }
 
-function canonicalize(options: TaskCoreOptions, now: () => number, ids: () => string, task: TaskRecord, intent: TaskIntent, requestedType: string, operation?: string): Canonicalization {
+function canonicalize(options: TaskCoreOptions, now: () => number, ids: () => string, task: TaskRecord, intent: TaskIntent, requestedType: string, operation?: string, echoCanonicalEventToOrigin = true): Canonicalization {
 	const terminal = TERMINAL_EVENTS.has(requestedType);
 	const type = terminal && TERMINAL_STATUSES.has(task.status) ? "task.late_terminal" : requestedType;
 	const sequence = String(task.events.length + 1);
 	const canonical = event(task, ids(), type, sequence, options.endpoint, task.target, now(), { intentId: intent.intentId, ...intent.payload });
-	const targetEnvelope = envelope(ids(), options.endpoint, task.target, task.taskId, TaskEnvelopeKind.canonicalEvent, canonical, canonical.occurredAt);
-	const originEnvelope = sameEndpoint(task.origin, task.target) ? undefined : envelope(ids(), options.endpoint, task.origin, task.taskId, TaskEnvelopeKind.canonicalEvent, canonical, canonical.occurredAt);
-	const persistedEnvelopeIds = originEnvelope === undefined ? [targetEnvelope.envelopeId] : [targetEnvelope.envelopeId, originEnvelope.envelopeId];
+	const suppressSelfTargetConversationEcho = !echoCanonicalEventToOrigin && sameEndpoint(task.origin, task.target);
+	const targetEnvelope = suppressSelfTargetConversationEcho ? undefined : envelope(ids(), options.endpoint, task.target, task.taskId, TaskEnvelopeKind.canonicalEvent, canonical, canonical.occurredAt);
+	const originEnvelope = !echoCanonicalEventToOrigin || sameEndpoint(task.origin, task.target) ? undefined : envelope(ids(), options.endpoint, task.origin, task.taskId, TaskEnvelopeKind.canonicalEvent, canonical, canonical.occurredAt);
+	const persistedEnvelopeIds = [targetEnvelope, originEnvelope].flatMap((item) => item === undefined ? [] : [item.envelopeId]);
 	if (operation !== undefined) {
 		const reservation = options.store.reserveTaskOperation({ taskId: task.taskId, operation, logicalId: canonical.eventId, logicalType: canonical.type, envelopeIds: persistedEnvelopeIds });
 		if (!reservation.created) return { envelopeIds: reservation.record.envelopeIds, eventType: reservation.record.logicalType, reused: true };
 	}
 	options.store.appendEvent(canonical);
 	if (TERMINAL_EVENTS.has(type)) options.store.setStatus(task.taskId, statusFor(type));
-	options.store.putOutbox(targetEnvelope);
+	if (targetEnvelope !== undefined) options.store.putOutbox(targetEnvelope);
 	if (originEnvelope !== undefined) options.store.putOutbox(originEnvelope);
 	return { envelopeIds: persistedEnvelopeIds, eventType: type, reused: false };
 }

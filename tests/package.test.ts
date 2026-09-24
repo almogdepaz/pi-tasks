@@ -120,6 +120,10 @@ describe("v2-only package", () => {
 			"independently verifies files, diff, tests, and artifacts",
 			"agent_task_ack({ taskId })",
 			"must not create, rotate, or close Wolfpack sessions through shell or session-control tools",
+			"while continuing work or asking for input",
+			"exactly one final `agent_task_done`",
+			"Intermediate messages remain allowed",
+			"do not send a separate terminal information message before `agent_task_done`",
 		]) expect(skill).toContain(detail);
 	});
 

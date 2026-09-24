@@ -18,9 +18,14 @@ function fixture(handler?: (body: any, init: RequestInit) => Promise<Response> |
     const body = JSON.parse(String(init?.body)); calls.push(body);
     if (handler) return handler(body, init!);
     if (!registrations.has(body.generation)) registrations.set(body.generation, { ...endpoint, id: crypto.randomUUID() });
-    return Response.json({ ok: true, profile, epoch, value: body.operation === "connect"
+    const value = body.operation === "connect"
       ? { kind: "connected", endpoint: registrations.get(body.generation), leaseExpiresAt: new Date(Date.now() + 60_000).toISOString() }
-      : { kind: "page", deliveries: [], nextCursor: "0", hasMore: false } });
+      : body.operation === "resolve"
+        ? { kind: "resolved", endpoint: body.target }
+        : body.operation === "send"
+          ? { kind: "accepted", envelopeId: body.envelope.envelopeId, acceptanceId: crypto.randomUUID(), duplicate: false, forwarding: "local" }
+          : { kind: "page", deliveries: [], nextCursor: "0", hasMore: false };
+    return Response.json({ ok: true, profile, epoch, value });
   }, { preconnect: fetch.preconnect }) as typeof fetch;
   return { path, calls, options: { sessionName: "fixture", baseUrl: "http://127.0.0.1:1", fetch: fetcher }, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
@@ -36,6 +41,20 @@ test("configured close discards RAM and the next lifecycle registers a fresh ide
     const connects = f.calls.filter(c => c.operation === "connect");
     expect(connects).toHaveLength(2); expect(connects[1].generation).not.toBe(connects[0].generation);
     expect(connects[1].epoch).toBeUndefined(); expect(f.calls.some(c => c.operation === "send")).toBe(false);
+  } finally { f.cleanup(); }
+});
+
+test("configured close fences a captured wake-request flush before it can relay", async () => {
+  const f = fixture();
+  try {
+    const core = await createConfiguredTaskCore(f.options);
+    const task = await core.createTask({ target: core.endpoint, task: "wake once", timeoutMs: 1_000 });
+    const request = core.recordWakeRequest({ taskId: task.taskId, eventId: "event-1" });
+    const sendsBeforeClose = f.calls.filter(call => call.operation === "send").length;
+    await core.close();
+
+    expect(() => request.flush()).toThrow(expect.objectContaining({ code: "RELAY_CLOSED", retryable: false }));
+    expect(f.calls.filter(call => call.operation === "send")).toHaveLength(sendsBeforeClose);
   } finally { f.cleanup(); }
 });
 
@@ -61,6 +80,7 @@ test("owned close aborts pending receive before discarding RAM and fences new wo
     await receiving; await core.close();
     expect(await result).toBe("RELAY_RESET");
     expect(() => core.receive()).toThrow("task session is closed");
+    expect(() => core.recordWakeRequest({ taskId: "closed-task", eventId: "closed-event" })).toThrow("task session is closed");
     const fresh = createTaskStore(); expect(fresh.getReceiveCursor()).toBe("0"); fresh.close();
   } finally { f.cleanup(); }
 });

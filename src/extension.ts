@@ -142,6 +142,14 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 			async recordInsertion(input, insertionSignal) {
 				if (isCurrent()) await activeCore.recordInsertion(input, insertionSignal);
 			},
+			recordWakeRequest(input) {
+				if (!isCurrent()) throw new TaskProtocolError("RELAY_CLOSED", "task lifecycle was replaced", { retryable: false });
+				const request = activeCore.recordWakeRequest(input);
+				return { flush: async (flushSignal?: AbortSignal): Promise<void> => {
+					if (!isCurrent()) throw new TaskProtocolError("RELAY_CLOSED", "task lifecycle was replaced", { retryable: false });
+					await request.flush(flushSignal);
+				} };
+			},
 		};
 		const inboxOutboxError = await deliverTaskInbox({
 			sendMessage(message, options) { if (isCurrent()) pi.sendMessage(message, options); },

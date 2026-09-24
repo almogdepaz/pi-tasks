@@ -6,6 +6,7 @@ const TASK_EVENT_CUSTOM_TYPE = "pi-tasks-event";
 const TASK_WAKE_CUSTOM_TYPE = "pi-tasks-wake";
 const TASK_CURSOR_CUSTOM_TYPE = "pi-tasks-relay-cursor";
 const TASK_RECORD_CUSTOM_TYPE = "pi-tasks-event-record";
+const TERMINAL_EVENT_TYPES = new Set(["task.completed", "task.failed", "task.cancelled", "task.timed_out"]);
 
 interface InboxContext {
 	readonly isIdle: () => boolean;
@@ -77,10 +78,11 @@ export async function deliverTaskInbox(pi: InboxPi, core: TaskCore, context: Inb
 			const insertionError = await settleDeliveryEvidence(() => core.recordInsertion(eventDetails, signal));
 			outboxError ??= insertionError;
 			let wakeAccepted = taskMessageKeys(context.sessionManager.getEntries(), TASK_WAKE_CUSTOM_TYPE).has(eventKey);
-			if (!wakeAccepted) {
+			const wakeSuppressed = !wakeAccepted && hasAcknowledgedLocalOriginTerminal(core, event);
+			if (!wakeAccepted && !wakeSuppressed) {
 				if (!context.isIdle()) return outboxError;
-				const wakeRequestError = await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.wakeRequested, state: TaskDeliveryEvidenceState.confirmed }, signal);
-				outboxError ??= wakeRequestError;
+				// This synchronous local write closes the ACK/wake race; do not await relay I/O before Pi emits the wake.
+				const wakeRequest = core.recordWakeRequest(eventDetails);
 				pi.sendMessage({
 					customType: TASK_WAKE_CUSTOM_TYPE,
 					content: "Process the pending Pi task event.",
@@ -89,9 +91,13 @@ export async function deliverTaskInbox(pi: InboxPi, core: TaskCore, context: Inb
 				}, { triggerTurn: true, deliverAs: "followUp" });
 				wakeAccepted = taskMessageKeys(context.sessionManager.getEntries(), TASK_WAKE_CUSTOM_TYPE).has(eventKey);
 				if (!wakeAccepted) return outboxError;
+				const wakeRequestError = await settleDeliveryEvidence(() => wakeRequest.flush(signal));
+				outboxError ??= wakeRequestError;
 			}
-			const wakeAcceptanceError = await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.wakeAccepted, state: TaskDeliveryEvidenceState.confirmed }, signal);
-			outboxError ??= wakeAcceptanceError;
+			if (wakeAccepted) {
+				const wakeAcceptanceError = await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.wakeAccepted, state: TaskDeliveryEvidenceState.confirmed }, signal);
+				outboxError ??= wakeAcceptanceError;
+			}
 		}
 		await core.acknowledgeRelayDelivery(delivery.cursor, signal);
 		pi.appendEntry(TASK_CURSOR_CUSTOM_TYPE, { cursor: delivery.cursor });
@@ -129,6 +135,14 @@ function isKnownEvent(type: string): boolean {
 
 function isModelVisible(type: string): boolean {
 	return !["task.delivery_receipt", "task.parent_acknowledged", "task.late_terminal"].includes(type);
+}
+
+function hasAcknowledgedLocalOriginTerminal(core: TaskCore, event: TaskEvent): boolean {
+	if (!TERMINAL_EVENT_TYPES.has(event.type)) return false;
+	const task = core.getTask(event.taskId);
+	if (task === undefined || task.origin.relay !== core.endpoint.relay || task.origin.id !== core.endpoint.id) return false;
+	const terminalIndex = task.events.findIndex((candidate) => candidate.eventId === event.eventId && candidate.type === event.type);
+	return terminalIndex >= 0 && task.events.slice(terminalIndex + 1).some((candidate) => candidate.type === "task.parent_acknowledged");
 }
 
 function renderTaskEvent(event: TaskEvent): string {

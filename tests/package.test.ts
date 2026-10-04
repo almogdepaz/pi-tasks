@@ -4,6 +4,12 @@ import { readFile } from "node:fs/promises";
 
 const packageJsonPath = new URL("../package.json", import.meta.url);
 const readmePath = new URL("../README.md", import.meta.url);
+const protocolReferencePath = new URL("../docs/protocol-reference.md", import.meta.url);
+
+async function readUsageDocumentation(): Promise<string> {
+	const documents = await Promise.all([readFile(readmePath, "utf8"), readFile(protocolReferencePath, "utf8")]);
+	return documents.join("\n");
+}
 const delegationSkillPath = new URL("../skills/wolfpack-pi-task-delegation/SKILL.md", import.meta.url);
 const summarySkillPath = new URL("../skills/task-context-summary/SKILL.md", import.meta.url);
 const removedPaths = [
@@ -42,7 +48,7 @@ describe("v2-only package", () => {
 	});
 
 	test("documents only endpoint-owned relay operation", async () => {
-		const [readme, skill] = await Promise.all([readFile(readmePath, "utf8"), readFile(delegationSkillPath, "utf8")]);
+		const [readme, skill] = await Promise.all([readUsageDocumentation(), readFile(delegationSkillPath, "utf8")]);
 		for (const document of [readme, skill]) {
 			expect(document).toContain("wolfpack-pi-tasks-v2");
 			expect(document).toContain("{ relay, id }");
@@ -62,7 +68,7 @@ describe("v2-only package", () => {
 	});
 
 	test("documents prompt-free workers, role model defaults and overrides, exact sends, and artifact declarations", async () => {
-		const [readme, skill] = await Promise.all([readFile(readmePath, "utf8"), readFile(delegationSkillPath, "utf8")]);
+		const [readme, skill] = await Promise.all([readUsageDocumentation(), readFile(delegationSkillPath, "utf8")]);
 		const minimalEnvelope = readme.match(/### minimal valid v2 send envelope\n\n```json\n([\s\S]+?)\n```/);
 
 		expect(minimalEnvelope?.[1]).toBe(JSON.stringify({
@@ -94,13 +100,13 @@ describe("v2-only package", () => {
 	});
 
 	test("references only the relay-v2 control API", async () => {
-		const documents = await Promise.all([readFile(readmePath, "utf8"), readFile(delegationSkillPath, "utf8")]);
+		const documents = await Promise.all([readUsageDocumentation(), readFile(delegationSkillPath, "utf8")]);
 		const links = documents.flatMap((document) => [...document.matchAll(/https:\/\/github\.com\/almogdepaz\/wolfpack\/blob\/main\/docs\/([^\s)#]+\.md)(?:#[^\s)]+)?/g)].map((match) => match[1]));
 		expect(new Set(links)).toEqual(new Set(["control-api-schema.md"]));
 	});
 
 	test("keeps role reuse, parent verification and acknowledgment, child teardown, and worker containment", async () => {
-		const [readme, skill] = await Promise.all([readFile(readmePath, "utf8"), readFile(delegationSkillPath, "utf8")]);
+		const [readme, skill] = await Promise.all([readUsageDocumentation(), readFile(delegationSkillPath, "utf8")]);
 		for (const document of [readme, skill]) {
 			expect(document).toContain("spawning coordinator");
 			expect(document).toContain("wolfpack kill <stable-session-id> --json");
@@ -128,13 +134,43 @@ describe("v2-only package", () => {
 	});
 
 	test("documents terminal preflight and blocked-delivery invariants", async () => {
-		const readme = await readFile(readmePath, "utf8");
+		const readme = await readUsageDocumentation();
 		expect(readme).toContain("Preflighting `agent_task_done` marks that task as closing before sibling calls are preflighted.");
 		expect(readme).toContain("Ordinary tools remain blocked for a closing, pending-terminal, accepted-terminal, or `delivery_blocked` task");
 		expect(readme).toContain("idempotent `agent_task_done` retry for that same assigned task remains allowed");
 		expect(readme).toContain("Another independently active assignment can still authorize work.");
 		expect(readme).toContain("stable intent/envelope identities, origin endpoint, timestamp, and structured non-retryable relay error");
 		expect(readme).toContain("is never changed to `delivery_blocked`");
+	});
+
+	test("introduces both usage paths and ships their linked reference", async () => {
+		const readme = await readFile(readmePath, "utf8");
+		const packageJson = JSON.parse(await readFile(packageJsonPath, "utf8")) as { readonly files: readonly string[] };
+		for (const heading of ["## how it works", "## use with wolfpack", "## use without wolfpack", "## important limits"]) {
+			expect(readme).toContain(heading);
+		}
+		expect(readme).toContain("the task core is transport-independent; the default pi extension is not.");
+		expect(readme).toContain("does not connect separate processes or machines");
+		expect(readme).toContain("docs/protocol-reference.md");
+		expect(packageJson.files).toContain("docs");
+		expect(existsSync(protocolReferencePath)).toBe(true);
+	});
+
+	test("runs the documented wolfpack-free core example", async () => {
+		const readme = await readFile(readmePath, "utf8");
+		const example = readme.match(/```ts\n([\s\S]+?)\n```/);
+		if (!example?.[1]) throw new Error("README core example is missing");
+		const child = Bun.spawn([process.execPath, "--eval", example[1]], {
+			cwd: new URL("..", import.meta.url).pathname,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+		]);
+		expect(stderr).toBe("");
+		expect(exitCode).toBe(0);
+		expect(stdout.trim()).toBe("completed");
 	});
 
 	test("ships a recovery-only context summary workflow", async () => {

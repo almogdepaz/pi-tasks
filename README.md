@@ -1,16 +1,61 @@
 # pi-tasks
 
-Endpoint-owned task coordination for Pi over Wolfpack's memory-only relay. **Both relay mail and endpoint task bookkeeping live in RAM.** Pi's existing session history is the historical record; there is no SQLite database, task-history directory, migration, disk outbox or startup replay.
+**give another pi agent a task, exchange messages, and get a structured result back.**
 
-The [relay control API](https://github.com/almogdepaz/wolfpack/blob/main/docs/control-api-schema.md#pi-tasks-relay-v2-boundary) defines the transport boundary.
+pi-tasks adds coordination tools to [pi](https://pi.dev). a parent agent can hand work to another session, keep working, and receive a follow-up when the worker asks a question or finishes. it works between sessions on one machine and, through wolfpack's trusted tailnet routing, across machines.
 
-## endpoint-owned relay
+for example: an implementer works on a change while the parent investigates something else. the implementer reports its result; the parent checks the diff and tests, then acknowledges the task.
 
-The default extension requires a compatible Wolfpack memory-owned server. It negotiates `volatile-v1` at `POST /api/task-relay/volatile-v1`. No transport opt-in flag is needed. The old durable relay adapter is removed, not retained as a compatibility mode.
+**pi-tasks coordinates work. it does not create agent sessions or execute the assignment itself.** wolfpack manages sessions and carries messages; the agents do the work.
 
-Set `WOLFPACK_SESSION_NAME` for each Pi process. `WOLFPACK_PORT` defaults to `18790`; `WOLFPACK_SESSION_NAME` resolves the active Pi process to its relay endpoint. Read `taskEndpoint` from structured session creation/status and pass its opaque `{ relay, id }` unchanged. Never derive it from a name, terminal output or broker ID.
+## how it works
 
-### minimal valid v2 send envelope
+```text
+parent agent  ── assignment ──>  worker agent
+              <── questions ──
+              ─── answers ───>
+              <─── result ────
+              ─ acknowledgment >
+```
+
+1. the parent sends instructions to the worker's **task endpoint**: an opaque address for that running session.
+2. the relay carries the assignment. the worker's pi extension queues it as a follow-up, without interrupting an active turn.
+3. the worker does the work, optionally exchanges messages, and submits a structured completion or failure.
+4. the parent receives the result, verifies it, and acknowledges the task.
+
+completion ends the **task**, not the **session**. keep a worker for another assignment, or close it through wolfpack when you no longer need it.
+
+## use with wolfpack
+
+this is the ready-made integration. you need pi, a compatible wolfpack memory-only server, and this package loaded in every participating pi session.
+
+### 1. install the pi package
+
+```bash
+pi install npm:@sgtbeatdown/pi-tasks
+```
+
+start new pi sessions after installation. wolfpack supplies `WOLFPACK_SESSION_NAME` to its sessions; the extension uses it to register the current process. the local control port defaults to `18790` (`WOLFPACK_PORT` overrides it).
+
+### 2. open a worker
+
+from a pi parent running under wolfpack:
+
+```bash
+# choose an available pi model explicitly.
+MODEL="openai-codex/gpt-6.1-sol:medium"
+wolfpack agent spawn --project-dir /absolute/worktree \
+  --name task-implementation --model "$MODEL" \
+  --task-worker --readiness-timeout-ms 30000 --json
+```
+
+replace `/absolute/worktree` with the directory the worker should use. this starts a prompt-free worker and returns a stable `sessionId` and a registered `taskEndpoint`. registration means the session can receive mail—not that its model has executed anything.
+
+for an existing session, use `wolfpack session status <sessionId> --json`. copy its returned `taskEndpoint` unchanged; never construct an endpoint from a session name.
+
+### 3. assign work
+
+ask the parent agent to call `agent_task_send` with that endpoint:
 
 ```json
 {
@@ -18,84 +63,127 @@ Set `WOLFPACK_SESSION_NAME` for each Pi process. `WOLFPACK_PORT` defaults to `18
     "relay": "wolfpack-pi-tasks-v2",
     "id": "target-opaque-endpoint-id"
   },
-  "task": "implement the narrow change and run focused tests"
+  "task": "implement the narrow change and run focused tests",
+  "timeoutMs": 3600000
 }
 ```
 
-The `agent_task_send` schema is exactly `to`, `task`, and optional `timeoutMs`. Unsupported fields are rejected before admission: a pre-admission validation rejection creates no task. If an outcome is uncertain, idempotency remains necessary within the current lifetime; inspect the returned task ID rather than blindly creating another assignment.
+replace `to` with the actual returned `{ relay, id }`. put the complete assignment in `task`; do not also give the worker a startup prompt. the timeout is a failure deadline, not a polling interval. allow at least an hour for coding work.
 
-## history versus live state
+### 4. receive and verify the result
 
-- Pi requests task-processing turns through its safe `deliverAs: "followUp"` queue. Pi session messages and tool calls/results preserve historical context. Non-waking receipts, parent ACKs and late-terminal facts are archived as `pi-tasks-event-record` custom entries before transport ACK, without waking the model. Received model-visible task events include the complete structured event in `pi-tasks-event` details, including results—not just a rendered summary.
-- Active tasks, outbox intentions, individual ACK checkpoints, deduplication and delivery-blocked evidence are RAM-owned. Each endpoint has lower-only limits of16,384 records/32MiB encoded state. Admission fails before exceeding those bounds; they are not a process-RSS guarantee.
-- `agent_task_send` confirms relay acceptance, **not execution**. `receiver_recorded` confirms receiver RAM receipt, **not durable persistence**. Pi insertion and wake acceptance are separate evidence, never proof of model execution.
-- Session history is not an operational journal. A new process/lifecycle starts empty with a fresh endpoint/generation; it does not reconstruct tasks, replay envelopes, reuse old ACKs or reopen a worker gate from old history.
-- A relay restart can lose even accepted mail. A Pi restart loses that endpoint's active task state. Relay-loss evidence marks affected work failed only in the discarded local lifetime; its remote outcome remains explicitly unknown and is never presented as canonical delivery or completion evidence.
+continue useful work after sending. when none remains, yield the turn: structured follow-ups bring questions and results back to the parent. do not repeatedly poll just to wait.
 
-## memory-owned lifecycle
+| tool | purpose |
+| --- | --- |
+| `agent_task_send` | assign work to an endpoint |
+| `agent_task_message` | send a question, answer, or progress update |
+| `agent_task_done` | worker submits its final status and result |
+| `agent_task_ack` | parent acknowledges a terminal task after verification |
+| `agent_task_status` / `agent_task_inbox` | inspect locally known task state |
+| `agent_task_cancel` | parent cancels its task |
+| `agent_task_wait` | explicitly block for a terminal result when requested |
 
-`createConfiguredTaskCore()` owns its transport and `createTaskStore()` RAM state. Startup registers; polling runs every five seconds and at agent settlement. Shutdown fences new work, aborts requests, drains active calls and discards state. Late callbacks cannot mutate a successor lifetime.
+workers report changed source paths in `result.changedFiles`. artifact declarations point to files for the parent to inspect; they do **not** transfer file contents.
 
-The default extension automatically replaces a lifetime only after a structured `RELAY_RESET` or `RELAY_REBIND_REQUIRED`. It fences and discards the unusable RAM state, records each active task in session history as locally failed with `RELAY_STATE_LOST` and an explicitly unknown remote outcome, then binds a fresh empty endpoint. The loss record does not wake the model by itself. Transient availability, authentication, capacity, abort, profile and malformed-response failures never trigger replacement. Historical tasks are not adopted into the successor lifetime.
+when finished with a session you created, run `wolfpack kill <sessionId> --json`, then verify that exact ID is absent from `wolfpack list --json`.
 
-`createVolatileTaskSession({ url, callerSession, store })` is the lower-level API for a caller-owned RAM store. Transport reconnect within that same lifetime retains pending immutable retries; `rebind()` clears the store, while `close()` stops transport and the caller then closes its state. Persistence/path options are rejected. Old database files are neither read nor deleted.
+### across machines
 
-Full immutable content, including the original creation timestamp, is reused for retries. Destination-confirmed acceptance is required. Conflicting content, exhausted delivery and reset cannot become successful acceptance. Individual ACKs preserve sparse bigint cursors and cannot skip earlier pending mail. Bounds/deadlines apply through complete response bodies, including noncooperative injected transports.
-
-## trusted Tailnet and optional authentication
-
-The intended deployment trusts its Tailnet machines; Tailscale access control is the network boundary. Do not expose owner APIs through the public internet/Funnel or an untrusted proxy. No additional JWT or peer-signature scheme is required by the task protocol.
-
-Existing global Wolfpack JWT enforcement remains **optional**. If the owner configures `WOLFPACK_JWT_SECRET`, the configured Pi factory supports it with short-lived tokens only for HTTP loopback. It never discovers/distributes secrets or automatically forwards them to arbitrary HTTPS URLs. HTTP401 reports `RELAY_AUTH_REQUIRED`, not an epoch reset.
-
-Remote task endpoints must be locally resolved aliases. The paired CLI qualifies a selected remote endpoint through the local coordinator; remote lists expose explicit remote metadata. Failed qualification preserves any created session/ID but removes unsafe `taskEndpoint` output and reports `taskEndpointError`.
-
-## delegation workflow
-
-Configure `WOLFPACK_IMPLEMENTER_MODEL` and `WOLFPACK_REVIEWER_MODEL`; defaults are `openai-codex/gpt-5.6-terra` and `openai-codex/gpt-5.6-sol`. Explicit user or project choices override those defaults.
+select a configured tailnet peer with `wolfpack --machine <peer>`. remote child spawning requires a parent on that machine; for a worker coordinated from here, use remote top-level creation:
 
 ```bash
-IMPLEMENTER_MODEL="${WOLFPACK_IMPLEMENTER_MODEL:-openai-codex/gpt-5.6-terra}"
-REVIEWER_MODEL="${WOLFPACK_REVIEWER_MODEL:-openai-codex/gpt-5.6-sol}"
+wolfpack --machine <peer> session create --project-dir /absolute/remote/worktree \
+  --harness pi --task-worker --readiness-timeout-ms 30000 --json
 ```
 
-1. Use one assignment mode: full-startup instructions, or an endpoint assignment—not both. For a task worker: `wolfpack agent spawn --project-dir /absolute/worktree --name <task-role> --model "$IMPLEMENTER_MODEL" --task-worker --readiness-timeout-ms 30000 --json` (or `"$REVIEWER_MODEL"`). This mode rejects prompts/plans and `--notify-parent`; put all instructions in `agent_task_send.task`.
-2. Verify exact session ID/root/Pi harness and registered `taskEndpoint`. `TASK_WORKER_PREFLIGHT_FAILED` precedes creation. `TASK_WORKER_NOT_READY` retains `createdSession`/`cleanup`; inspect `unconfirmed` cleanup by exact ID before retry. Registration is not model execution.
-3. Submit the assignment and continue useful work. When none remains, yield to structured follow-up. Do not poll `agent_task_status` or `agent_task_inbox` merely to wait; use `agent_task_wait` only when explicitly asked to block.
-4. Use `agent_task_message` for questions, answers and information. The receiver's last action is `agent_task_done`, not completion prose.
-5. Independently verify, then acknowledge the terminal task and deliberately retain or clean up the parent-owned role.
+paths are on the remote host. the CLI qualifies the remote endpoint through your local coordinator and returns a locally routable `taskEndpoint`. use that returned address in the same send flow. if it reports `taskEndpointError`, inspect the retained `sessionId` rather than blindly creating another session. use the same `--machine` selector for cleanup.
 
-Endpoint assignments require terminal completion and one `agent_task_ack`; full-startup children have no task ID, so use explicit completion/block notification and parent verification instead. Close only sessions the parent spawned using `wolfpack kill <stable-session-id> --json`, then verify that ID absent from `wolfpack list --json`. Never use `wolfpack session send`, `/exit`, or `/quit` for cleanup.
+see the [delegation workflow](skills/wolfpack-pi-task-delegation/SKILL.md) for role reuse, worker restrictions, readiness errors, and complete lifecycle rules.
 
-## worker-only execution gate
+## use without wolfpack
 
-The exact value `PI_TASK_WORKER=1` enables a fail-closed model tool gate. Before assignment only inbox/status/wait are allowed; other tools receive `PI_TASK_WORKER_ASSIGNMENT_REQUIRED`. Ordinary interactive Pi and explicit user shell commands are outside this gate.
+**the task core is transport-independent; the default pi extension is not.** you can import the core into your own application and supply a `TaskRelay`. there is no bundled alternative production network relay or configuration switch that makes the default extension wolfpack-free.
 
-`PI_TASK_WORKER=1` sessions are leaf roles. Generic role-orchestration guidance applies only to non-worker coordinators. The spawning coordinator owns each child's complete lifecycle.
+### try the core in one process
 
-Workers cannot call `agent_task_send`, `agent_task_cancel`, or `agent_task_ack` (`PI_TASK_WORKER_COORDINATION_FORBIDDEN`). `agent_task_message` must name their eligible incorporated assignment. A structured session event alone is insufficient: its task must also be active in this endpoint's current RAM state. Old session history never authorizes work after restart.
+with the package available to your bun project, save this as `task-demo.ts` and run `bun task-demo.ts`. it uses the exported in-memory relay fixture, so it needs neither wolfpack nor a model:
 
-Preflighting `agent_task_done` marks that task as closing before sibling calls are preflighted. Ordinary tools remain blocked for a closing, pending-terminal, accepted-terminal, or `delivery_blocked` task; an idempotent `agent_task_done` retry for that same assigned task remains allowed. Another independently active assignment can still authorize work.
+```ts
+import {
+  createInMemoryTaskRelay,
+  createTaskCore,
+  createTaskStore,
+} from "@sgtbeatdown/pi-tasks";
 
-## terminal delivery and acknowledgment
+const relay = createInMemoryTaskRelay("demo");
+const parentStore = createTaskStore();
+const workerStore = createTaskStore();
+const parent = createTaskCore({
+  endpoint: { relay: relay.id, id: "parent" },
+  relay,
+  store: parentStore,
+});
+const worker = createTaskCore({
+  endpoint: { relay: relay.id, id: "worker" },
+  relay,
+  store: workerStore,
+});
 
-During the active lifetime `terminalDelivery` reports `not_submitted`, `pending`, `accepted`, or `delivery_blocked`. The blocked variant includes stable intent/envelope identities, origin endpoint, timestamp, and structured non-retryable relay error. Canonical task status is never changed to `delivery_blocked`. Retryable failures reuse the original intent; permanent failures are not rearmed. This evidence is lost on endpoint restart.
+try {
+  await parent.connect();
+  await worker.connect();
+  const { taskId } = await parent.createTask({
+    target: worker.endpoint,
+    task: "summarize the change",
+    timeoutMs: 60_000,
+  });
 
-`agent_task_ack` is terminal-only and origin-owned. Sequential/concurrent retries in one lifetime reuse the logical event and envelope IDs. There is no restart recovery. Report changed source paths in `result.changedFiles`; artifacts are receiver-project-relative regular files, not the changed-file list.
+  // a real application would consume the assignment and do the work here.
+  for (const delivery of await worker.receive()) {
+    await worker.acknowledgeRelayDelivery(delivery.cursor);
+  }
+  await worker.submitIntent({
+    taskId,
+    type: "task.completed",
+    payload: { summary: "the change adds task coordination" },
+  });
+  for (const delivery of await parent.receive()) {
+    await parent.acknowledgeRelayDelivery(delivery.cursor);
+  }
 
-```json
-{ "result": { "changedFiles": ["src/extension.ts"] }, "artifacts": [{ "path": "verification/task-2.md" }] }
+  console.log(parent.getTask(taskId)?.status); // completed
+  await parent.acknowledgeParent(taskId);
+} finally {
+  parentStore.close();
+  workerStore.close();
+}
 ```
 
-## development and verification
+this demonstrates task coordination, not agent execution. both endpoints share one in-process fixture; it does not connect separate processes or machines.
+
+### integrate your own transport
+
+implement the exported [`TaskRelay` interface](src/task-protocol.ts) to connect endpoints, resolve targets, send envelopes, receive mail, and acknowledge individual deliveries. provide a separate `createTaskStore()` and `createTaskCore()` for each endpoint. `runTaskRelayConformance` is available to check a relay implementation.
+
+your application owns polling, retries, timeout evaluation, delivery acknowledgments, and shutdown. it also owns how assignments reach an agent and how that agent runs them. the core alone does not install pi tools or wake a model.
+
+## important limits
+
+- **active state lives in ram.** a pi restart loses that endpoint's tasks; a relay restart can lose even accepted mail. pi session history remains readable, but does not restore tasks or authorize workers after restart.
+- **accepted is not executed.** relay acceptance, receiver receipt, pi follow-up insertion, model execution, and task completion are separate stages.
+- **the parent owns task status.** a worker submits a result; the origin processes it before its task becomes terminal. status reads are local snapshots.
+- **use a trusted network.** the wolfpack integration assumes trusted tailnet machines. do not expose owner APIs to the public internet or an untrusted proxy.
+
+## reference and development
+
+- [protocol and operations reference](docs/protocol-reference.md): memory lifecycle, restart loss, authentication, worker gate, delivery evidence, and acknowledgment details.
+- [wolfpack relay control API](https://github.com/almogdepaz/wolfpack/blob/main/docs/control-api-schema.md#pi-tasks-relay-v2-boundary): transport contract.
 
 ```bash
 bun install
 bun test
 bun run typecheck
-PI_TASKS_WOLFPACK_SOURCE=/absolute/clean/wolfpack-checkout \
-PI_TASKS_WOLFPACK_REVISION=<full-commit-id> \
-bun test tests/volatile-real-worker.test.ts tests/volatile-extension-worker.test.ts
 ```
 
-Wolfpack worker tests require its supported Bun runtime (currently stable>=1.4.2). Optional source-selected checks use private HTTP/workers, not installed services. They test same-lifetime retry/ACK, automatic default-extension reset recovery, explicit lower-level session replacement, fresh endpoint state and history-only evidence. `createInMemoryTaskRelay` is a deterministic conformance fixture, never the default runtime transport. Physical two-machine qualification, final-path performance, release packaging and live activation remain separate gates.
+optional real-worker checks and their prerequisites are documented in the [reference](docs/protocol-reference.md#development-and-verification).

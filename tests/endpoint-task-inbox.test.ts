@@ -45,6 +45,62 @@ test("archives non-waking facts before ACK, deduplicates an ACK retry and retain
 	} finally { ack.mockRestore(); parentStore.close(); childStore.close(); }
 });
 
+test.each([false, true])("queued parent intake canonicalizes completion behind held visible mail (idle=%s)", async (initialIdle) => {
+	const relay = createInMemoryTaskRelay("memory");
+	const parentStore = createTaskStore(), childStore = createTaskStore();
+	const clock = { now: (): number => 0 };
+	const parent = createTaskCore({ endpoint: origin, relay, store: parentStore, ids: ids("queued-parent"), clock });
+	const child = createTaskCore({ endpoint: receiver, relay, store: childStore, ids: ids("queued-child"), clock });
+	const entries: unknown[] = [];
+	const messages: Array<{ readonly customType: string; readonly details: { readonly eventId: string } }> = [];
+	const pi = {
+		sendMessage(message: { readonly customType: string; readonly details: { readonly eventId: string } }) {
+			messages.push(message);
+			entries.push({ type: "custom_message", ...message });
+		},
+		appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); },
+	};
+	let pending = true, idle = initialIdle;
+	const context = { isIdle: (): boolean => idle, hasPendingMessages: (): boolean => pending, sessionManager: { getEntries: (): readonly unknown[] => entries } };
+	try {
+		await parent.connect(); await child.connect();
+		const created = await parent.createTask({ target: receiver, task: "complete behind queued follow-ups", timeoutMs: 60_000 });
+		await child.receive();
+		await child.submitIntent({ taskId: created.taskId, type: "task.information", payload: { message: "earlier visible progress" } });
+		expect(await parent.receive()).toEqual([]);
+		const cursorBefore = parentStore.getReceiveCursor();
+		await child.submitIntent({ taskId: created.taskId, type: "task.completed", payload: { summary: "finished", result: { verified: true } } });
+		const before = await relay.receive({ endpoint: origin, cursor: cursorBefore, limit: 100 });
+		expect(before.deliveries.map(delivery => delivery.envelope.kind)).toEqual(["canonical_event", "intent"]);
+		const held = before.deliveries[0];
+		if (held === undefined) throw new Error("expected held canonical progress");
+
+		await deliverTaskInbox(pi, parent, context);
+		expect(parent.getTask(created.taskId)?.status).toBe("completed");
+		const terminal = parent.getTask(created.taskId)?.events.find(event => event.type === "task.completed");
+		if (terminal === undefined) throw new Error("expected canonical completion during queued intake");
+		expect(terminal.payload).toEqual(expect.objectContaining({ summary: "finished", result: { verified: true } }));
+		await deliverTaskInbox(pi, parent, context);
+		await deliverTaskInbox(pi, parent, context);
+		expect(parent.getTask(created.taskId)?.events.filter(event => event.type === "task.completed")).toHaveLength(1);
+		expect(entries).toEqual([]);
+		expect(parentStore.getReceiveCursor()).toBe(cursorBefore);
+		const replay = await relay.receive({ endpoint: origin, cursor: cursorBefore, limit: 100 });
+		expect(replay.deliveries.map(delivery => delivery.envelope.kind)).toEqual(["canonical_event", "canonical_event"]);
+		expect(replay.deliveries[0]).toEqual(held); // Later raw intent ACK must not consume the held prefix.
+
+		pending = false; idle = false;
+		await deliverTaskInbox(pi, parent, context);
+		expect(entries).toEqual([]);
+		idle = true;
+		await deliverTaskInbox(pi, parent, context);
+		await deliverTaskInbox(pi, parent, context);
+		expect(messages.filter(message => message.customType === "pi-tasks-event" && message.details.eventId === terminal.eventId)).toHaveLength(1);
+		expect(messages.filter(message => message.customType === "pi-tasks-wake" && message.details.eventId === terminal.eventId)).toHaveLength(1);
+		expect(await parent.receive()).toEqual([]);
+	} finally { parentStore.close(); childStore.close(); }
+});
+
 test("records inbound RAM state and structural session evidence before relay acknowledgement", async () => {
 	const relay = createInMemoryTaskRelay("memory");
 	const parent = createTaskCore({ endpoint: origin, relay, store: createTaskStore(), ids: ids("parent") });
@@ -154,8 +210,8 @@ test.each(["task.completed", "task.failed", "task.cancelled", "task.timed_out"] 
 		},
 		appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); },
 	};
-	let idle = false;
-	const context = { isIdle: (): boolean => idle, hasPendingMessages: (): boolean => false, sessionManager: { getEntries: (): readonly unknown[] => entries } };
+	let idle = false, pending = true;
+	const context = { isIdle: (): boolean => idle, hasPendingMessages: (): boolean => pending, sessionManager: { getEntries: (): readonly unknown[] => entries } };
 	try {
 		await parent.connect(); await child.connect();
 		const created = await parent.createTask({ target: receiver, task: "report a blocker", timeoutMs: 1 });
@@ -178,6 +234,9 @@ test.each(["task.completed", "task.failed", "task.cancelled", "task.timed_out"] 
 		expect(entries).toEqual([]);
 		await parent.acknowledgeParent(created.taskId);
 
+		pending = false;
+		await deliverTaskInbox(pi, parent, context);
+		expect(entries).toEqual([]);
 		idle = true;
 		await deliverTaskInbox(pi, parent, context);
 		await deliverTaskInbox(pi, parent, context);

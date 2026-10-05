@@ -1,8 +1,11 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import piTasks, { createConfiguredCoreLoader, createSingleFlightInboxRefresh, registerAgentTaskTools } from "../src/extension";
+import { createInMemoryTaskRelay } from "../src/in-memory-task-relay";
+import { createTaskCore } from "../src/task-core";
 import type { TaskCore } from "../src/task-core";
+import { createTaskStore } from "../src/task-store";
 import { TASK_PROTOCOL_VERSION, TaskEnvelopeKind, TaskOutboxDeliveryError, TaskProtocolError } from "../src/task-protocol";
 
 interface Tool {
@@ -403,51 +406,117 @@ test("starts polling after rejected startup and clears the warning after autonom
 	}
 });
 
-test("renews registration while pending Pi messages prevent inbox receive", async () => {
+test("renews registration and receives real completion while pending Pi messages defer presentation", async () => {
 	let sessionStart: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
 	let sessionShutdown: (() => void) | undefined;
 	let poll: (() => void) | undefined;
-	let connects = 0;
-	let refreshes = 0;
-	let polled: (() => void) | undefined;
+	let statusUpdates = 0;
+	let polled!: () => void;
 	const pollCompleted = new Promise<void>((resolve) => { polled = resolve; });
 	const originalSetInterval = globalThis.setInterval;
 	globalThis.setInterval = ((handler: (...args: unknown[]) => void) => {
 		poll = (): void => handler();
 		return 1 as unknown as ReturnType<typeof setInterval>;
 	}) as typeof setInterval;
-	const core = {
-		async connect(): Promise<void> { connects += 1; },
-		async flushOutbox(): Promise<void> {
-			refreshes += 1;
-			if (refreshes === 2) polled?.();
-		},
-		async evaluateTimeouts(): Promise<void> { undefined; },
-		async receive(): Promise<readonly []> { throw new Error("receive must remain gated"); },
-	} as unknown as TaskCore;
+	const relay = createInMemoryTaskRelay("memory");
+	const parentStore = createTaskStore(), childStore = createTaskStore();
+	const parent = createTaskCore({ endpoint: { relay: "memory", id: "parent" }, relay, store: parentStore });
+	const child = createTaskCore({ endpoint: { relay: "memory", id: "child" }, relay, store: childStore });
+	const connects = spyOn(parent, "connect");
+	const entries: unknown[] = [];
+	const statuses: Array<string | undefined> = [];
 	const context = {
+		isIdle: (): boolean => false,
 		hasPendingMessages: (): boolean => true,
-		sessionManager: { getEntries: (): readonly unknown[] => [] },
-		ui: { setStatus: (): void => undefined, theme: { fg: (_color: string, text: string): string => text } },
+		sessionManager: { getEntries: (): readonly unknown[] => entries },
+		ui: { setStatus(_key: string, status: string | undefined): void { statuses.push(status); if (++statusUpdates === 2) polled(); }, theme: { fg: (_color: string, text: string): string => text } },
 	};
 
 	try {
+		await parent.connect(); await child.connect();
+		const task = await parent.createTask({ target: child.endpoint, task: "finish during queued follow-ups", timeoutMs: 60_000 });
+		await child.receive();
+		connects.mockClear();
 		registerAgentTaskTools({
 			on(event: string, handler: unknown): void {
 				if (event === "session_start") sessionStart = handler as (event: unknown, context: unknown) => Promise<unknown>;
 				if (event === "session_shutdown") sessionShutdown = handler as () => void;
 			},
 			registerTool(): void { undefined; },
-		} as unknown as ExtensionAPI, core);
+			sendMessage(message: unknown): void { entries.push(message); },
+			appendEntry(customType: string, data: unknown): void { entries.push({ customType, data }); },
+		} as unknown as ExtensionAPI, parent);
 
 		await sessionStart!({}, context);
+		await child.submitIntent({ taskId: task.taskId, type: "task.completed", payload: { summary: "done" } });
 		poll?.();
-		await Promise.race([pollCompleted, Bun.sleep(100).then(() => { throw new Error("background poll did not refresh"); })]);
-		expect(connects).toBe(2);
+		await pollCompleted;
+		expect(connects).toHaveBeenCalledTimes(2);
+		expect(statuses).toEqual([undefined, undefined]);
+		expect(parent.getTask(task.taskId)?.status).toBe("completed");
+		expect(parent.getTask(task.taskId)?.events.filter(event => event.type === "task.completed")).toHaveLength(1);
+		expect(entries).toEqual([]);
 	} finally {
 		sessionShutdown?.();
+		connects.mockRestore();
 		globalThis.setInterval = originalSetInterval;
+		parentStore.close(); childStore.close();
 	}
+});
+
+test.each(["shutdown", "context replacement"] as const)("fences real held assignment presentation and ACK during %s", async (replacement) => {
+	let sessionStart!: (event: unknown, context: unknown) => Promise<unknown>;
+	let agentEnd!: (event: unknown, context: unknown) => Promise<unknown>;
+	let agentSettled!: (event: unknown, context: unknown) => Promise<unknown>;
+	let sessionShutdown!: () => Promise<unknown>;
+	const relay = createInMemoryTaskRelay("memory");
+	const parentStore = createTaskStore(), childStore = createTaskStore();
+	const parent = createTaskCore({ endpoint: { relay: "memory", id: "parent" }, relay, store: parentStore });
+	const child = createTaskCore({ endpoint: { relay: "memory", id: "child" }, relay, store: childStore });
+	const entries: unknown[] = [];
+	let successorInsertion = false;
+	const ui = { setStatus(): void { undefined; }, theme: { fg: (_color: string, text: string): string => text } };
+	const successor = { isIdle: (): boolean => true, hasPendingMessages: (): boolean => false, sessionManager: { getEntries: (): readonly unknown[] => entries }, ui };
+	let replacementStarted = false;
+	let replacing: Promise<unknown> | undefined;
+	const prior = {
+		isIdle: (): boolean => true,
+		hasPendingMessages(): boolean {
+			if (!replacementStarted) {
+				replacementStarted = true;
+				replacing = replacement === "shutdown" ? sessionShutdown() : agentEnd({}, successor);
+			}
+			return false;
+		},
+		sessionManager: { getEntries: (): readonly unknown[] => [] }, ui,
+	};
+	registerAgentTaskTools({
+		on(event: string, handler: unknown): void {
+			if (event === "session_start") sessionStart = handler as typeof sessionStart;
+			if (event === "agent_end") agentEnd = handler as typeof agentEnd;
+			if (event === "agent_settled") agentSettled = handler as typeof agentSettled;
+			if (event === "session_shutdown") sessionShutdown = handler as typeof sessionShutdown;
+		},
+		registerTool(): void { undefined; },
+		sendMessage(message: { readonly customType: string; readonly details: unknown }): void { if (!successorInsertion) throw new Error("stale Pi insertion"); entries.push({ type: "custom_message", ...message }); },
+		appendEntry(customType: string, data: unknown): void { if (!successorInsertion) throw new Error("stale Pi archive/ACK"); entries.push({ type: "custom", customType, data }); },
+	} as unknown as ExtensionAPI, child);
+	try {
+		await parent.connect(); await child.connect();
+		const created = await parent.createTask({ target: child.endpoint, task: "hold across lifecycle replacement", timeoutMs: 60_000 });
+		await sessionStart({}, prior);
+		await replacing;
+		expect(replacementStarted).toBe(true);
+		expect(entries).toEqual([]);
+		expect(child.getTask(created.taskId)?.status).toBe("active");
+		expect(childStore.getReceiveCursor()).toBe("0");
+		expect((await relay.receive({ endpoint: child.endpoint, cursor: "0", limit: 100 })).deliveries).toHaveLength(1);
+		successorInsertion = true;
+		if (replacement === "shutdown") await sessionStart({}, successor);
+		else await agentSettled({}, successor);
+		expect(entries).toEqual(expect.arrayContaining([expect.objectContaining({ type: "custom_message", customType: "pi-tasks-event" })]));
+		expect(childStore.getReceiveCursor()).not.toBe("0");
+	} finally { await sessionShutdown(); parentStore.close(); childStore.close(); }
 });
 
 test("continues autonomous polling after Pi replaces the extension context at agent_end", async () => {

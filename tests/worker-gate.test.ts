@@ -8,6 +8,7 @@ import { createInMemoryTaskRelay } from "../src/in-memory-task-relay";
 import { createTaskCore } from "../src/task-core";
 import type { TaskCore } from "../src/task-core";
 import { createTaskStore } from "../src/task-store";
+import { deliverTaskInbox } from "../src/task-inbox";
 import { TaskProtocolError } from "../src/task-protocol";
 import type { TaskEvent, TaskRelay } from "../src/task-protocol";
 
@@ -112,6 +113,42 @@ test("only structured assignment evidence matching a local active worker task op
 	const terminalOnly = { ...assignment, details: { taskId, eventId: terminalEvent.eventId } };
 	expect(await call(gate, "read", { path: "README.md" }, [terminalOnly])).toEqual({ block: true, reason: DENIAL_CODE });
 	expect(await call(gate, "read", { path: "README.md" }, [terminalOnly, terminalOnly])).toEqual({ block: true, reason: DENIAL_CODE });
+});
+
+test("queued assignment intake records RAM state without opening the worker gate and queued terminal intake closes it", async () => {
+	const relay = createInMemoryTaskRelay("memory");
+	const originStore = createTaskStore(), workerStore = createTaskStore();
+	const origin = createTaskCore({ endpoint: ORIGIN, relay, store: originStore, ids: sequence("queued-origin") });
+	const worker = createTaskCore({ endpoint: WORKER, relay, store: workerStore, ids: sequence("queued-worker") });
+	const gate = registerGate(worker, "1");
+	const entries: unknown[] = [];
+	const pi = {
+		sendMessage(message: { readonly customType: string; readonly details: unknown }): void { entries.push({ type: "custom_message", ...message }); },
+		appendEntry(customType: string, data: unknown): void { entries.push({ type: "custom", customType, data }); },
+	};
+	let pending = true;
+	const context = { isIdle: (): boolean => true, hasPendingMessages: (): boolean => pending, sessionManager: { getEntries: (): readonly unknown[] => entries } };
+	try {
+		await origin.connect(); await worker.connect();
+		const created = await origin.createTask({ target: WORKER, task: "wait for structured incorporation", timeoutMs: 60_000 });
+		await deliverTaskInbox(pi, worker, context);
+		await deliverTaskInbox(pi, worker, context);
+		expect(worker.getTask(created.taskId)?.status).toBe("active");
+		expect(entries).toEqual([]);
+		expect(workerStore.getReceiveCursor()).toBe("0");
+		expect(await call(gate, "bash", { command: "pwd" }, entries)).toEqual({ block: true, reason: DENIAL_CODE });
+
+		pending = false;
+		await deliverTaskInbox(pi, worker, context);
+		expect(await call(gate, "bash", { command: "pwd" }, entries)).toBeUndefined();
+		await origin.submitIntent({ taskId: created.taskId, type: "task.cancelled", payload: {} });
+		pending = true;
+		const incorporatedEntries = [...entries];
+		await deliverTaskInbox(pi, worker, context);
+		expect(worker.getTask(created.taskId)?.status).toBe("cancelled");
+		expect(entries).toEqual(incorporatedEntries);
+		expect(await call(gate, "bash", { command: "pwd" }, entries)).toEqual({ block: true, reason: DENIAL_CODE });
+	} finally { originStore.close(); workerStore.close(); }
 });
 
 test("restored session history cannot reopen the worker gate after endpoint RAM loss", async () => {

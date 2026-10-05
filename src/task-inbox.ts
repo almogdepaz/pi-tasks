@@ -35,7 +35,6 @@ type DeliveryEvidencePayload =
 
 /** Persists model-visible Pi evidence before advancing the relay cursor, then starts one separate turn. */
 export async function deliverTaskInbox(pi: InboxPi, core: TaskCore, context: InboxContext, signal?: AbortSignal): Promise<TaskOutboxDeliveryError | undefined> {
-	if (context.hasPendingMessages()) return undefined;
 	const deliveries = await core.receive(signal);
 	let outboxError: TaskOutboxDeliveryError | undefined;
 	for (const delivery of deliveries) {

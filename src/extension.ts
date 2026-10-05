@@ -133,6 +133,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		const guardedCore: TaskCore = {
 			...activeCore,
 			async receive(receiveSignal) {
+				if (!isCurrent()) return [];
 				const deliveries = await activeCore.receive(receiveSignal);
 				return isCurrent() ? deliveries : [];
 			},

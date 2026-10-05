@@ -38,6 +38,10 @@ The `agent_task_send` schema is exactly `to`, `task`, and optional `timeoutMs`. 
 
 `createConfiguredTaskCore()` owns its transport and `createTaskStore()` RAM state. Startup registers; polling runs every five seconds and at agent settlement. Shutdown fences new work, aborts requests, drains active calls and discards state. Late callbacks cannot mutate a successor lifetime.
 
+Background refresh records protocol facts in RAM even while Pi is busy or has queued messages. A valid completion within the fetched receive page can become canonical before its notification is presented. Model-visible insertion and the separate follow-up wake still wait for idle Pi with no queued messages; visible relay mail remains replayable until the required structured insertion/wake evidence is present. Intake alone does not incorporate an assignment or authorize worker tools. Parent acknowledgment before terminal presentation retains the event but suppresses its redundant wake.
+
+This separation does not change polling or the 100-envelope receive-page bound: a full prefix of held visible mail can still prevent intake of a newer intent beyond that page. General backlog scanning is not provided.
+
 The default extension automatically replaces a lifetime only after a structured `RELAY_RESET` or `RELAY_REBIND_REQUIRED`. It fences and discards the unusable RAM state, records each active task in session history as locally failed with `RELAY_STATE_LOST` and an explicitly unknown remote outcome, then binds a fresh empty endpoint. The loss record does not wake the model by itself. Transient availability, authentication, capacity, abort, profile and malformed-response failures never trigger replacement. Historical tasks are not adopted into the successor lifetime.
 
 `createVolatileTaskSession({ url, callerSession, store })` is the lower-level API for a caller-owned RAM store. Transport reconnect within that same lifetime retains pending immutable retries; `rebind()` clears the store, while `close()` stops transport and the caller then closes its state. Persistence/path options are rejected. Old database files are neither read nor deleted.

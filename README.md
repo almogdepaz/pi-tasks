@@ -43,7 +43,7 @@ from a pi parent running under wolfpack:
 
 ```bash
 # choose an available pi model explicitly.
-MODEL="openai-codex/gpt-6.1-sol:medium"
+MODEL="openai-codex/gpt-6.1-sol:high"
 wolfpack agent spawn --project-dir /absolute/worktree \
   --name task-implementation --model "$MODEL" \
   --task-worker --readiness-timeout-ms 30000 --json

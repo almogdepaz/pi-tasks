@@ -1,3 +1,4 @@
+import { TASK_WORK_LIMITS } from "./task-work-scope";
 import { TERMINAL_INTENT_OPERATION, TaskProtocolError } from "./task-protocol";
 import type { RelayTransportBinding, RelayEnvelope, TaskEndpoint, TaskEvent, TaskRecord, TaskSnapshot, TerminalDeliveryState, TerminalTaskIntentType } from "./task-protocol";
 
@@ -25,6 +26,12 @@ export interface TaskStore {
   appendEvent(event: TaskEvent): boolean;
   putOutbox(envelope: RelayEnvelope): void;
   outbox(state: OutboxRecord["state"]): readonly OutboxRecord[];
+  /** Indexed lookup, fair rotation and cooldown are required store capabilities. */
+  getOutboxRecord(envelopeId: string): OutboxRecord | undefined;
+  hasPendingOutbox(): boolean;
+  selectPendingOutbox(limit: number, now: number, maxInspections?: number): readonly OutboxRecord[];
+  outboxRetryAt(envelopeId: string): number;
+  postponeOutbox(envelopeId: string, until: number): void;
   markOutboxAccepted(envelopeId: string): void;
   quarantineOutbox(envelopeId: string, input: OutboxQuarantineInput): void;
   quarantinedOutbox(): readonly OutboxQuarantineRecord[];
@@ -33,10 +40,13 @@ export interface TaskStore {
   setReceiveCursor(cursor: string): void;
   trackRelayDeliveries(endpoint: TaskEndpoint, deliveries: readonly { readonly cursor: string; readonly envelopeId: string }[]): void;
   pendingRelayEnvelopeId(endpoint: TaskEndpoint, cursor: string): string | undefined;
-  requestRelayAcknowledgement(endpoint: TaskEndpoint, cursor: string): void;
-  requestedRelayAcknowledgements(endpoint: TaskEndpoint): readonly string[];
+  requestRelayAcknowledgement(endpoint: TaskEndpoint, cursor: string, retryAt?: number): void;
+  requestedRelayAcknowledgements(endpoint: TaskEndpoint, limit?: number, now?: number): readonly string[];
+  relayAcknowledgementRetryAt(endpoint: TaskEndpoint, cursor: string): number;
   acknowledgeRelayCursor(endpoint: TaskEndpoint, cursor: string): void;
   putIntent(intentId: string, taskId: string, envelopeId: string): void;
+  /** Locally submitted intent only; retained through acceptance or quarantine in this RAM lifetime. */
+  getIntentEnvelope(intentId: string): RelayEnvelope | undefined;
   putInsertionReceipt(taskId: string, eventId: string): boolean;
   reserveTaskOperation(input: TaskOperationRecord): { readonly created: boolean; readonly record: TaskOperationRecord };
   getEndpointGeneration(): string | undefined;
@@ -52,7 +62,7 @@ export interface TaskStore {
 const LIMITS = { entries: 16_384, bytes: 32 * 1024 * 1024 };
 type Cell = { readonly text: string; readonly bytes: number; readonly order: number };
 type Undo = { readonly table: Map<string, Cell>; readonly key: string; readonly prior: Cell | undefined };
-interface Checkpoint { frontier: string; highWater: string; pending: Record<string, string>; requested: Record<string, true>; }
+interface Checkpoint { frontier: string; highWater: string; pending: Record<string, string>; requested: Record<string, number>; }
 
 /** One endpoint lifetime. No SQLite, files, migrations, startup reads or replay. */
 export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
@@ -61,6 +71,14 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
   if (!Number.isInteger(maxEntries) || maxEntries < 1 || maxEntries > LIMITS.entries || !Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > LIMITS.bytes) throw new TypeError("invalid task memory limit");
   const tables = new Map<string, Map<string, Cell>>();
   const frames: Map<string, Undo>[] = [];
+  // ID-only retry rotation, bounded by the existing pending outbox; no payload copy.
+  const pendingOutbox = new Map<string, number>();
+  const syncPendingOutbox = (id: string) => {
+    const row = tables.get("outbox")?.get(id);
+    if (row && (JSON.parse(row.text) as OutboxRecord).state === "pending") {
+      if (!pendingOutbox.has(id)) pendingOutbox.set(id, 0);
+    } else pendingOutbox.delete(id);
+  };
   let bytes = 0, entries = 0, sequence = 0, closed = false;
   const remember = (name: string, key: string, target: Map<string, Cell>, prior: Cell | undefined) => {
     const frame = frames.at(-1), identity = JSON.stringify([name, key]);
@@ -116,7 +134,11 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
         const result = operation();
         if (result instanceof Promise) throw new TypeError("task transactions must be synchronous");
         const parent = frames.at(-2);
-        if (parent) for (const [key, item] of frame) if (!parent.has(key)) parent.set(key, item);
+        if (parent) {
+          for (const [key, item] of frame) if (!parent.has(key)) parent.set(key, item);
+        } else {
+          for (const item of frame.values()) if (item.table === tables.get("outbox")) syncPendingOutbox(item.key);
+        }
         return result;
       } catch (error) {
         for (const item of [...frame.values()].reverse()) { if (item.prior) item.table.set(item.key, item.prior); else item.table.delete(item.key); }
@@ -133,9 +155,28 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
     },
     setStatus(id, status) { const task = get<Omit<TaskRecord, "events">>("tasks", id); if (task) put("tasks", id, { ...task, status }); },
     appendEvent(event) { requireTask(event.taskId); return put("events", event.eventId, event, true); },
-    putOutbox(envelope) { put("outbox", envelope.envelopeId, { envelope, state: "pending" }, true); },
+    putOutbox(envelope) { put("outbox", envelope.envelopeId, { envelope, state: "pending" }, true); if (!frames.length) syncPendingOutbox(envelope.envelopeId); },
     outbox(status) { return rows<OutboxRecord>("outbox").filter(item => item.state === status); },
-    markOutboxAccepted(id) { const prior = get<OutboxRecord>("outbox", id); if (prior) put("outbox", id, { ...prior, state: "accepted" }); },
+    getOutboxRecord(id) { return get<OutboxRecord>("outbox", id); },
+    hasPendingOutbox() { check(); return pendingOutbox.size > 0; },
+    selectPendingOutbox(limit, now, maxInspections = TASK_WORK_LIMITS.retryInspections) {
+      check();
+      const selected: OutboxRecord[] = [];
+      // Also bound inspection when the queue is cooling down. Rotate even skipped IDs.
+      const inspections = Math.min(pendingOutbox.size, TASK_WORK_LIMITS.retryInspections, maxInspections);
+      for (let i = 0; i < inspections && selected.length < limit; i++) {
+        const [id, retryAt] = pendingOutbox.entries().next().value!;
+        pendingOutbox.delete(id); pendingOutbox.set(id, retryAt);
+        if (retryAt <= now) {
+          const record = get<OutboxRecord>("outbox", id);
+          if (record?.state === "pending") selected.push(record);
+        }
+      }
+      return selected;
+    },
+    outboxRetryAt(id) { check(); return pendingOutbox.get(id) ?? 0; },
+    postponeOutbox(id, until) { check(); if (pendingOutbox.has(id)) pendingOutbox.set(id, until); },
+    markOutboxAccepted(id) { const prior = get<OutboxRecord>("outbox", id); if (prior) put("outbox", id, { ...prior, state: "accepted" }); if (!frames.length) syncPendingOutbox(id); },
     quarantineOutbox(id, input) {
       store.transaction(() => { const prior = get<OutboxRecord>("outbox", id); if (!prior) return;
         put("quarantine", id, { ...input, envelope: prior.envelope, priorState: prior.state }, true); remove("outbox", id);
@@ -156,12 +197,16 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
       writeCheckpoint(endpoint, value);
     },
     pendingRelayEnvelopeId(endpoint, cursor) { return checkpoint(endpoint).pending[cursor]; },
-    requestRelayAcknowledgement(endpoint, cursor) {
+    requestRelayAcknowledgement(endpoint, cursor, retryAt = 0) {
       const value = checkpoint(endpoint);
       if (value.pending[cursor] === undefined) throw new TaskProtocolError("INVALID_CURSOR", "relay delivery is not pending in this endpoint scope");
-      value.requested[cursor] = true; writeCheckpoint(endpoint, value);
+      value.requested[cursor] = retryAt; writeCheckpoint(endpoint, value);
     },
-    requestedRelayAcknowledgements(endpoint) { return Object.keys(checkpoint(endpoint).requested); },
+    requestedRelayAcknowledgements(endpoint, limit = Number.MAX_SAFE_INTEGER, now = Date.now()) {
+      const value = checkpoint(endpoint);
+      return Object.keys(value.requested).filter(cursor => value.requested[cursor]! <= now).slice(0, limit);
+    },
+    relayAcknowledgementRetryAt(endpoint, cursor) { return checkpoint(endpoint).requested[cursor] ?? 0; },
     acknowledgeRelayCursor(endpoint, cursor) {
       store.transaction(() => {
         const value = checkpoint(endpoint); if (value.pending[cursor] === undefined) return;
@@ -173,6 +218,12 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
       });
     },
     putIntent(intentId, taskId, envelopeId) { put("intents", intentId, { taskId, envelopeId }, true); },
+    getIntentEnvelope(intentId) {
+      const intent = get<{ taskId: string; envelopeId: string }>("intents", intentId);
+      if (!intent) return undefined;
+      const envelope = (get<OutboxRecord>("outbox", intent.envelopeId) ?? get<OutboxQuarantineRecord>("quarantine", intent.envelopeId))?.envelope;
+      return envelope?.taskId === intent.taskId ? envelope : undefined;
+    },
     putInsertionReceipt(taskId, eventId) { requireTask(taskId); return put("insertions", pair(taskId, eventId), true, true); },
     reserveTaskOperation(input) { requireTask(input.taskId); const key = pair(input.taskId, input.operation); const created = put("operations", key, input, true); return { created, record: get<TaskOperationRecord>("operations", key)! }; },
     getEndpointGeneration() { return state<string>("generation"); },
@@ -181,7 +232,7 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
     setEndpointBinding(value) { put("state", "endpoint", value); },
     getRelayTransportBinding() { return state<RelayTransportBinding>("transport"); },
     setRelayTransportBinding(value) { put("state", "transport", value); },
-    clear() { check(); if (frames.length) throw new Error("cannot clear task state during a transaction"); tables.clear(); bytes = entries = sequence = 0; },
+    clear() { check(); if (frames.length) throw new Error("cannot clear task state during a transaction"); tables.clear(); pendingOutbox.clear(); bytes = entries = sequence = 0; },
     close() { if (closed) return; store.clear(); closed = true; },
   };
   return store;

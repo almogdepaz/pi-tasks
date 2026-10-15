@@ -4,6 +4,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 import { abortableSleep } from "./abortable-sleep";
+import { createTaskWorkScope } from "./task-work-scope";
 import { deliverTaskInbox, incorporatedTaskEvents } from "./task-inbox";
 import { TaskDeliveryEvidenceState, TaskDeliveryStage, TaskOutboxDeliveryError, TaskProtocolError, isBlockedOutboxDeliveryCode } from "./task-protocol";
 import { createConfiguredTaskCore } from "./configured-task-core";
@@ -113,18 +114,21 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		const epoch = lifecycleEpoch;
 		const isCurrent = (): boolean => inboxContext === context && lifecycleEpoch === epoch;
 		if (!context) return undefined;
+		const work = createTaskWorkScope(signal);
+		work.retryAllowed = false; // Reserve initial intake ahead of speculative backlog work and ACK repair.
+		signal = work.signal;
 		const activeCore = await configuredCore(signal);
 		if (!isCurrent()) return undefined;
 		let outboxError: unknown;
 		try {
-			await activeCore.flushOutbox(signal);
+			await activeCore.connect(signal, work);
 		} catch (error) {
 			if (isRelayLoss(error)) return error;
 			outboxError = error;
 		}
 		if (!isCurrent()) return undefined;
 		try {
-			await activeCore.evaluateTimeouts(signal);
+			await activeCore.evaluateTimeouts(signal, work);
 		} catch (error) {
 			if (isRelayLoss(error)) return error;
 			outboxError ??= error;
@@ -132,20 +136,26 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		if (!isCurrent()) return undefined;
 		const guardedCore: TaskCore = {
 			...activeCore,
-			async receive(receiveSignal) {
+			async receive(receiveSignal, receiveWork) {
 				if (!isCurrent()) return [];
-				const deliveries = await activeCore.receive(receiveSignal);
+				const deliveries = await activeCore.receive(receiveSignal, receiveWork);
 				return isCurrent() ? deliveries : [];
 			},
-			async acknowledgeRelayDelivery(cursor, acknowledgementSignal) {
-				if (isCurrent()) await activeCore.acknowledgeRelayDelivery(cursor, acknowledgementSignal);
+			async acknowledgeRelayDelivery(cursor, acknowledgementSignal, acknowledgementWork) {
+				if (isCurrent()) await activeCore.acknowledgeRelayDelivery(cursor, acknowledgementSignal, acknowledgementWork);
 			},
-			async recordInsertion(input, insertionSignal) {
-				if (isCurrent()) await activeCore.recordInsertion(input, insertionSignal);
+			async recordInsertion(input, insertionSignal, insertionWork) {
+				if (isCurrent()) await activeCore.recordInsertion(input, insertionSignal, insertionWork);
 			},
-			recordWakeRequest(input) {
+			async submitIntent(input, intentSignal, intentWork) {
+				if (isCurrent()) await activeCore.submitIntent(input, intentSignal, intentWork);
+			},
+			async flushOutbox(flushSignal, flushWork) {
+				if (isCurrent()) await activeCore.flushOutbox(flushSignal, flushWork);
+			},
+			recordWakeRequest(input, wakeWork) {
 				if (!isCurrent()) throw new TaskProtocolError("RELAY_CLOSED", "task lifecycle was replaced", { retryable: false });
-				const request = activeCore.recordWakeRequest(input);
+				const request = activeCore.recordWakeRequest(input, wakeWork);
 				return { flush: async (flushSignal?: AbortSignal): Promise<void> => {
 					if (!isCurrent()) throw new TaskProtocolError("RELAY_CLOSED", "task lifecycle was replaced", { retryable: false });
 					await request.flush(flushSignal);
@@ -159,7 +169,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 			isIdle: (): boolean => isCurrent() && context.isIdle(),
 			hasPendingMessages: (): boolean => !isCurrent() || context.hasPendingMessages(),
 			sessionManager: context.sessionManager,
-		}, signal);
+		}, signal, work);
 		return outboxError ?? inboxOutboxError;
 	});
 	const startBackgroundRefresh = (context: ExtensionContext, epoch: number): void => {
@@ -220,18 +230,11 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		let activeCore: (TaskCore & Partial<Pick<OwnedTaskCore, "close">>) | undefined;
 		try {
 			activeCore = await configuredCore();
-			let connectionError: unknown;
-			try {
-				await activeCore.connect();
-			} catch (error) {
-				connectionError = error;
-			}
 			if (!isCurrent()) return;
-			if (isRelayLoss(connectionError) && await recoverRelayLoss(context, epoch, activeCore)) return;
 			const outboxError = await refreshInbox();
 			if (!isCurrent()) return;
 			if (isRelayLoss(outboxError) && await recoverRelayLoss(context, epoch, activeCore)) return;
-			const lifecycleError = outboxError ?? connectionError;
+			const lifecycleError = outboxError;
 			const status = lifecycleError === undefined ? undefined : outboxFailureStatus(lifecycleError);
 			context.ui.setStatus("pi-tasks", status === undefined ? undefined : context.ui.theme.fg("warning", status));
 			if (lifecycleError === undefined) announceFreshBinding(context);

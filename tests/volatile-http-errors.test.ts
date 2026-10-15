@@ -86,7 +86,7 @@ for (const rejection of httpFailures) {
       // More sequential failures than the transport's active-request limit:
       // capacity errors must release slots rather than poison later retries.
       for (let attempt = 0; attempt < 10; attempt++) {
-        await expect(core.flushOutbox()).rejects.toMatchObject({ code: rejection.code, retryable: rejection.retryable });
+        await expect(core.flushOutbox()).rejects.toMatchObject({ code: rejection.status === 429 ? "TASK_DELIVERY_DEFERRED" : rejection.code, retryable: rejection.retryable });
       }
       await expect(core.receive()).rejects.toMatchObject({ code: rejection.code, retryable: rejection.retryable });
       expect(f.store.getReceiveCursor()).toBe("42");
@@ -96,11 +96,13 @@ for (const rejection of httpFailures) {
       expect(f.store.outbox("accepted")).toEqual([]);
       expect(f.store.quarantinedOutbox()).toEqual([]);
       expect(core.listTasks()).toEqual(tasks);
-      expect(sends).toHaveLength(12);
+      expect(sends).toHaveLength(rejection.status === 429 ? 1 : 12);
 
       rejecting = false;
+      // Simulate the eligibility boundary rather than sleeping in a regression fixture.
+      if (rejection.status === 429) f.store.postponeOutbox!(pending[0]!.envelope.envelopeId, 0);
       await core.flushOutbox();
-      expect(sends).toHaveLength(13);
+      expect(sends).toHaveLength(rejection.status === 429 ? 2 : 13);
       expect(sends.every(encoded => encoded === sends[0])).toBe(true);
       expect(f.store.outbox("pending")).toEqual([]);
       expect(f.store.outbox("accepted")).toEqual(pending.map(record => ({ ...record, state: "accepted" })));

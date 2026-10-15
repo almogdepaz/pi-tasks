@@ -117,7 +117,7 @@ test("continues timeout and inbox processing while reporting degraded outbox del
 
 	try {
 		await sessionStart!({}, context);
-		expect(calls).toEqual(["connect", "flush", "timeout", "receive"]);
+		expect(calls).toEqual(["connect", "timeout", "receive", "flush"]);
 		expect(statuses.at(-1)).toBe("tasks: outbox degraded");
 	} finally {
 		sessionShutdown?.();
@@ -156,7 +156,7 @@ test("continues inbox receive and reports degradation when timeout delivery fail
 
 	try {
 		await sessionStart!({}, context);
-		expect(calls).toEqual(["connect", "flush", "timeout", "receive"]);
+		expect(calls).toEqual(["connect", "timeout", "receive", "flush"]);
 		expect(statuses.at(-1)).toBe("tasks: outbox degraded");
 	} finally {
 		sessionShutdown?.();
@@ -226,6 +226,7 @@ test("reports inbox delivery evidence failure as outbox degradation after advanc
 		async flushOutbox(): Promise<void> { undefined; },
 		async evaluateTimeouts(): Promise<void> { undefined; },
 		async receive() { return acknowledgements === 0 ? [delivery] : []; },
+		isSelfAuthoredConversation() { return false; },
 		async recordInsertion(): Promise<never> {
 			throw new TaskOutboxDeliveryError("DELIVERY_UNCONFIRMED", "peer delivery outcome is unknown", {
 				retryable: false,
@@ -592,6 +593,7 @@ test("keeps missing idle insertion evidence unacknowledged and retryable after p
 		async flushOutbox(): Promise<void> { undefined; },
 		async evaluateTimeouts(): Promise<void> { undefined; },
 		async receive() { return [delivery]; },
+		isSelfAuthoredConversation() { return false; },
 		async submitIntent(input: { readonly payload: { readonly stage: string; readonly state: string } }): Promise<void> { deliveryEvidence.add(`${input.payload.stage}:${input.payload.state}`); },
 		async recordInsertion(): Promise<void> { recordedInsertions += 1; },
 		async acknowledgeRelayDelivery(): Promise<void> { acknowledgements += 1; },
@@ -665,6 +667,7 @@ test("persists an idle task event before sending one separate wake", async () =>
 		async flushOutbox(): Promise<void> { undefined; },
 		async evaluateTimeouts(): Promise<void> { undefined; },
 		async receive() { return acknowledgements === 0 ? [delivery] : []; },
+		isSelfAuthoredConversation() { return false; },
 		async submitIntent(input): Promise<void> {
 			const { stage, state } = input.payload;
 			if (typeof stage === "string" && typeof state === "string") deliveryEvidence.add(`${stage}:${state}`);
@@ -756,6 +759,7 @@ test("does not flush or acknowledge a captured wake request after session shutdo
 		async flushOutbox(): Promise<void> { undefined; },
 		async evaluateTimeouts(): Promise<void> { undefined; },
 		async receive() { return acknowledgements === 0 ? [delivery] : []; },
+		isSelfAuthoredConversation() { return false; },
 		async recordInsertion(): Promise<void> { undefined; },
 		recordWakeRequest() {
 			wakeRequests += 1;
@@ -974,8 +978,8 @@ test.each(["RELAY_RESET", "RELAY_REBIND_REQUIRED"] as const)("automatically repl
 		await agentSettled!({}, context);
 
 		expect(factoryModes).toEqual([false, true]);
-		expect(oldEvaluations).toBe(1);
-		expect(oldReceives).toBe(1);
+		expect(oldEvaluations).toBe(relayLossCode === "RELAY_RESET" ? 1 : 2);
+		expect(oldReceives).toBe(relayLossCode === "RELAY_RESET" ? 1 : 2);
 		expect(oldCloses).toBe(1);
 		expect(messages).toEqual([{
 			message: {
@@ -1044,7 +1048,7 @@ test("retries a rejected configured core during a later lifecycle inbox refresh"
 	await agentEnd!({}, context);
 
 	expect(attempts).toBe(2);
-	expect(calls).toEqual(["connect", "flush", "timeout", "receive"]);
+	expect(calls).toEqual(["connect", "timeout", "receive", "flush"]);
 });
 
 test("clears a rejected configured core before retrying it", async () => {

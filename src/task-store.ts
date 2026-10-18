@@ -33,7 +33,10 @@ export interface TaskStore {
   /** Indexed lookup, fair rotation and cooldown are required store capabilities. */
   getOutboxRecord(envelopeId: string): OutboxRecord | undefined;
   hasPendingOutbox(): boolean;
+  /** Rotates fairly but yields only each target's oldest pending envelope (per-target FIFO). */
   selectPendingOutbox(limit: number, now: number, maxInspections?: number): readonly OutboxRecord[];
+  /** Older pending envelopes to the same target, oldest first; the envelope may be sent only once this is empty. */
+  pendingOutboxAhead(envelopeId: string): readonly string[];
   outboxRetryAt(envelopeId: string): number;
   postponeOutbox(envelopeId: string, until: number): void;
   markOutboxAccepted(envelopeId: string): void;
@@ -59,6 +62,8 @@ export interface TaskStore {
   getIntentEnvelope(intentId: string): RelayEnvelope | undefined;
   putInsertionReceipt(taskId: string, eventId: string): boolean;
   reserveTaskOperation(input: TaskOperationRecord): { readonly created: boolean; readonly record: TaskOperationRecord };
+  /** Withdraws a reservation whose envelopes were never offered to the relay, with its pending envelopes and intent row. */
+  discardUnsentOperation(taskId: string, operation: string): void;
   getEndpointGeneration(): string | undefined;
   setEndpointGeneration(generation: string): void;
   getEndpointBinding(): TaskEndpoint | undefined;
@@ -83,11 +88,29 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
   const frames: Map<string, Undo>[] = [];
   // ID-only retry rotation, bounded by the existing pending outbox; no payload copy.
   const pendingOutbox = new Map<string, number>();
+  // Per-target FIFO: pending ids grouped by target; outbox cell order is creation order.
+  const pendingByTarget = new Map<string, Set<string>>(), pendingTarget = new Map<string, string>();
   const syncPendingOutbox = (id: string) => {
     const row = tables.get("outbox")?.get(id);
-    if (row && (JSON.parse(row.text) as OutboxRecord).state === "pending") {
+    const record = row && JSON.parse(row.text) as OutboxRecord;
+    if (record?.state === "pending") {
       if (!pendingOutbox.has(id)) pendingOutbox.set(id, 0);
-    } else pendingOutbox.delete(id);
+      if (!pendingTarget.has(id)) {
+        const key = pair(record.envelope.target.relay, record.envelope.target.id);
+        pendingTarget.set(id, key);
+        const ids = pendingByTarget.get(key) ?? new Set<string>(); ids.add(id); pendingByTarget.set(key, ids);
+      }
+    } else {
+      pendingOutbox.delete(id);
+      const key = pendingTarget.get(id);
+      if (key !== undefined) { pendingTarget.delete(id); const ids = pendingByTarget.get(key)!; ids.delete(id); if (!ids.size) pendingByTarget.delete(key); }
+    }
+  };
+  const outboxOrder = (id: string) => tables.get("outbox")!.get(id)!.order;
+  const pendingAhead = (id: string): string[] => {
+    const key = pendingTarget.get(id); if (key === undefined) return [];
+    const order = outboxOrder(id);
+    return [...pendingByTarget.get(key)!].filter(other => outboxOrder(other) < order).sort((a, b) => outboxOrder(a) - outboxOrder(b));
   };
   let bytes = 0, entries = 0, sequence = 0, closed = false;
   const listeners = new Set<() => void>();
@@ -188,13 +211,16 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
       for (let i = 0; i < inspections && selected.length < limit; i++) {
         const [id, retryAt] = pendingOutbox.entries().next().value!;
         pendingOutbox.delete(id); pendingOutbox.set(id, retryAt);
-        if (retryAt <= now) {
-          const record = get<OutboxRecord>("outbox", id);
+        // Only a target's oldest pending envelope is sendable; inspecting any of its ids offers the head.
+        const head = pendingAhead(id)[0] ?? id;
+        if (pendingOutbox.get(head)! <= now && !selected.some(record => record.envelope.envelopeId === head)) {
+          const record = get<OutboxRecord>("outbox", head);
           if (record?.state === "pending") selected.push(record);
         }
       }
       return selected;
     },
+    pendingOutboxAhead(id) { check(); return pendingAhead(id); },
     outboxRetryAt(id) { check(); return pendingOutbox.get(id) ?? 0; },
     postponeOutbox(id, until) { check(); if (pendingOutbox.has(id)) pendingOutbox.set(id, until); },
     markOutboxAccepted(id) { const prior = get<OutboxRecord>("outbox", id); if (prior) put("outbox", id, { ...prior, state: "accepted" }); if (!frames.length) syncPendingOutbox(id); },
@@ -251,13 +277,23 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
     },
     putInsertionReceipt(taskId, eventId) { requireTask(taskId); return put("insertions", pair(taskId, eventId), true, true); },
     reserveTaskOperation(input) { requireTask(input.taskId); const key = pair(input.taskId, input.operation); const created = put("operations", key, input, true); return { created, record: get<TaskOperationRecord>("operations", key)! }; },
+    discardUnsentOperation(taskId, operation) {
+      store.transaction(() => {
+        const key = pair(taskId, operation), record = get<TaskOperationRecord>("operations", key); if (!record) return;
+        for (const id of record.envelopeIds) {
+          if (get<OutboxRecord>("outbox", id)?.state !== "pending") throw new Error("only a pending, never-sent operation can be discarded");
+          remove("outbox", id);
+        }
+        remove("intents", record.logicalId); remove("operations", key);
+      });
+    },
     getEndpointGeneration() { return state<string>("generation"); },
     setEndpointGeneration(value) { put("state", "generation", value); },
     getEndpointBinding() { return state<TaskEndpoint>("endpoint"); },
     setEndpointBinding(value) { put("state", "endpoint", value); },
     getRelayTransportBinding() { return state<RelayTransportBinding>("transport"); },
     setRelayTransportBinding(value) { put("state", "transport", value); },
-    clear() { check(); if (frames.length) throw new Error("cannot clear task state during a transaction"); tables.clear(); pendingOutbox.clear(); bytes = entries = sequence = 0; },
+    clear() { check(); if (frames.length) throw new Error("cannot clear task state during a transaction"); tables.clear(); pendingOutbox.clear(); pendingByTarget.clear(); pendingTarget.clear(); bytes = entries = sequence = 0; },
     close() { if (closed) return; store.clear(); closed = true; },
   };
   return store;

@@ -32,7 +32,7 @@ export interface TaskEventDetails {
 }
 
 type DeliveryEvidencePayload =
-	| { readonly stage: typeof TaskDeliveryStage.receiverRecorded | typeof TaskDeliveryStage.wakeRequested | typeof TaskDeliveryStage.wakeAccepted; readonly state: typeof TaskDeliveryEvidenceState.confirmed }
+	| { readonly stage: typeof TaskDeliveryStage.receiverRecorded | typeof TaskDeliveryStage.wakeAccepted; readonly state: typeof TaskDeliveryEvidenceState.confirmed }
 	| { readonly stage: typeof TaskDeliveryStage.piInsertion; readonly state: typeof TaskDeliveryEvidenceState.blocked; readonly retryable: true };
 
 /** Relay items carry delivery receipts; origin-local items never emit receipts, insertion records or ACKs. */
@@ -72,7 +72,11 @@ export async function deliverTaskInbox(pi: InboxPi, core: TaskCore, context: Inb
 	return outboxError;
 }
 
-/** Idle gate, insertion, rescan, wake and wake evidence for one event. Returns false when presentation is held. */
+/**
+ * Idle gate, insertion, rescan, wake and wake evidence for one event. Returns false when presentation is held.
+ * Receipts collapse to the highest stage reached in this refresh (the origin derives the stages it implies),
+ * plus `pi_insertion` blocked when insertion was not observed.
+ */
 async function presentEvent(pi: InboxPi, core: TaskCore, context: InboxContext, event: TaskEvent, receipts: RelayReceipts | undefined): Promise<boolean> {
 	if (!isKnownEvent(event.type)) throw new TaskProtocolError("UNKNOWN_EVENT", `unknown task inbox event type: ${event.type}`);
 	if (context.hasPendingMessages()) return false;
@@ -84,10 +88,15 @@ async function presentEvent(pi: InboxPi, core: TaskCore, context: InboxContext, 
 		// This is evidence only: no task state or delivery queue is reconstructed.
 		pi.appendEntry(TASK_RECORD_CUSTOM_TYPE, { ...eventDetails, event });
 	}
-	if (receipts && event.type === "task.created") receipts.report(await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.receiverRecorded, state: TaskDeliveryEvidenceState.confirmed }, receipts));
 	if (!modelVisible) return true;
+	const recordReceiver = async () => {
+		if (receipts && event.type === "task.created") receipts.report(await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.receiverRecorded, state: TaskDeliveryEvidenceState.confirmed }, receipts));
+	};
+	const recordInsertion = async () => {
+		if (receipts) receipts.report(await settleDeliveryEvidence(() => core.recordInsertion(eventDetails, receipts.signal, receipts.work)));
+	};
 	if (!incorporatedEvents(context.sessionManager.getEntries()).has(eventKey)) {
-		if (!context.isIdle()) return false;
+		if (!context.isIdle()) { await recordReceiver(); return false; }
 		pi.sendMessage({
 			customType: TASK_EVENT_CUSTOM_TYPE,
 			content: renderTaskEvent(event),
@@ -95,16 +104,21 @@ async function presentEvent(pi: InboxPi, core: TaskCore, context: InboxContext, 
 			details: { ...eventDetails, event },
 		}, { triggerTurn: false });
 		if (!incorporatedEvents(context.sessionManager.getEntries()).has(eventKey)) {
+			await recordReceiver();
 			if (receipts) receipts.report(await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.piInsertion, state: TaskDeliveryEvidenceState.blocked, retryable: true }, receipts));
 			return false;
 		}
 	}
-	if (receipts) receipts.report(await settleDeliveryEvidence(() => core.recordInsertion(eventDetails, receipts.signal, receipts.work)));
-	let wakeAccepted = taskMessageKeys(context.sessionManager.getEntries(), TASK_WAKE_CUSTOM_TYPE).has(eventKey);
-	if (!wakeAccepted && !hasAcknowledgedLocalOriginTerminal(core, event)) {
-		if (!context.isIdle()) return false;
-		// This synchronous local write closes the ACK/wake race; do not await relay I/O before Pi emits the wake.
-		const wakeRequest = receipts && core.recordWakeRequest(eventDetails, receipts.work);
+	if (taskMessageKeys(context.sessionManager.getEntries(), TASK_WAKE_CUSTOM_TYPE).has(eventKey)) {
+		if (receipts) receipts.report(await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.wakeAccepted, state: TaskDeliveryEvidenceState.confirmed }, receipts));
+		return true;
+	}
+	if (hasAcknowledgedLocalOriginTerminal(core, event)) { await recordInsertion(); return true; }
+	if (!context.isIdle()) { await recordInsertion(); return false; }
+	// This synchronous local write closes the ACK/wake race; do not await relay I/O before Pi emits the wake.
+	const wakeRequest = receipts && core.recordWakeRequest(eventDetails, receipts.work);
+	let wakeAccepted = false;
+	try {
 		pi.sendMessage({
 			customType: TASK_WAKE_CUSTOM_TYPE,
 			content: "Process the pending Pi task event.",
@@ -112,10 +126,12 @@ async function presentEvent(pi: InboxPi, core: TaskCore, context: InboxContext, 
 			details: eventDetails,
 		}, { triggerTurn: true, deliverAs: "followUp" });
 		wakeAccepted = taskMessageKeys(context.sessionManager.getEntries(), TASK_WAKE_CUSTOM_TYPE).has(eventKey);
-		if (!wakeAccepted) return false;
-		if (receipts && wakeRequest) receipts.report(await settleDeliveryEvidence(() => wakeRequest.flush(receipts.signal)));
+	} finally {
+		// An unaccepted or throwing wake must not leave a wake_accepted record for the outbox flush.
+		if (!wakeAccepted) wakeRequest?.discard();
 	}
-	if (receipts && wakeAccepted) receipts.report(await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.wakeAccepted, state: TaskDeliveryEvidenceState.confirmed }, receipts));
+	if (!wakeAccepted) { await recordInsertion(); return false; }
+	if (receipts && wakeRequest) receipts.report(await settleDeliveryEvidence(() => wakeRequest.flush(receipts.signal)));
 	return true;
 }
 

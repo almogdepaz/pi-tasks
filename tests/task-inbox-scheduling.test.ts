@@ -153,9 +153,10 @@ for (const state of ["empty", "busy", "queued", "missing-insertion", "evidence-e
       expect(childStore.getOutboxRecord(old.envelopeId)).toEqual({ state: "accepted", envelope: old });
       if (state === "busy" || state === "queued" || state === "missing-insertion" || state === "evidence-error") {
         expect(childStore.getReceiveCursor()).toBe("0");
-        expect(ui.messages.filter(message => message.customType === "pi-tasks-wake")).toEqual([]);
+        // The only common-path receipt is wake_accepted, flushed after the observed wake.
+        expect(ui.messages.filter(message => message.customType === "pi-tasks-wake")).toHaveLength(state === "evidence-error" ? 1 : 0);
       }
-      if (state === "evidence-error") expect(childStore.outbox("pending").map(row => row.envelope.kind)).toEqual(["intent"]);
+      if (state === "evidence-error") expect(childStore.outbox("pending").map(row => [row.envelope.kind, (JSON.parse(row.envelope.payload) as { payload: { stage: string } }).payload.stage])).toEqual([["intent", "wake_accepted"]]);
     } finally { parentStore.close(); childStore.close(); }
   });
 }

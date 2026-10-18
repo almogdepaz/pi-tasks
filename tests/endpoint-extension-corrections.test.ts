@@ -234,17 +234,22 @@ test("reports inbox delivery evidence failure as outbox degradation after advanc
 		async evaluateTimeouts(): Promise<void> { undefined; },
 		async receive() { return acknowledgements === 0 ? [{ kind: "relay" as const, delivery, order: 1 }] : []; },
 		isSelfAuthoredConversation() { return false; },
-		async recordInsertion(): Promise<never> {
-			throw new TaskOutboxDeliveryError("DELIVERY_UNCONFIRMED", "peer delivery outcome is unknown", {
-				retryable: false,
-				details: { mayHaveBeenDelivered: true },
-			});
-		},
+		async recordInsertion(): Promise<void> { undefined; },
 		async submitIntent(): Promise<void> { undefined; },
 		recordWakeRequest() {
 			wakeRequests += 1;
 			wakeOrder.push("request");
-			return { async flush(): Promise<void> { wakeFlushes += 1; wakeOrder.push("flush"); } };
+			// The common path's only receipt is the wake evidence; its delivery is blocked.
+			return {
+				async flush(): Promise<never> {
+					wakeFlushes += 1; wakeOrder.push("flush");
+					throw new TaskOutboxDeliveryError("DELIVERY_UNCONFIRMED", "peer delivery outcome is unknown", {
+						retryable: false,
+						details: { mayHaveBeenDelivered: true },
+					});
+				},
+				discard(): void { undefined; },
+			};
 		},
 		async acknowledgeRelayDelivery(): Promise<void> { acknowledgements += 1; },
 		async acknowledgeParent(): Promise<void> { undefined; },
@@ -673,13 +678,16 @@ test("persists an idle task event before sending one separate wake", async () =>
 		},
 		async recordInsertion(): Promise<void> { recordedInsertions = 1; },
 		recordWakeRequest() {
-			deliveryEvidence.add("wake_requested:confirmed");
+			deliveryEvidence.add("wake_accepted:confirmed");
 			wakeOrder.push("request");
-			return { flush: async (): Promise<void> => {
-				wakeOrder.push("flush");
-				signalWakeFlush();
-				await wakeFlush;
-			} };
+			return {
+				flush: async (): Promise<void> => {
+					wakeOrder.push("flush");
+					signalWakeFlush();
+					await wakeFlush;
+				},
+				discard: (): void => { deliveryEvidence.delete("wake_accepted:confirmed"); },
+			};
 		},
 		async acknowledgeRelayDelivery(): Promise<void> { acknowledgements += 1; },
 		async acknowledgeParent(): Promise<void> { undefined; },
@@ -719,16 +727,16 @@ test("persists an idle task event before sending one separate wake", async () =>
 			{ customType: "pi-tasks-wake", triggerTurn: true },
 		]);
 		expect(entries.filter((entry) => typeof entry === "object" && entry !== null && "customType" in entry && entry.customType === "pi-tasks-event")).toHaveLength(1);
-		expect(recordedInsertions).toBe(1);
+		expect(recordedInsertions).toBe(0); // The wake evidence implies the insertion.
 		expect(wakeOrder).toEqual(["request", "wake", "flush"]);
 		expect(acknowledgements).toBe(0);
 
 		releaseWakeFlush();
 		await settled;
 		expect(sent).toHaveLength(2);
-		expect(recordedInsertions).toBe(1);
+		expect(recordedInsertions).toBe(0);
 		expect(acknowledgements).toBe(1);
-		expect([...deliveryEvidence]).toEqual(["receiver_recorded:confirmed", "wake_requested:confirmed", "wake_accepted:confirmed"]);
+		expect([...deliveryEvidence]).toEqual(["receiver_recorded:confirmed", "wake_accepted:confirmed"]);
 	} finally {
 		sessionShutdown?.();
 	}
@@ -765,7 +773,7 @@ test("does not flush or acknowledge a captured wake request after session shutdo
 		async recordInsertion(): Promise<void> { undefined; },
 		recordWakeRequest() {
 			wakeRequests += 1;
-			return { async flush(): Promise<void> { wakeFlushes += 1; } };
+			return { async flush(): Promise<void> { wakeFlushes += 1; }, discard(): void { undefined; } };
 		},
 		async submitIntent(): Promise<void> { undefined; },
 		async acknowledgeRelayDelivery(): Promise<void> { acknowledgements += 1; },

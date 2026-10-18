@@ -46,9 +46,9 @@ test("rotation advances past rejecting targets and recovers immutable old work w
   store.close();
 });
 
-test("old work has a positive share during continuous fresh scoped operations", async () => {
+test("old work has a positive share during continuous fresh scoped operations to another target", async () => {
   const store = createTaskStore(), attempts: string[] = [];
-  for (let i = 0; i < 24; i++) store.putOutbox(envelope(`old-${i}`));
+  for (let i = 0; i < 24; i++) store.putOutbox(envelope(`old-${i}`, { ...target, id: "elsewhere" }));
   const core = createTaskCore({ endpoint: origin, store, relay: relay(async input => { attempts.push(input.envelopeId); return { envelopeId: input.envelopeId }; }) });
   for (let i = 0; i < 4; i++) {
     const before = attempts.length;
@@ -56,6 +56,24 @@ test("old work has a positive share during continuous fresh scoped operations", 
     expect(attempts.length - before).toBeLessThanOrEqual(9);
   }
   expect(store.outbox("accepted").filter(record => record.envelope.envelopeId.startsWith("old-"))).toHaveLength(24);
+  store.close();
+});
+
+test("old mail to the same target drains first under the bounded retry budget", async () => {
+  const store = createTaskStore(), attempts: string[] = [];
+  for (let i = 0; i < 24; i++) store.putOutbox(envelope(`old-${i}`));
+  const core = createTaskCore({ endpoint: origin, store, relay: relay(async input => { attempts.push(input.envelopeId); return { envelopeId: input.envelopeId }; }) });
+  for (let i = 0; i < 4; i++) {
+    const before = attempts.length;
+    // Per-target fifo: a fresh assignment defers behind older mail, which drains under the bounded retry budget.
+    try { await core.createTask({ target, task: `new-${i}`, timeoutMs: 60_000 }); } catch (error) {
+      expect(error).toMatchObject({ code: "TASK_DELIVERY_DEFERRED" });
+    }
+    expect(attempts.length - before).toBeLessThanOrEqual(9);
+  }
+  expect(store.outbox("pending")).toEqual([]);
+  expect(attempts).toEqual(store.outbox("accepted").map(record => record.envelope.envelopeId)); // relay order is creation order
+  expect(attempts.slice(0, 24)).toEqual(Array.from({ length: 24 }, (_, i) => `old-${i}`));
   store.close();
 });
 

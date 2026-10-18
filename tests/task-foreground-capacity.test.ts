@@ -4,7 +4,7 @@ import { createTaskStore } from '../src/task-store';
 import { TaskProtocolError } from '../src/task-protocol';
 import type { TaskRelay } from '../src/task-protocol';
 
-test.each([true, false])('foreground byte capacity preserves a bounded old-work opportunity (small packets fit: %s)', async smallFits => {
+test.each([true, false])('foreground byte capacity keeps per-target fifo with bounded old work (small packets fit: %s)', async smallFits => {
   const origin = { relay: 'memory', id: 'origin' }, target = { relay: 'memory', id: 'target' };
   const store = createTaskStore(), attempts: string[] = [];
   let seeding = true;
@@ -24,20 +24,23 @@ test.each([true, false])('foreground byte capacity preserves a bounded old-work 
   const core = createTaskCore({ endpoint: origin, store, relay: transport });
   for (let i = 0; i < 8; i++) {
     try { await core.createTask({ target, task: `small-${i}`, timeoutMs: 60_000 }); }
-    catch (error) { expect(error).toMatchObject({ code: 'RELAY_UNAVAILABLE' }); }
+    catch (error) { expect(['RELAY_UNAVAILABLE', 'TASK_DELIVERY_DEFERRED']).toContain((error as TaskProtocolError).code); }
   }
-  const oldIds = new Set(store.outbox('pending').map(record => record.envelope.envelopeId));
+  const oldIds = store.outbox('pending').map(record => record.envelope.envelopeId);
+  expect(oldIds).toHaveLength(8);
   seeding = false; attempts.length = 0;
   for (let i = 0; i < 8; i++) {
     const before = attempts.length;
     try { await core.createTask({ target, task: 'x'.repeat(16_384), timeoutMs: 60_000 }); } catch (error) {
-      expect(error).toMatchObject({ code: 'RELAY_CAPACITY' });
+      expect(['RELAY_CAPACITY', 'TASK_DELIVERY_DEFERRED']).toContain((error as TaskProtocolError).code);
     }
     expect(attempts.length - before).toBeLessThanOrEqual(9);
-    if (!smallFits) expect(attempts.slice(before).filter(id => oldIds.has(id))).toHaveLength(1);
   }
-  const oldAttempts = attempts.filter(id => oldIds.has(id));
   const accepted = store.outbox('accepted').map(item => item.envelope.envelopeId);
-  console.log(JSON.stringify({ probe: 'foreground-capacity-old-share', operations: 8, oldAttempts, accepted, attempts: attempts.length }));
-  try { expect(accepted).toHaveLength(smallFits ? 8 : 0); expect(oldAttempts).toHaveLength(8); } finally { store.close(); }
+  console.log(JSON.stringify({ probe: 'foreground-capacity-fifo', operations: 8, attempts, accepted }));
+  try {
+    // Old mail goes strictly first; once the head is refused, nothing younger to the target is attempted during its cooldown.
+    if (smallFits) { expect(accepted).toEqual(oldIds); expect(attempts).toHaveLength(9); expect(attempts.slice(0, 8)).toEqual(oldIds); }
+    else { expect(accepted).toEqual([]); expect(attempts).toEqual(oldIds.slice(0, 1)); }
+  } finally { store.close(); }
 });

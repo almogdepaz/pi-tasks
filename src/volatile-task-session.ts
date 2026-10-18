@@ -123,6 +123,7 @@ class Transport {
   private expiresAt = 0;
   private renewing: Promise<RelayTransportBinding> | undefined;
   private active = 0;
+  private readonly waiters: Array<{ reserved: boolean; grant(): void }> = [];
   constructor(private url: string, private caller: string, private generation: string, prior: RelayTransportBinding | undefined,
     private fetcher: typeof fetch, private timeoutMs: number, private onReset: (expected: RelayTransportBinding | undefined) => void) { this.binding = prior; }
   stop(): void { this.stopSignal.abort(); }
@@ -202,13 +203,34 @@ class Transport {
       },
     };
   }
+  // FIFO in-flight slots: 8 for ordinary requests, 2 more held for acknowledge/connect.
+  // A waiter has sent nothing, so its abort is a plain retryable ABORTED; RELAY_CAPACITY
+  // only ever comes from the server.
+  private fits(reserved: boolean): boolean { return this.active < (reserved ? 10 : 8); }
+  private acquire(reserved: boolean, signal?: AbortSignal): Promise<void> {
+    if (this.fits(reserved)) { this.active++; return Promise.resolve(); }
+    return new Promise((resolve, reject) => {
+      const cleanup = () => { signal?.removeEventListener("abort", cancel); this.stopSignal.signal.removeEventListener("abort", cancel); };
+      const waiter = { reserved, grant: () => { cleanup(); this.active++; resolve(); } };
+      const cancel = () => {
+        cleanup(); this.waiters.splice(this.waiters.indexOf(waiter), 1);
+        reject(this.stopSignal.signal.aborted ? failure("RELAY_RESET", false, { mayHaveBeenDelivered: true }) : failure("ABORTED", true));
+      };
+      this.waiters.push(waiter);
+      signal?.addEventListener("abort", cancel, { once: true }); this.stopSignal.signal.addEventListener("abort", cancel, { once: true });
+      if (signal?.aborted) cancel();
+    });
+  }
+  private release(): void {
+    this.active--;
+    for (const waiter of [...this.waiters]) if (this.fits(waiter.reserved)) { this.waiters.splice(this.waiters.indexOf(waiter), 1); waiter.grant(); }
+  }
   private async request(body: Record<string, unknown>, signal?: AbortSignal): Promise<{ epoch: string; value: unknown }> {
     this.assertActive();
     const reserved = body.operation === "acknowledge" || body.operation === "connect";
-    if (this.active >= (reserved ? 10 : 8)) throw failure("RELAY_CAPACITY", true);
     const encoded = JSON.stringify(body);
     if (Buffer.byteLength(encoded) > 64 * 1024) throw failure("PAYLOAD_TOO_LARGE", false);
-    this.active++;
+    await this.acquire(reserved, signal);
     const controller = new AbortController();
     let timedOut = false;
     const abort = () => controller.abort();
@@ -271,7 +293,7 @@ class Transport {
       if (error instanceof TaskProtocolError) throw error;
       throw failure("RELAY_UNAVAILABLE", true, { mayHaveBeenDelivered: true });
     } finally {
-      clearTimeout(timer); this.active--; signal?.removeEventListener("abort", abort); this.stopSignal.signal.removeEventListener("abort", abort); controller.signal.removeEventListener("abort", rejectAbort);
+      clearTimeout(timer); this.release(); signal?.removeEventListener("abort", abort); this.stopSignal.signal.removeEventListener("abort", abort); controller.signal.removeEventListener("abort", rejectAbort);
     }
   }
 }

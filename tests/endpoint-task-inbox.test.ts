@@ -36,7 +36,7 @@ test("archives non-waking facts before ACK, deduplicates an ACK retry and retain
 		await parent.receive(); await deliverTaskInbox(pi, child, context);
 		const records = entries.filter(entry => entry.customType === "pi-tasks-event-record");
 		expect(records.some(entry => entry.data.event.type === "task.parent_acknowledged")).toBe(true);
-		expect(records.some(entry => entry.data.event.type === "task.delivery_receipt")).toBe(true);
+		expect(records.some(entry => entry.data.event.type === "task.delivery_receipt")).toBe(false); // Receipts stay at the origin.
 		expect(new Set(records.map(entry => entry.data.eventId)).size).toBe(records.length);
 		expect(records.every(entry => entry.data.event.taskId === task.taskId)).toBe(true);
 		expect(entries.some(entry => entry.type === "custom_message" && entry.details?.event?.type === "task.parent_acknowledged")).toBe(false);
@@ -122,7 +122,7 @@ test("records inbound RAM state and structural session evidence before relay ack
 	expect(relay.envelopesFor(receiver)).toHaveLength(1);
 	await parent.receive();
 	expect(parent.getTask(created.taskId)?.events.filter((event) => event.type === "task.delivery_receipt").map((event) => event.payload.stage)).toEqual([
-		"receiver_recorded", "pi_inserted", "wake_requested", "wake_accepted",
+		"wake_accepted",
 	]);
 });
 
@@ -186,7 +186,7 @@ test("keeps the relay delivery retryable until a separate wake is durably accept
 	expect(entries.filter((entry) => typeof entry === "object" && entry !== null && "customType" in entry && entry.customType === "pi-tasks-event" && "details" in entry && typeof entry.details === "object" && entry.details !== null && "taskId" in entry.details && entry.details.taskId === created.taskId)).toHaveLength(1);
 	await parent.receive();
 	expect(parent.getTask(created.taskId)?.events.filter((event) => event.type === "task.delivery_receipt").map((event) => event.payload.stage)).toEqual([
-		"receiver_recorded", "pi_inserted", "wake_requested", "wake_accepted",
+		"wake_accepted",
 	]);
 });
 
@@ -476,10 +476,10 @@ test("origin acknowledges raw receiver intents and renders their canonical messa
 
 	expect(parent.getTask(created.taskId)?.status).toBe("completed");
 	expect(parent.getTask(created.taskId)?.events.filter((event) => event.type === "task.delivery_receipt").map((event) => event.payload.stage)).toEqual([
-		"receiver_recorded", "pi_inserted", "wake_requested", "wake_accepted",
+		"wake_accepted",
 	]);
 	expect(parent.getTask(created.taskId)?.events.slice(-2).map((event) => event.type)).toEqual(["task.information", "task.completed"]);
-	expect(parentStore.getReceiveCursor()).toBe("7");
+	expect(parentStore.getReceiveCursor()).toBe("4"); // One collapsed receipt instead of four.
 	// Canonical events are queued locally while the raw intents are acknowledged, so the same refresh renders them.
 	expect(parentEntries).toEqual(expect.arrayContaining([
 		expect.objectContaining({ type: "custom_message", content: expect.stringContaining("progress") }),

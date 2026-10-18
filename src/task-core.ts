@@ -64,9 +64,11 @@ export type SubmitIntentOutcome =
 	| { readonly authority: "origin"; readonly canonicalEvent: { readonly type: string; readonly reused: boolean } }
 	| { readonly authority: "receiver" };
 
-/** Local wake-request evidence is persisted before Pi wake emission; relay delivery is flushed afterward. */
+/** Local `wake_accepted` evidence is persisted before Pi wake emission; flush delivers it once the wake is observed. */
 export interface WakeRequest {
 	flush(signal?: AbortSignal): Promise<void>;
+	/** Withdraws the never-sent record when Pi did not accept the wake; call synchronously after the wake attempt. */
+	discard(): void;
 }
 
 /** One presentable inbox item, merged by store arrival order. Local items are origin-canonicalized events that never travel through the relay to the origin. */
@@ -286,20 +288,31 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 			await flushDeliveryEvidence(options, signal, input.taskId, persistedEnvelopeIds, evidence, work, flush);
 		},
 		recordWakeRequest(input, work) {
-			const task = requiredTask(options.store, input.taskId);
-			const evidence: DeliveryEvidence = { eventId: input.eventId, stage: TaskDeliveryStage.wakeRequested, state: TaskDeliveryEvidenceState.confirmed };
-			let persistedEnvelopeIds: readonly string[] = [];
-			options.store.transaction(() => {
-				persistedEnvelopeIds = persistIntent(options, clock.now, ids, task, {
+			const evidence: DeliveryEvidence = { eventId: input.eventId, stage: TaskDeliveryStage.wakeAccepted, state: TaskDeliveryEvidenceState.confirmed };
+			const operation = deliveryEvidenceOperation(evidence);
+			const persist = () => options.store.transaction(() => {
+				options.store.putInsertionReceipt(input.taskId, input.eventId);
+				return persistIntent(options, clock.now, ids, requiredTask(options.store, input.taskId), {
 					taskId: input.taskId,
 					type: "task.delivery_receipt",
 					payload: { eventId: input.eventId, stage: evidence.stage, state: evidence.state },
-				}, deliveryEvidenceOperation(evidence)).envelopeIds;
+				}, operation);
 			});
-			return { flush: async (signal?: AbortSignal): Promise<void> => {
-				const activeWork = work ?? createTaskWorkScope(signal);
-				await flushDeliveryEvidence(options, activeWork.signal, input.taskId, persistedEnvelopeIds, evidence, activeWork, flush);
-			} };
+			// An origin canonicalizes evidence straight into its task log, which cannot be withdrawn,
+			// so it records on flush; a receiver writes its outbound record before the wake.
+			let persisted = sameEndpoint(options.endpoint, requiredTask(options.store, input.taskId).origin) ? undefined : persist();
+			return {
+				flush: async (signal?: AbortSignal): Promise<void> => {
+					persisted ??= persist();
+					const activeWork = work ?? createTaskWorkScope(signal);
+					await flushDeliveryEvidence(options, activeWork.signal, input.taskId, persisted.envelopeIds, evidence, activeWork, flush);
+				},
+				discard: () => {
+					// No await separates the write from this call, so the envelope was never offered to the relay.
+					if (persisted?.created) options.store.discardUnsentOperation(input.taskId, operation);
+					persisted = undefined;
+				},
+			};
 		},
 		async evaluateTimeouts(signal, work = createTaskWorkScope(signal)) {
 			signal = work.signal;
@@ -387,6 +400,8 @@ function persistReceivedEnvelope(options: TaskCoreOptions, now: () => number, id
 interface PersistedIntent {
 	readonly envelopeIds: readonly string[];
 	readonly outcome: SubmitIntentOutcome;
+	/** False when an existing operation reservation was reused. */
+	readonly created: boolean;
 }
 
 function persistIntent(options: TaskCoreOptions, now: () => number, ids: () => string, task: TaskRecord, input: SubmitIntentInput, reservedOperation?: string): PersistedIntent {
@@ -396,7 +411,7 @@ function persistIntent(options: TaskCoreOptions, now: () => number, ids: () => s
 		// The origin already recorded its own conversational event; present only peer-authored conversations for model incorporation.
 		const presentToOrigin = !CONVERSATIONAL_EVENTS.has(input.type);
 		const canonical = canonicalize(options, now, ids, task, { intentId: ids(), taskId: input.taskId, type: input.type, payload: input.payload }, input.type, operation, presentToOrigin);
-		return { envelopeIds: canonical.envelopeIds, outcome: { authority: "origin", canonicalEvent: { type: canonical.eventType, reused: canonical.reused } } };
+		return { envelopeIds: canonical.envelopeIds, outcome: { authority: "origin", canonicalEvent: { type: canonical.eventType, reused: canonical.reused } }, created: !canonical.reused };
 	}
 	const envelopeId = ids();
 	const intent: TaskIntent = { intentId: ids(), taskId: input.taskId, type: input.type, payload: input.payload };
@@ -416,12 +431,12 @@ function persistIntent(options: TaskCoreOptions, now: () => number, ids: () => s
 					details: { taskId: input.taskId, existingType: reservation.record.logicalType, requestedType: intent.type },
 				});
 			}
-			return { envelopeIds: reservation.record.envelopeIds, outcome: { authority: "receiver" } };
+			return { envelopeIds: reservation.record.envelopeIds, outcome: { authority: "receiver" }, created: false };
 		}
 	}
 	options.store.putIntent(intent.intentId, input.taskId, envelopeId);
 	options.store.putOutbox(envelope(envelopeId, options.endpoint, task.origin, input.taskId, TaskEnvelopeKind.intent, intent, now()));
-	return { envelopeIds: [envelopeId], outcome: { authority: "receiver" } };
+	return { envelopeIds: [envelopeId], outcome: { authority: "receiver" }, created: true };
 }
 
 interface DeliveryEvidence {
@@ -463,7 +478,9 @@ function canonicalize(options: TaskCoreOptions, now: () => number, ids: () => st
 	const canonical = event(task, ids(), type, sequence, options.endpoint, task.target, now(), { ...intent.payload, intentId: intent.intentId });
 	// A self-targeted task presents through its target envelope; suppress that for its own conversations.
 	const selfTarget = sameEndpoint(task.origin, task.target);
-	const targetEnvelope = !presentToOrigin && selfTarget ? undefined : envelope(ids(), options.endpoint, task.target, task.taskId, TaskEnvelopeKind.canonicalEvent, canonical, canonical.occurredAt);
+	// Delivery evidence is origin-local status: no fan-out to the target and no presentation.
+	const originLocal = requestedType === "task.delivery_receipt";
+	const targetEnvelope = originLocal || (!presentToOrigin && selfTarget) ? undefined : envelope(ids(), options.endpoint, task.target, task.taskId, TaskEnvelopeKind.canonicalEvent, canonical, canonical.occurredAt);
 	const persistedEnvelopeIds = targetEnvelope === undefined ? [] : [targetEnvelope.envelopeId];
 	if (operation !== undefined) {
 		const reservation = options.store.reserveTaskOperation({ taskId: task.taskId, operation, logicalId: canonical.eventId, logicalType: canonical.type, envelopeIds: persistedEnvelopeIds });
@@ -472,7 +489,7 @@ function canonicalize(options: TaskCoreOptions, now: () => number, ids: () => st
 	options.store.appendEvent(canonical);
 	if (TERMINAL_EVENTS.has(type)) options.store.setStatus(task.taskId, statusFor(type));
 	if (targetEnvelope !== undefined) options.store.putOutbox(targetEnvelope);
-	if (presentToOrigin && !selfTarget) options.store.enqueuePresentation({ taskId: task.taskId, eventId: canonical.eventId });
+	if (presentToOrigin && !selfTarget && !originLocal) options.store.enqueuePresentation({ taskId: task.taskId, eventId: canonical.eventId });
 	return { envelopeIds: persistedEnvelopeIds, eventType: type, reused: false };
 }
 
@@ -506,6 +523,13 @@ function createOutboxFlusher(options: TaskCoreOptions): OutboxFlusher {
 	const inFlight = new Map<string, Promise<void>>();
 	const send = async (record: OutboxRecord, retry: boolean, work: TaskWorkScope): Promise<void> => {
 		const id = record.envelope.envelopeId;
+		// Per-target FIFO: older pending mail to the same target goes first. Wait out an
+		// older send already in flight instead of racing it; otherwise defer behind it.
+		for (let ahead = options.store.pendingOutboxAhead(id); ahead.length; ahead = options.store.pendingOutboxAhead(id)) {
+			const older = ahead.map(olderId => inFlight.get(olderId)).find(Boolean);
+			if (!older) throw deferredTaskDelivery({ envelopeId: id, blockedBy: ahead[0], retryAfterMs: Math.max(0, options.store.outboxRetryAt(ahead[0]!) - Date.now()) });
+			await waitForRelayOperation(older.catch(() => undefined), work.signal);
+		}
 		const joined = inFlight.get(id);
 		if (joined) { await waitForRelayOperation(joined, work.signal); return; }
 		const retryAt = options.store.outboxRetryAt(id);
@@ -543,6 +567,14 @@ function createOutboxFlusher(options: TaskCoreOptions): OutboxFlusher {
 				const quarantined = options.store.quarantinedOutbox().find(item => item.envelope.envelopeId === id);
 				failure ??= quarantined ? new TaskProtocolError(quarantined.errorCode, quarantined.reason, { retryable: false, details: quarantined.details }) : deferredTaskDelivery({ envelopeId: id });
 				continue;
+			}
+			// Offer older pending mail to the same target first, as bounded old work (retry
+			// budget and background window); its failure leaves this envelope deferred.
+			for (const olderId of options.store.pendingOutboxAhead(id)) {
+				const older = options.store.getOutboxRecord(olderId);
+				if (!older || inFlight.has(olderId)) continue;
+				if (work.blockedRetryTargets.has(JSON.stringify(older.envelope.target))) break;
+				try { await send(older, true, work); } catch (error) { if (work.signal.aborted) throw error; break; }
 			}
 			try { await send(record, false, work); } catch (error) {
 				if (work.signal.aborted) throw error;

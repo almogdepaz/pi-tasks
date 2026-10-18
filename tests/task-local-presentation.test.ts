@@ -151,7 +151,9 @@ test("parent acknowledgement works after local presentation and drains non-visib
 	expect(events.filter(event => event.type === "task.delivery_receipt").length).toBeGreaterThan(0);
 	expect(f.stores.origin.pendingPresentations()).toEqual([]);
 	const archived = new Set(f.parentPi.records.flatMap(record => record.customType === "pi-tasks-event-record" ? [(record.data as TaskEventDetails).eventId] : []));
-	for (const event of events.filter(candidate => candidate.type === "task.delivery_receipt" || candidate.type === "task.parent_acknowledged")) expect(archived.has(event.eventId)).toBe(true);
+	for (const event of events.filter(candidate => candidate.type === "task.parent_acknowledged")) expect(archived.has(event.eventId)).toBe(true);
+	// Delivery receipts are origin-local status: recorded in the log, never presented or archived.
+	for (const event of events.filter(candidate => candidate.type === "task.delivery_receipt")) expect(archived.has(event.eventId)).toBe(false);
 	expect(f.parentPi.events()).toEqual([completion(f).eventId]);
 	f.close();
 });

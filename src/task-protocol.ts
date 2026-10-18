@@ -18,6 +18,11 @@ export function isBlockedOutboxDeliveryCode(code: string): boolean {
 	return BLOCKED_OUTBOX_DELIVERY_CODES.has(code);
 }
 
+/**
+ * Ordered receiver_recorded < pi_inserted < wake_accepted; a later stage implies the earlier ones.
+ * Receivers emit the highest stage reached per refresh plus pi_insertion blocked. wake_requested is
+ * accepted from 0.1.15 receivers but no longer emitted.
+ */
 export const TaskDeliveryStage = {
 	receiverRecorded: "receiver_recorded",
 	piInsertion: "pi_insertion",

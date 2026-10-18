@@ -163,10 +163,14 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 			recordWakeRequest(input, wakeWork) {
 				if (!isCurrent()) throw new TaskProtocolError("RELAY_CLOSED", "task lifecycle was replaced", { retryable: false });
 				const request = activeCore.recordWakeRequest(input, wakeWork);
-				return { flush: async (flushSignal?: AbortSignal): Promise<void> => {
-					if (!isCurrent()) throw new TaskProtocolError("RELAY_CLOSED", "task lifecycle was replaced", { retryable: false });
-					await request.flush(flushSignal);
-				} };
+				return {
+					flush: async (flushSignal?: AbortSignal): Promise<void> => {
+						if (!isCurrent()) throw new TaskProtocolError("RELAY_CLOSED", "task lifecycle was replaced", { retryable: false });
+						await request.flush(flushSignal);
+					},
+					// A replaced lifecycle discards its own state; there is nothing left to withdraw.
+					discard() { if (isCurrent()) request.discard(); },
+				};
 			},
 		};
 		const inboxOutboxError = await deliverTaskInbox({
@@ -516,8 +520,13 @@ function taskDeliveryEvidence(task: TaskSnapshot): TaskDeliveryEvidence {
 			receiverReceipt = "confirmed";
 			piInsertion = "confirmed";
 		}
+		// Legacy v0.1.15 receivers still send wake_requested; current receivers send only the highest stage.
 		if (event.payload.stage === TaskDeliveryStage.wakeRequested) wakeAcceptance = "pending";
-		if (event.payload.stage === TaskDeliveryStage.wakeAccepted) wakeAcceptance = "confirmed";
+		if (event.payload.stage === TaskDeliveryStage.wakeAccepted) {
+			receiverReceipt = "confirmed";
+			piInsertion = "confirmed";
+			wakeAcceptance = "confirmed";
+		}
 	}
 	return { receiverReceipt, piInsertion, wakeAcceptance, modelExecution: "not_evidenced" };
 }

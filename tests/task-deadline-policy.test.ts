@@ -4,7 +4,7 @@ import { createTaskStore } from "../src/task-store";
 import { TASK_PROTOCOL_VERSION, TaskProtocolError, type RelayEnvelope, type TaskRelay } from "../src/task-protocol";
 
 const origin = { relay: "memory", id: "origin" }, target = { relay: "memory", id: "target" };
-const envelope = (id: string): RelayEnvelope => ({ envelopeId: id, taskId: id, source: origin, target,
+const envelope = (id: string, destination = target): RelayEnvelope => ({ envelopeId: id, taskId: id, source: origin, target: destination,
   kind: "assignment", protocolVersion: TASK_PROTOCOL_VERSION, payload: "{}", createdAt: new Date().toISOString() });
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -71,8 +71,8 @@ for (const operation of ["send", "message", "done"] as const) {
   }, 8_000);
 }
 
-test("slow foreground acceptance cannot leave speculative old work unbounded", async () => {
-  const store = createTaskStore(), transport = relay(), old = envelope("old"); store.putOutbox(old);
+test("slow foreground acceptance cannot leave speculative old work to another target unbounded", async () => {
+  const store = createTaskStore(), transport = relay(), old = envelope("old", { ...target, id: "elsewhere" }); store.putOutbox(old);
   let release!: () => void, entered!: () => void;
   const held = new Promise<void>(resolve => { release = resolve; }), started = new Promise<void>(resolve => { entered = resolve; });
   transport.send = async (input, signal) => {
@@ -89,5 +89,29 @@ test("slow foreground acceptance cannot leave speculative old work unbounded", a
     expect(store.outbox("pending").map(row => row.envelope)).toEqual([old]);
     release(); await Promise.resolve(); await Promise.resolve();
     expect(store.outbox("pending").map(row => row.envelope)).toEqual([old]);
+  } finally { release(); await attempt.catch(() => {}); store.close(); }
+}, 7_000);
+
+test("slow old work ahead of a foreground send stays bounded by the background window", async () => {
+  const store = createTaskStore(), transport = relay(), old = envelope("old"); store.putOutbox(old);
+  const sent: string[] = [];
+  let release!: () => void, entered!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; }), started = new Promise<void>(resolve => { entered = resolve; });
+  transport.send = async input => {
+    sent.push(input.envelopeId);
+    if (input.envelopeId === old.envelopeId) { entered(); await held; }
+    return { envelopeId: input.envelopeId };
+  };
+  const core = createTaskCore({ endpoint: origin, store, relay: transport });
+  const attempt = core.createTask({ target, task: "foreground behind bounded old work", timeoutMs: 60_000 });
+  try {
+    await started;
+    // Per-target fifo: the new assignment waits behind the older one, which only gets the bounded background window.
+    await expect(attempt).rejects.toMatchObject({ code: "TASK_DELIVERY_DEFERRED" });
+    expect(sent).toEqual([old.envelopeId]);
+    expect(store.outbox("accepted")).toHaveLength(0);
+    expect(store.outbox("pending").map(row => row.envelope)[0]).toEqual(old);
+    release(); await Promise.resolve(); await Promise.resolve();
+    expect(store.outbox("pending").map(row => row.envelope)[0]).toEqual(old); // a late result after the window is not recorded
   } finally { release(); await attempt.catch(() => {}); store.close(); }
 }, 7_000);

@@ -232,3 +232,46 @@ test("bounds ignored aborts and streamed bodies; a late handshake cannot install
   try { await expect(streamed.session.connect()).rejects.toMatchObject({ code: "RELAY_TIMEOUT" }); }
   finally { streamed.close(); }
 });
+
+async function until(condition: () => boolean): Promise<void> {
+  for (let i = 0; i < 500 && !condition(); i++) await new Promise(resolve => setTimeout(resolve, 1));
+  expect(condition()).toBe(true);
+}
+
+test("in-flight request cap queues the ninth request instead of failing locally, and aborted waiters leak no slot", async () => {
+  let gate = Promise.withResolvers<void>();
+  const f = fixture(async body => {
+    if (body.operation === "connect") return connected();
+    if (body.operation === "resolve") { await gate.promise; return reply({ kind: "resolved", endpoint: body.target }); }
+    return reply({ kind: "accepted", envelopeId: body.envelope.envelopeId, acceptanceId: epoch, duplicate: false, forwarding: "local" });
+  });
+  const resolves = () => f.requests.filter(body => body.operation === "resolve").length;
+  try {
+    const core = await f.session.connect();
+    const create = (signal?: AbortSignal) => core.createTask({ target: endpoint, task: "queued", timeoutMs: 60_000 }, signal);
+    const first = Array.from({ length: 9 }, () => create());
+    await until(() => resolves() === 8);
+    await Bun.sleep(5);
+    expect(resolves()).toBe(8); // the ninth waits for a slot rather than reaching fetch
+    gate.resolve();
+    expect((await Promise.all(first)).length).toBe(9); // the ninth completes once a slot frees
+
+    gate = Promise.withResolvers<void>();
+    const held = Array.from({ length: 8 }, () => create());
+    await until(() => resolves() === 17);
+    const controller = new AbortController();
+    const waiting = create(controller.signal);
+    await Bun.sleep(5);
+    expect(resolves()).toBe(17);
+    controller.abort();
+    await expect(waiting).rejects.toMatchObject({ code: "ABORTED" });
+    gate.resolve(); await Promise.all(held);
+
+    gate = Promise.withResolvers<void>();
+    const again = Array.from({ length: 9 }, () => create());
+    await until(() => resolves() === 25); // all eight slots are free again after the aborted wait
+    await Bun.sleep(5);
+    expect(resolves()).toBe(25);
+    gate.resolve(); await Promise.all(again);
+  } finally { gate.resolve(); f.close(); }
+});

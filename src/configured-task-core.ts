@@ -50,10 +50,14 @@ export async function createConfiguredTaskCore(options: ConfiguredTaskCoreOption
         const result: unknown = value.apply(core, args);
         if (key === "recordWakeRequest") {
           const request = result as WakeRequest;
-          return { flush: (signal?: AbortSignal): Promise<void> => {
-            if (closed) throw new TaskProtocolError("RELAY_CLOSED", "task session is closed", { retryable: false });
-            return track(request.flush(signal));
-          } };
+          return {
+            flush: (signal?: AbortSignal): Promise<void> => {
+              if (closed) throw new TaskProtocolError("RELAY_CLOSED", "task session is closed", { retryable: false });
+              return track(request.flush(signal));
+            },
+            // A closed session drops its store; there is nothing left to withdraw.
+            discard: () => { if (!closed) request.discard(); },
+          };
         }
         return result instanceof Promise ? track(result) : result;
       } });

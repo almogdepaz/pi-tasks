@@ -170,6 +170,8 @@ implement the exported [`TaskRelay` interface](src/task-protocol.ts) to connect 
 
 `receive()` returns items in order: `relay` items wrap a delivery you acknowledge with `acknowledgeRelayDelivery`, and `local` items carry an event the origin itself canonicalized, which you complete with `completeLocalPresentation` once presented.
 
+`createTaskCore({ timers })` accepts a `TaskTimers` clock for the delivery budget (deadline, retry slices, cooldowns), which lets tests run those bounds on virtual time; task records still use `clock`. an origin can move an active task off a target whose loss the relay reported with `reassignTask`; the [reference](docs/protocol-reference.md#memory-owned-lifecycle) covers its preconditions and why the default extension does not call it yet.
+
 your application owns polling, retries, timeout evaluation, delivery acknowledgments, and shutdown. it also owns how assignments reach an agent and how that agent runs them. the core alone does not install pi tools or wake a model.
 
 ## important limits

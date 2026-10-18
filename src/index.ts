@@ -32,3 +32,4 @@ export type {
 } from "./task-protocol";
 export type { SubmitIntentOutcome, TaskCore, TaskCoreOptions, TaskInboxItem } from "./task-core";
 export type { PendingPresentation, PresentationRecord, TaskStore, TaskStoreOptions } from "./task-store";
+export type { TaskTimers } from "./task-work-scope";

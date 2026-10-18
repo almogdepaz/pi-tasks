@@ -5,6 +5,18 @@ export const TASK_WORK_LIMITS = { scopedSends: 56, retries: 8, acknowledgements:
   // Fetched-but-unacknowledged relay deliveries; intake pauses at this bound until ACKs drain it.
   pendingDeliveries: 200 } as const;
 
+/** Time source for delivery budgets: the background deadline, admission slices and retry cooldowns. Tests inject virtual time. */
+export interface TaskTimers {
+  /** Wall-clock milliseconds, comparable with stored retry times. */
+  now(): number;
+  /** Monotonic milliseconds for admission slices. */
+  elapsed(): number;
+  /** A signal that aborts once `ms` have passed. */
+  timeout(ms: number): AbortSignal;
+}
+
+export const SYSTEM_TASK_TIMERS: TaskTimers = { now: () => Date.now(), elapsed: () => performance.now(), timeout: ms => AbortSignal.timeout(ms) };
+
 /** Required envelopes a phased pass persisted; its ship phase sends them in persist order. */
 export interface TaskShipment {
   readonly envelopeIds: readonly string[];
@@ -41,10 +53,10 @@ export interface TaskWorkScope {
   backgroundSignal(): AbortSignal;
 }
 
-export function createTaskWorkScope(signal?: AbortSignal, mode: "background" | "foreground" | "phased" = "background"): TaskWorkScope {
+export function createTaskWorkScope(signal?: AbortSignal, mode: "background" | "foreground" | "phased" = "background", timers: TaskTimers = SYSTEM_TASK_TIMERS): TaskWorkScope {
   const caller = signal ?? new AbortController().signal;
   let background: AbortSignal | undefined;
-  const backgroundSignal = () => background ??= AbortSignal.any([caller, AbortSignal.timeout(TASK_WORK_LIMITS.deadlineMs)]);
+  const backgroundSignal = () => background ??= AbortSignal.any([caller, timers.timeout(TASK_WORK_LIMITS.deadlineMs)]);
   // Foreground requests retain the transport/caller timeout. Their speculative
   // retries start a bounded background window only after required sends finish.
   const active = mode === "foreground" ? caller : backgroundSignal();
@@ -69,8 +81,8 @@ export function createTaskWorkScope(signal?: AbortSignal, mode: "background" | "
     remainingAcknowledgements() { return active.aborted ? 0 : TASK_WORK_LIMITS.acknowledgements - acknowledgements; },
     // Slices stop admission, not completion: an admitted request gets the
     // remaining background window, including cancellation and late fences.
-    canRetry() { return !backgroundSignal().aborted && performance.now() < (retryUntil ??= performance.now() + TASK_WORK_LIMITS.retrySliceMs); },
-    canRepairAcknowledgement() { return !backgroundSignal().aborted && performance.now() < (repairUntil ??= performance.now() + TASK_WORK_LIMITS.ackRepairSliceMs); },
+    canRetry() { return !backgroundSignal().aborted && timers.elapsed() < (retryUntil ??= timers.elapsed() + TASK_WORK_LIMITS.retrySliceMs); },
+    canRepairAcknowledgement() { return !backgroundSignal().aborted && timers.elapsed() < (repairUntil ??= timers.elapsed() + TASK_WORK_LIMITS.ackRepairSliceMs); },
   };
 }
 
@@ -79,8 +91,8 @@ export function deferredTaskDelivery(details?: Record<string, unknown>): TaskPro
 }
 
 /** Known admission backpressure gets at least one normal polling interval, without another timer. */
-export function capacityRetryAt(error: unknown): number | undefined {
+export function capacityRetryAt(error: unknown, now = Date.now()): number | undefined {
   if (!(error instanceof TaskProtocolError) || error.code !== "RELAY_CAPACITY" || !error.retryable) return undefined;
   const hint = error.details?.retryAfterMs;
-  return Date.now() + Math.max(TASK_WORK_LIMITS.capacityCooldownMs, typeof hint === "number" && Number.isFinite(hint) && hint >= 0 ? hint : 0);
+  return now + Math.max(TASK_WORK_LIMITS.capacityCooldownMs, typeof hint === "number" && Number.isFinite(hint) && hint >= 0 ? hint : 0);
 }

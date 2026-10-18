@@ -5,10 +5,11 @@ import { createInMemoryTaskRelay } from "../src/in-memory-task-relay";
 import { deliverTaskInbox, type TaskEventDetails } from "../src/task-inbox";
 import { createTaskWorkScope } from "../src/task-work-scope";
 import { TASK_PROTOCOL_VERSION, TaskProtocolError, type RelayEnvelope, type TaskRelay } from "../src/task-protocol";
+import { virtualTime } from "./virtual-time";
 
 const origin = { relay: "memory", id: "origin" }, worker = { relay: "memory", id: "worker" }, blocked = { relay: "memory", id: "blocked" };
 
-function slowOldWork(backing: TaskRelay) {
+function slowOldWork(backing: TaskRelay, time: ReturnType<typeof virtualTime>) {
   let seeding = true, retryDelayMs = 3_000;
   const attempts: RelayEnvelope[] = [];
   const transport: TaskRelay = {
@@ -22,12 +23,7 @@ function slowOldWork(backing: TaskRelay) {
         if (seeding) throw new TaskProtocolError("RELAY_UNAVAILABLE", "seed unrelated old work", { retryable: true });
         attempts.push(input);
         // A finite, cooperative request slower than the overall refresh window.
-        await new Promise<void>((resolve, reject) => {
-          const abort = () => { clearTimeout(timer); signal?.removeEventListener("abort", abort); reject(new TaskProtocolError("ABORTED", "fixture request cancelled")); };
-          const timer = setTimeout(() => { signal?.removeEventListener("abort", abort); resolve(); }, retryDelayMs);
-          signal?.addEventListener("abort", abort, { once: true });
-          if (signal?.aborted) abort();
-        });
+        await time.sleep(retryDelayMs, signal, () => new TaskProtocolError("ABORTED", "fixture request cancelled"));
       }
       return backing.send(input, signal);
     },
@@ -48,18 +44,24 @@ function presentation(idle: boolean, queued: boolean) {
   };
 }
 
-async function refresh(core: ReturnType<typeof createTaskCore>, ui: ReturnType<typeof presentation>) {
-  const work = createTaskWorkScope(undefined, "phased");
-  await core.connect(work.signal, work);
+async function refresh(core: ReturnType<typeof createTaskCore>, ui: ReturnType<typeof presentation>, time: ReturnType<typeof virtualTime>) {
+  const work = createTaskWorkScope(undefined, "phased", time.timers);
+  await time.run(core.connect(work.signal, work));
   // The speculative timeout stays visible, but cannot undo current-page progress.
-  await expect(deliverTaskInbox(ui.pi, core, ui.context, work.signal, work)).rejects.toMatchObject({ code: "ABORTED" });
+  await expect(time.run(deliverTaskInbox(ui.pi, core, ui.context, work.signal, work))).rejects.toMatchObject({ code: "ABORTED" });
+}
+
+/** Phased inbox delivery on virtual time. */
+function deliver(core: ReturnType<typeof createTaskCore>, ui: ReturnType<typeof presentation>, time: ReturnType<typeof virtualTime>) {
+  const work = createTaskWorkScope(undefined, "phased", time.timers);
+  return time.run(deliverTaskInbox(ui.pi, core, ui.context, work.signal, work));
 }
 
 test("healthy assignment is inserted, woken and ACKed before an unrelated slow retry over repeated refreshes", async () => {
-  const backing = createInMemoryTaskRelay("memory"), parentStore = createTaskStore(), childStore = createTaskStore();
-  const slow = slowOldWork(backing);
+  const backing = createInMemoryTaskRelay("memory"), parentStore = createTaskStore(), childStore = createTaskStore(), time = virtualTime();
+  const slow = slowOldWork(backing, time);
   const parent = createTaskCore({ endpoint: origin, store: parentStore, relay: backing });
-  const child = createTaskCore({ endpoint: worker, store: childStore, relay: slow.transport });
+  const child = createTaskCore({ endpoint: worker, store: childStore, relay: slow.transport, timers: time.timers });
   const ui = presentation(true, false);
   try {
     await parent.connect(); await child.connect();
@@ -70,7 +72,7 @@ test("healthy assignment is inserted, woken and ACKed before an unrelated slow r
     const assignment = await parent.createTask({ target: worker, task: "healthy incoming assignment", timeoutMs: 60_000 });
     const observations: Array<{ events: number; wakes: number; cursor: string }> = [];
     for (let cycle = 0; cycle < 2; cycle++) {
-      await refresh(child, ui);
+      await refresh(child, ui, time);
       observations.push({ events: ui.messages.filter(message => message.customType === "pi-tasks-event").length,
         wakes: ui.messages.filter(message => message.customType === "pi-tasks-wake").length, cursor: childStore.getReceiveCursor() });
       expect(child.getTask(assignment.taskId)).toBeDefined();
@@ -78,14 +80,16 @@ test("healthy assignment is inserted, woken and ACKed before an unrelated slow r
     }
     expect(observations).toEqual([{ events: 1, wakes: 1, cursor: "1" }, { events: 1, wakes: 1, cursor: "1" }]);
     expect(slow.attempts).toEqual([old[0]!, old[0]!]);
+    // Each refresh ended at its own 2s background window, not at the 3s retry.
+    expect(time.timers.elapsed()).toBe(4_000);
   } finally { parentStore.close(); childStore.close(); }
-}, 10_000);
+});
 
 for (const path of ["busy inbox", "direct receive"] as const) {
   test(`${path} canonicalizes progress and completion in the initial page before unrelated slow retries`, async () => {
-    const backing = createInMemoryTaskRelay("memory"), parentStore = createTaskStore(), childStore = createTaskStore();
-    const slow = slowOldWork(backing);
-    const parent = createTaskCore({ endpoint: origin, store: parentStore, relay: slow.transport });
+    const backing = createInMemoryTaskRelay("memory"), parentStore = createTaskStore(), childStore = createTaskStore(), time = virtualTime();
+    const slow = slowOldWork(backing, time);
+    const parent = createTaskCore({ endpoint: origin, store: parentStore, relay: slow.transport, timers: time.timers });
     const child = createTaskCore({ endpoint: worker, store: childStore, relay: backing });
     const ui = presentation(false, true);
     try {
@@ -100,8 +104,8 @@ for (const path of ["busy inbox", "direct receive"] as const) {
       await child.submitIntent({ taskId: assignment.taskId, type: "task.completed", payload: { summary: "done" } });
       const observations: Array<{ status: string | undefined; events: string[]; cursor: string }> = [];
       for (let cycle = 0; cycle < 2; cycle++) {
-        if (path === "direct receive") await expect(parent.receive()).rejects.toMatchObject({ code: "ABORTED" });
-        else await refresh(parent, ui);
+        if (path === "direct receive") await expect(time.run(parent.receive())).rejects.toMatchObject({ code: "ABORTED" });
+        else await refresh(parent, ui, time);
         observations.push({ status: parent.getTask(assignment.taskId)?.status,
           events: parent.getTask(assignment.taskId)!.events.map(event => event.type), cursor: parentStore.getReceiveCursor() });
         expect(parentStore.outbox("pending").map(row => row.envelope)).toEqual(old);
@@ -113,16 +117,17 @@ for (const path of ["busy inbox", "direct receive"] as const) {
       }
       expect(ui.messages).toEqual([]);
       expect(slow.attempts).toEqual([old[0]!, old[0]!]);
+      expect(time.timers.elapsed()).toBe(4_000);
     } finally { parentStore.close(); childStore.close(); }
-  }, 10_000);
+  });
 }
 
 for (const state of ["empty", "busy", "queued", "missing-insertion", "evidence-error", "receive-error", "direct-empty"] as const) {
   test(`old work retains a bounded opportunity after current-page completion or yield: ${state}`, async () => {
-    const backing = createInMemoryTaskRelay("memory"), parentStore = createTaskStore(), childStore = createTaskStore();
-    const slow = slowOldWork(backing);
+    const backing = createInMemoryTaskRelay("memory"), parentStore = createTaskStore(), childStore = createTaskStore(), time = virtualTime();
+    const slow = slowOldWork(backing, time);
     const parent = createTaskCore({ endpoint: origin, store: parentStore, relay: backing });
-    const child = createTaskCore({ endpoint: worker, store: childStore, relay: slow.transport });
+    const child = createTaskCore({ endpoint: worker, store: childStore, relay: slow.transport, timers: time.timers });
     const ui = presentation(state !== "busy", state === "queued");
     try {
       await parent.connect(); await child.connect();
@@ -144,10 +149,10 @@ for (const state of ["empty", "busy", "queued", "missing-insertion", "evidence-e
       }
       if (state === "missing-insertion") ui.pi.sendMessage = message => { ui.messages.push(message); };
 
-      if (state === "direct-empty") expect(await child.receive()).toEqual([]);
-      else if (state === "receive-error") await expect(deliverTaskInbox(ui.pi, child, ui.context)).rejects.toBe(failure);
-      else if (state === "evidence-error") await expect(deliverTaskInbox(ui.pi, child, ui.context)).rejects.toMatchObject({ code: failure.code, message: failure.message });
-      else await deliverTaskInbox(ui.pi, child, ui.context);
+      if (state === "direct-empty") expect(await time.run(child.receive())).toEqual([]);
+      else if (state === "receive-error") await expect(deliver(child, ui, time)).rejects.toBe(failure);
+      else if (state === "evidence-error") await expect(deliver(child, ui, time)).rejects.toMatchObject({ code: failure.code, message: failure.message });
+      else await deliver(child, ui, time);
 
       expect(slow.attempts).toEqual([old]);
       expect(childStore.getOutboxRecord(old.envelopeId)).toEqual({ state: "accepted", envelope: old });

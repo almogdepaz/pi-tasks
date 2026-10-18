@@ -26,7 +26,11 @@ export interface TaskStore {
   putTask(task: Omit<TaskRecord, "events">): void;
   getTask(taskId: string): TaskSnapshot | undefined;
   listTasks(): readonly TaskSnapshot[];
+  /** Whether any task of this lifetime is active; indexed, no snapshot is built. */
+  hasActiveTasks(): boolean;
   setStatus(taskId: string, status: TaskRecord["status"]): void;
+  /** Follows a reassignment; existing envelopes keep their addresses. */
+  setTarget(taskId: string, target: TaskEndpoint): void;
   appendEvent(event: TaskEvent): boolean;
   putOutbox(envelope: RelayEnvelope): void;
   outbox(state: OutboxRecord["state"]): readonly OutboxRecord[];
@@ -42,6 +46,8 @@ export interface TaskStore {
   markOutboxAccepted(envelopeId: string): void;
   quarantineOutbox(envelopeId: string, input: OutboxQuarantineInput): void;
   quarantinedOutbox(): readonly OutboxQuarantineRecord[];
+  /** Indexed lookup of one quarantined envelope. */
+  getQuarantine(envelopeId: string): OutboxQuarantineRecord | undefined;
   persistInbox(envelope: RelayEnvelope, cursor: string): boolean;
   /** Store arrival order of a persisted inbox envelope; shares the presentation order sequence. */
   inboxOrder(envelopeId: string): number | undefined;
@@ -80,9 +86,15 @@ export interface TaskStore {
 }
 
 const LIMITS = { entries: 16_384, bytes: 32 * 1024 * 1024 };
-type Cell = { readonly text: string; readonly bytes: number; readonly order: number };
-type Undo = { readonly table: Map<string, Cell>; readonly key: string; readonly prior: Cell | undefined };
+// `text` is the immutable source of truth and of the byte charge; `value` is its lazily parsed, deep-frozen form.
+type Cell = { readonly text: string; readonly bytes: number; readonly order: number; value?: unknown };
+type Undo = { readonly name: string; readonly table: Map<string, Cell>; readonly key: string; readonly prior: Cell | undefined };
 interface Checkpoint { frontier: string; highWater: string; pending: Record<string, string>; requested: Record<string, number>; }
+const freeze = <T>(value: T): T => {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) { Object.freeze(value); for (const child of Object.values(value)) freeze(child); }
+  return value;
+};
+const read = <T>(row: Cell): T => (row.value ??= freeze(JSON.parse(row.text))) as T;
 
 /** One endpoint lifetime. No SQLite, files, migrations, startup reads or replay. */
 export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
@@ -97,7 +109,7 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
   const pendingByTarget = new Map<string, Set<string>>(), pendingTarget = new Map<string, string>();
   const syncPendingOutbox = (id: string) => {
     const row = tables.get("outbox")?.get(id);
-    const record = row && JSON.parse(row.text) as OutboxRecord;
+    const record = row && read<OutboxRecord>(row);
     if (record?.state === "pending") {
       if (!pendingOutbox.has(id)) pendingOutbox.set(id, 0);
       if (!pendingTarget.has(id)) {
@@ -117,6 +129,16 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
     const order = outboxOrder(id);
     return [...pendingByTarget.get(key)!].filter(other => outboxOrder(other) < order).sort((a, b) => outboxOrder(a) - outboxOrder(b));
   };
+  // Cell-derived indexes, updated with every cell change including rollback; never a second copy of the data.
+  const eventsByTask = new Map<string, Set<string>>(), activeTasks = new Set<string>();
+  const reindex = (name: string, key: string, before: Cell | undefined, after: Cell | undefined) => {
+    if (name === "tasks") {
+      if (after && read<TaskRecord>(after).status === "active") activeTasks.add(key); else activeTasks.delete(key);
+    } else if (name === "events") {
+      if (before) { const taskId = read<TaskEvent>(before).taskId, ids = eventsByTask.get(taskId); ids?.delete(key); if (ids?.size === 0) eventsByTask.delete(taskId); }
+      if (after) { const taskId = read<TaskEvent>(after).taskId, ids = eventsByTask.get(taskId) ?? new Set<string>(); ids.add(key); eventsByTask.set(taskId, ids); }
+    }
+  };
   let bytes = 0, entries = 0, sequence = 0, closed = false;
   const listeners = new Set<() => void>();
   // Listeners run after state is final; a failure is logged, not rethrown, because the write already committed.
@@ -125,19 +147,21 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
   const committed = (name: string, key: string) => { if (frames.length) return; if (name === "outbox") syncPendingOutbox(key); notify(); };
   const remember = (name: string, key: string, target: Map<string, Cell>, prior: Cell | undefined) => {
     const frame = frames.at(-1), identity = JSON.stringify([name, key]);
-    if (frame && !frame.has(identity)) frame.set(identity, { table: target, key, prior });
+    if (frame && !frame.has(identity)) frame.set(identity, { name, table: target, key, prior });
   };
   const check = () => { if (closed) throw new TaskProtocolError("RELAY_CLOSED", "task state is closed", { retryable: false }); };
   const table = (name: string) => { check(); let value = tables.get(name); if (!value) { value = new Map(); tables.set(name, value); } return value; };
-  const get = <T>(name: string, key: string): T | undefined => { const row = table(name).get(key); return row ? JSON.parse(row.text) as T : undefined; };
-  const rows = <T>(name: string): T[] => [...table(name).values()].sort((a, b) => a.order - b.order).map(row => JSON.parse(row.text) as T);
+  const get = <T>(name: string, key: string): T | undefined => { const row = table(name).get(key); return row ? read<T>(row) : undefined; };
+  const rows = <T>(name: string): T[] => [...table(name).values()].sort((a, b) => a.order - b.order).map(row => read<T>(row));
+  const taskEvents = (taskId: string): TaskEvent[] => { const events = table("events"); return [...eventsByTask.get(taskId) ?? []].map(id => read<TaskEvent>(events.get(id)!)); };
   const put = (name: string, key: string, value: unknown, onlyNew = false): boolean => {
     const target = table(name), prior = target.get(key);
     if (onlyNew && prior) return false;
     const text = JSON.stringify(value), size = Buffer.byteLength(text) + Buffer.byteLength(key) + 64;
     if (bytes - (prior?.bytes ?? 0) + size > maxBytes || (!prior && entries >= maxEntries)) throw new TaskProtocolError("TASK_CAPACITY", "active task state is full", { retryable: false });
     remember(name, key, target, prior);
-    target.set(key, { text, bytes: size, order: prior?.order ?? sequence++ });
+    const cell = { text, bytes: size, order: prior?.order ?? sequence++ };
+    target.set(key, cell); reindex(name, key, prior, cell);
     bytes += size - (prior?.bytes ?? 0); if (!prior) entries++;
     committed(name, key);
     return true;
@@ -145,7 +169,7 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
   const remove = (name: string, key: string) => {
     const target = table(name), prior = target.get(key); if (!prior) return;
     remember(name, key, target, prior);
-    target.delete(key); bytes -= prior.bytes; entries--;
+    target.delete(key); reindex(name, key, prior, undefined); bytes -= prior.bytes; entries--;
     committed(name, key);
   };
   const pair = (a: string, b: string) => JSON.stringify([a, b]);
@@ -170,7 +194,8 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
     if (bound && (bound.relay !== endpoint.relay || bound.id !== endpoint.id)) throw new TaskProtocolError("RELAY_RESET", "delivery checkpoint belongs to a retired endpoint", { retryable: false });
     return JSON.stringify([endpoint.relay, endpoint.id, store.getRelayTransportBinding()?.epoch]);
   };
-  const checkpoint = (endpoint: TaskEndpoint): Checkpoint => get<Checkpoint>("checkpoints", checkpointKey(endpoint)) ?? { frontier: store.getReceiveCursor(), highWater: store.getReceiveCursor(), pending: {}, requested: {} };
+  // A mutable copy: callers edit it before writing it back, and the cached cell value is frozen.
+  const checkpoint = (endpoint: TaskEndpoint): Checkpoint => structuredClone(get<Checkpoint>("checkpoints", checkpointKey(endpoint))) ?? { frontier: store.getReceiveCursor(), highWater: store.getReceiveCursor(), pending: {}, requested: {} };
   const writeCheckpoint = (endpoint: TaskEndpoint, value: Checkpoint) => { put("checkpoints", checkpointKey(endpoint), value); };
   const store: TaskStore = {
     transaction<T>(operation: () => T): T {
@@ -188,7 +213,11 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
           topLevelChange = frame.size > 0;
         }
       } catch (error) {
-        for (const item of [...frame.values()].reverse()) { if (item.prior) item.table.set(item.key, item.prior); else item.table.delete(item.key); }
+        for (const item of [...frame.values()].reverse()) {
+          const current = item.table.get(item.key);
+          if (item.prior) item.table.set(item.key, item.prior); else item.table.delete(item.key);
+          reindex(item.name, item.key, current, item.prior);
+        }
         bytes = priorBytes; entries = priorEntries; sequence = priorSequence;
         throw error;
       } finally { frames.pop(); }
@@ -197,13 +226,13 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
     },
     onChange(listener) { const entry = () => listener(); listeners.add(entry); return () => { listeners.delete(entry); }; },
     putTask(task) { put("tasks", task.taskId, task, true); },
-    getTask(id) { const task = get<Omit<TaskRecord, "events">>("tasks", id); return task ? snapshot(task, rows<TaskEvent>("events").filter(event => event.taskId === id)) : undefined; },
+    getTask(id) { const task = get<Omit<TaskRecord, "events">>("tasks", id); return task ? snapshot(task, taskEvents(id)) : undefined; },
     listTasks() {
-      const events = new Map<string, TaskEvent[]>();
-      for (const event of rows<TaskEvent>("events")) { const list = events.get(event.taskId) ?? []; list.push(event); events.set(event.taskId, list); }
-      return rows<Omit<TaskRecord, "events">>("tasks").sort((a, b) => a.createdAt - b.createdAt || a.taskId.localeCompare(b.taskId)).map(task => snapshot(task, events.get(task.taskId) ?? []));
+      return rows<Omit<TaskRecord, "events">>("tasks").sort((a, b) => a.createdAt - b.createdAt || a.taskId.localeCompare(b.taskId)).map(task => snapshot(task, taskEvents(task.taskId)));
     },
+    hasActiveTasks() { check(); return activeTasks.size > 0; },
     setStatus(id, status) { const task = get<Omit<TaskRecord, "events">>("tasks", id); if (task) put("tasks", id, { ...task, status }); },
+    setTarget(id, target) { const task = get<Omit<TaskRecord, "events">>("tasks", id); if (task) put("tasks", id, { ...task, target }); },
     appendEvent(event) { requireTask(event.taskId); return put("events", event.eventId, event, true); },
     putOutbox(envelope) { put("outbox", envelope.envelopeId, { envelope, state: "pending" }, true); if (!frames.length) syncPendingOutbox(envelope.envelopeId); },
     outbox(status) { return rows<OutboxRecord>("outbox").filter(item => item.state === status); },
@@ -236,11 +265,12 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
       });
     },
     quarantinedOutbox() { return rows<OutboxQuarantineRecord>("quarantine"); },
+    getQuarantine(id) { return get<OutboxQuarantineRecord>("quarantine", id); },
     persistInbox(envelope, cursor) { return put("inbox", envelope.envelopeId, { envelope, cursor }, true); },
     inboxOrder(id) { return table("inbox").get(id)?.order; },
     inboxEnvelope(id) { return get<{ envelope: RelayEnvelope }>("inbox", id)?.envelope; },
     enqueuePresentation(details) { requireTask(details.taskId); put("presentation", details.eventId, { taskId: details.taskId, eventId: details.eventId }, true); },
-    pendingPresentations() { return [...table("presentation").values()].sort((a, b) => a.order - b.order).map(row => ({ ...JSON.parse(row.text) as PresentationRecord, order: row.order })); },
+    pendingPresentations() { return [...table("presentation").values()].sort((a, b) => a.order - b.order).map(row => ({ ...read<PresentationRecord>(row), order: row.order })); },
     completePresentation(eventId) { remove("presentation", eventId); },
     getReceiveCursor() { return state<string>("cursor") ?? "0"; },
     setReceiveCursor(cursor) { put("state", "cursor", cursor); },
@@ -305,7 +335,7 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
     setEndpointBinding(value) { put("state", "endpoint", value); },
     getRelayTransportBinding() { return state<RelayTransportBinding>("transport"); },
     setRelayTransportBinding(value) { put("state", "transport", value); },
-    clear() { check(); if (frames.length) throw new Error("cannot clear task state during a transaction"); tables.clear(); pendingOutbox.clear(); pendingByTarget.clear(); pendingTarget.clear(); bytes = entries = sequence = 0; },
+    clear() { check(); if (frames.length) throw new Error("cannot clear task state during a transaction"); tables.clear(); eventsByTask.clear(); activeTasks.clear(); pendingOutbox.clear(); pendingByTarget.clear(); pendingTarget.clear(); bytes = entries = sequence = 0; },
     close() { if (closed) return; store.clear(); closed = true; },
   };
   return store;

@@ -23,9 +23,9 @@ import type {
 	TaskRelay,
 	TaskSnapshot,
 } from "./task-protocol";
-import type { TaskStore, OutboxRecord } from "./task-store";
-import { TASK_WORK_LIMITS, capacityRetryAt, createTaskWorkScope, deferredTaskDelivery } from "./task-work-scope";
-import type { TaskShipment, TaskWorkScope } from "./task-work-scope";
+import type { TaskStore, OutboxRecord, OutboxQuarantineRecord } from "./task-store";
+import { SYSTEM_TASK_TIMERS, TASK_WORK_LIMITS, capacityRetryAt, createTaskWorkScope, deferredTaskDelivery } from "./task-work-scope";
+import type { TaskShipment, TaskTimers, TaskWorkScope } from "./task-work-scope";
 
 const RECEIVE_PAGE_SIZE = TASK_WORK_LIMITS.pageItems;
 const DELIVERY_EVIDENCE_OPERATION = "delivery_evidence";
@@ -36,12 +36,17 @@ const CONVERSATIONAL_EVENTS = taskEventTypes(type => type.conversational);
 const CANONICAL_EVENTS = taskEventTypes(() => true);
 const RECEIVER_INTENT_TYPES = taskEventTypes(type => type.intent);
 const IGNORE_OUTBOX_FAILURES: ReadonlySet<string> = new Set();
+/** The blocked-send code that records a target loss, the precondition of a reassignment. */
+const TARGET_LOSS_CODE = "TARGET_NOT_REGISTERED";
+const REASSIGNED_EVENT = "task.reassigned";
 
 export interface TaskCoreOptions {
 	readonly endpoint: TaskEndpoint;
 	readonly relay: TaskRelay;
 	readonly store: TaskStore;
 	readonly clock?: { readonly now: () => number };
+	/** Delivery budget time (deadline, slices, cooldowns); defaults to system time. Separate from `clock`, which stamps task records. */
+	readonly timers?: TaskTimers;
 	readonly ids?: () => string;
 }
 
@@ -103,15 +108,22 @@ export interface TaskCore {
 	recordWakeRequest(input: { readonly taskId: string; readonly eventId: string }, work?: TaskWorkScope): WakeRequest;
 	evaluateTimeouts(signal?: AbortSignal, work?: TaskWorkScope): Promise<void>;
 	acknowledgeParent(taskId: string, signal?: AbortSignal, work?: TaskWorkScope): Promise<void>;
+	/**
+	 * Origin-only: after a recorded TARGET_NOT_REGISTERED loss of the current target, resolves the lost
+	 * target's successor and sends it a `task.reassigned` assignment carrying the task history.
+	 */
+	reassignTask?(taskId: string, signal?: AbortSignal, work?: TaskWorkScope): Promise<{ readonly taskId: string; readonly target: TaskEndpoint }>;
 }
 
 type ReceivedEnvelope =
-	| { readonly kind: "assignment"; readonly task: Omit<TaskRecord, "events">; readonly event: TaskEvent }
+	| { readonly kind: "assignment"; readonly task: Omit<TaskRecord, "events">; readonly event: TaskEvent; readonly history: readonly TaskEvent[] }
 	| { readonly kind: "intent"; readonly task: TaskRecord; readonly intent: TaskIntent }
 	| { readonly kind: "canonical_event"; readonly task: TaskRecord; readonly event: TaskEvent };
 
 export function createTaskCore(options: TaskCoreOptions): TaskCore {
 	const clock = options.clock ?? { now: (): number => Date.now() };
+	const timers = options.timers ?? SYSTEM_TASK_TIMERS;
+	const workScope = (signal?: AbortSignal, mode?: "background" | "foreground" | "phased") => createTaskWorkScope(signal, mode, timers);
 	const ids = options.ids ?? (() => crypto.randomUUID());
 	const flush = createOutboxFlusher(options);
 	const acknowledgeWithSignal = async (cursor: string, signal: AbortSignal, work: TaskWorkScope): Promise<void> => {
@@ -119,7 +131,7 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 		const envelopeId = options.store.pendingRelayEnvelopeId(options.endpoint, cursor);
 		if (envelopeId === undefined) throw new TaskProtocolError("INVALID_CURSOR", "relay delivery is not pending in this endpoint scope");
 		const retryAt = options.store.relayAcknowledgementRetryAt(options.endpoint, cursor);
-		if (retryAt > Date.now() || !work.claimAcknowledgement(cursor)) throw deferredTaskDelivery({ cursor, retryAfterMs: Math.max(0, retryAt - Date.now()) });
+		if (retryAt > timers.now() || !work.claimAcknowledgement(cursor)) throw deferredTaskDelivery({ cursor, retryAfterMs: Math.max(0, retryAt - timers.now()) });
 		options.store.transaction(() => options.store.requestRelayAcknowledgement(options.endpoint, cursor));
 		try {
 			await waitForRelayOperation(options.relay.acknowledgeDelivery({ endpoint: options.endpoint, cursor, envelopeId }, signal), signal);
@@ -127,14 +139,14 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 			options.store.transaction(() => options.store.acknowledgeRelayCursor(options.endpoint, cursor));
 		} catch (error) {
 			if (signal.aborted) throw error;
-			const retryAt = capacityRetryAt(error);
+			const retryAt = capacityRetryAt(error, timers.now());
 			if (retryAt !== undefined) options.store.transaction(() => options.store.requestRelayAcknowledgement(options.endpoint, cursor, retryAt));
 			throw error;
 		}
 	};
-	const acknowledgeRelayDelivery = (cursor: string, signal?: AbortSignal, work = createTaskWorkScope(signal)): Promise<void> => acknowledgeWithSignal(cursor, work.signal, work);
+	const acknowledgeRelayDelivery = (cursor: string, signal?: AbortSignal, work = workScope(signal)): Promise<void> => acknowledgeWithSignal(cursor, work.signal, work);
 	const retryRequestedAcknowledgements = async (work: TaskWorkScope): Promise<void> => {
-		for (const cursor of options.store.requestedRelayAcknowledgements(options.endpoint, TASK_WORK_LIMITS.acknowledgements, Date.now())) {
+		for (const cursor of options.store.requestedRelayAcknowledgements(options.endpoint, TASK_WORK_LIMITS.acknowledgements, timers.now())) {
 			if (!work.canAcknowledge() || !work.canRepairAcknowledgement()) break;
 			if (!work.attemptedAcknowledgements.has(cursor) && options.store.pendingRelayEnvelopeId(options.endpoint, cursor) !== undefined) await acknowledgeWithSignal(cursor, work.backgroundSignal(), work);
 		}
@@ -171,7 +183,7 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 		await retryRequestedAcknowledgements(work);
 		const pendingRaw = options.store.pendingRelayDeliveries(options.endpoint).find(pending => options.store.inboxEnvelope(pending.envelopeId)?.kind === TaskEnvelopeKind.intent);
 		if (pendingRaw) throw deferredTaskDelivery({ cursor: pendingRaw.cursor,
-			retryAfterMs: Math.max(0, options.store.relayAcknowledgementRetryAt(options.endpoint, pendingRaw.cursor) - Date.now()) });
+			retryAfterMs: Math.max(0, options.store.relayAcknowledgementRetryAt(options.endpoint, pendingRaw.cursor) - timers.now()) });
 	};
 	/**
 	 * Intake phase: re-drives tracked, unacknowledged relay deliveries from the local inbox, then fetches
@@ -226,7 +238,7 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 		}
 		return inboxItems(options.store, visibleDeliveries);
 	};
-	const submitIntentWithOutcome = async (input: SubmitIntentInput, signal?: AbortSignal, work = createTaskWorkScope(signal, "foreground")): Promise<SubmitIntentOutcome> => {
+	const submitIntentWithOutcome = async (input: SubmitIntentInput, signal?: AbortSignal, work = workScope(signal, "foreground")): Promise<SubmitIntentOutcome> => {
 		signal = work.signal;
 		if (!RECEIVER_INTENT_TYPES.has(input.type) || !isRecord(input.payload)) throw new TaskProtocolError("INVALID_INTENT", "intent type or payload is invalid");
 		let persistedEnvelopeIds: readonly string[] = [];
@@ -260,7 +272,7 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 
 	return {
 		endpoint: options.endpoint,
-		async connect(signal, work = createTaskWorkScope(signal)) {
+		async connect(signal, work = workScope(signal)) {
 			signal = work.signal;
 			const connection = await options.relay.connect({ endpoint: options.endpoint, protocolVersion: TASK_PROTOCOL_VERSION, receiveCursor: options.store.getReceiveCursor() }, signal);
 			if (!sameEndpoint(connection.endpoint, options.endpoint)) throw new TaskProtocolError("INVALID_CONNECTION", "relay connected a different endpoint");
@@ -268,7 +280,7 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 			// A phased pass repairs in its acknowledge phase, after intake.
 			if (!work.phased) await retryRequestedAcknowledgements(work);
 		},
-		async createTask(input, signal, work = createTaskWorkScope(signal, "foreground")) {
+		async createTask(input, signal, work = workScope(signal, "foreground")) {
 			signal = work.signal;
 			if (input.task.length === 0 || !Number.isInteger(input.timeoutMs) || input.timeoutMs < 1) throw new TaskProtocolError("INVALID_TASK", "task and a positive timeout are required");
 			const target = await options.relay.resolve({ relay: input.target.relay, reference: input.target.id }, signal);
@@ -294,10 +306,42 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 			}
 			return { taskId };
 		},
+		async reassignTask(taskId, signal, work = workScope(signal, "foreground")) {
+			signal = work.signal;
+			const lost = lostTarget(options, taskId).target;
+			const target = await options.relay.resolve({ relay: lost.relay, reference: lost.id }, signal);
+			throwIfAborted(signal);
+			if (!isEndpoint(target)) throw new TaskProtocolError("INVALID_TARGET", "relay resolved an invalid task endpoint");
+			if (sameEndpoint(target, lost)) throw reassignmentRefused(taskId, "the lost target resolved to itself");
+			const assignmentId = ids();
+			options.store.transaction(() => {
+				// Re-checked here: a concurrent reassignment already moved the target, so one loss allows one reassignment.
+				const task = lostTarget(options, taskId);
+				if (!sameEndpoint(task.target, lost)) throw reassignmentRefused(taskId, "the task target changed during resolution");
+				const now = clock.now();
+				const record: Omit<TaskRecord, "events"> = {
+					taskId, protocolVersion: task.protocolVersion, origin: task.origin, target, task: task.task,
+					createdAt: task.createdAt, expiresAt: task.expiresAt, status: task.status,
+				};
+				const reassigned = event(record, ids(), REASSIGNED_EVENT, String(task.events.length + 1), options.endpoint, target, now, { task: task.task, previousTarget: lost });
+				// Origin-local delivery evidence never travels to a target.
+				const history = task.events.filter(candidate => TASK_EVENT_TYPES[candidate.type]?.evidence !== true);
+				options.store.setTarget(taskId, target);
+				options.store.appendEvent(reassigned);
+				options.store.putOutbox(envelope(assignmentId, options.endpoint, target, taskId, TaskEnvelopeKind.assignment, reassignmentPayload(record, reassigned, history), now));
+				if (!sameEndpoint(target, options.endpoint)) options.store.enqueuePresentation({ taskId, eventId: reassigned.eventId });
+			});
+			try {
+				await flush(signal, new Set([assignmentId]), work);
+			} catch (error) {
+				throw operationError(error, taskId);
+			}
+			return { taskId, target };
+		},
 		getTask(taskId) { return options.store.getTask(taskId); },
 		listTasks() { return options.store.listTasks(); },
 		onChange(listener) { return options.store.onChange(listener); },
-		hasPendingWork() { return options.store.hasPendingOutbox() || options.store.listTasks().some((task) => task.status === "active"); },
+		hasPendingWork() { return options.store.hasPendingOutbox() || options.store.hasActiveTasks(); },
 		isSelfAuthoredConversation(event) {
 			if (!CONVERSATIONAL_EVENTS.has(event.type) || typeof event.payload.intentId !== "string") return false;
 			const task = options.store.getTask(event.taskId);
@@ -309,8 +353,8 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 			const intent = parsePayload(localEnvelope);
 			return isTaskIntent(intent) && intent.taskId === event.taskId && intent.type === event.type && intent.intentId === event.payload.intentId;
 		},
-		async flushOutbox(signal, work = createTaskWorkScope(signal)) { await flush(work.signal, undefined, work, true); },
-		async receive(signal, work = createTaskWorkScope(signal)) {
+		async flushOutbox(signal, work = workScope(signal)) { await flush(work.signal, undefined, work, true); },
+		async receive(signal, work = workScope(signal)) {
 			// The phases of a pass without presentation; the first fan-out or repair failure surfaces after them.
 			const shipments: TaskShipment[] = [];
 			let items: readonly TaskInboxItem[], failure: unknown;
@@ -329,14 +373,14 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 			if (failure !== undefined) throw failure;
 			return items;
 		},
-		async intakeInbox(signal, work = createTaskWorkScope(signal, "phased")) { return intake(work.signal, work.shipments); },
-		async shipRequired(signal, work = createTaskWorkScope(signal, "phased")) { await shipAll(work.shipments, work); },
-		async repairAcknowledgements(signal, work = createTaskWorkScope(signal)) { await repairAcknowledgements(work); },
+		async intakeInbox(signal, work = workScope(signal, "phased")) { return intake(work.signal, work.shipments); },
+		async shipRequired(signal, work = workScope(signal, "phased")) { await shipAll(work.shipments, work); },
+		async repairAcknowledgements(signal, work = workScope(signal)) { await repairAcknowledgements(work); },
 		acknowledgeRelayDelivery,
 		completeLocalPresentation(eventId) { options.store.completePresentation(eventId); },
 		async submitIntent(input, signal, work) { await submitIntentWithOutcome(input, signal, work); },
 		submitIntentWithOutcome,
-		async recordInsertion(input, signal, work = createTaskWorkScope(signal)) {
+		async recordInsertion(input, signal, work = workScope(signal)) {
 			signal = work.signal;
 			const task = requiredTask(options.store, input.taskId);
 			const evidence: DeliveryEvidence = { eventId: input.eventId, stage: TaskDeliveryStage.piInserted, state: TaskDeliveryEvidenceState.confirmed };
@@ -368,7 +412,7 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 			return {
 				flush: async (signal?: AbortSignal): Promise<void> => {
 					const { envelopeIds } = persisted ??= persist();
-					const activeWork = work ?? createTaskWorkScope(signal);
+					const activeWork = work ?? workScope(signal);
 					await ship(activeWork.signal, envelopeIds, activeWork, () => throwIfDeliveryEvidenceBlocked(options.store, input.taskId, envelopeIds, evidence));
 				},
 				discard: () => {
@@ -378,7 +422,7 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 				},
 			};
 		},
-		async evaluateTimeouts(signal, work = createTaskWorkScope(signal)) {
+		async evaluateTimeouts(signal, work = workScope(signal)) {
 			signal = work.signal;
 			const persistedEnvelopeIds: string[] = [];
 			for (const candidate of options.store.listTasks()) {
@@ -391,7 +435,7 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 			}
 			if (persistedEnvelopeIds.length > 0) await ship(signal, persistedEnvelopeIds, work);
 		},
-		async acknowledgeParent(taskId, signal, work = createTaskWorkScope(signal)) {
+		async acknowledgeParent(taskId, signal, work = workScope(signal)) {
 			signal = work.signal;
 			let persistedEnvelopeIds: readonly string[] = [];
 			options.store.transaction(() => {
@@ -417,6 +461,7 @@ function validateReceivedEnvelope(options: TaskCoreOptions, relayEnvelope: unkno
 
 function validateAssignment(envelope: RelayEnvelope, payload: unknown): ReceivedEnvelope {
 	if (!isRecord(payload) || !isTaskRecordInput(payload.task) || !isTaskEvent(payload.event)) throw new TaskProtocolError("INVALID_ASSIGNMENT", "assignment payload is malformed");
+	if (payload.event.type === REASSIGNED_EVENT) return validateReassignment(envelope, payload, payload.task, payload.event);
 	const task = payload.task;
 	const created = payload.event;
 	if (envelope.taskId !== task.taskId || envelope.taskId !== created.taskId || task.protocolVersion !== TASK_PROTOCOL_VERSION
@@ -425,7 +470,66 @@ function validateAssignment(envelope: RelayEnvelope, payload: unknown): Received
 		|| !sameEndpoint(created.source, task.origin) || !sameEndpoint(created.target, task.target)) {
 		throw new TaskProtocolError("INVALID_ASSIGNMENT", "assignment envelope headers do not match its payload");
 	}
-	return { kind: "assignment", task, event: created };
+	return { kind: "assignment", task, event: created, history: [] };
+}
+
+/**
+ * A reassignment carries history addressed to earlier targets, so each carried event is checked
+ * against the task and its origin, not the current target. Without `historyTruncated` it starts at `task.created`.
+ */
+function validateReassignment(envelope: RelayEnvelope, payload: Record<string, unknown>, task: Omit<TaskRecord, "events">, reassigned: TaskEvent): ReceivedEnvelope {
+	const truncated = payload.historyTruncated === true;
+	const history = payload.history;
+	if (!Array.isArray(history) || !history.every(isTaskEvent) || (payload.historyTruncated !== undefined && !truncated)) throw new TaskProtocolError("INVALID_ASSIGNMENT", "reassignment payload is malformed");
+	let previous = 0n;
+	const carried = history.every(event => {
+		const ordered = BigInt(event.sequence) > previous;
+		previous = BigInt(event.sequence);
+		return ordered && event.taskId === task.taskId && CANONICAL_EVENTS.has(event.type) && TASK_EVENT_TYPES[event.type]?.evidence !== true && sameEndpoint(event.source, task.origin);
+	});
+	const first = history[0];
+	if (envelope.taskId !== task.taskId || envelope.taskId !== reassigned.taskId || task.protocolVersion !== TASK_PROTOCOL_VERSION
+		|| task.status !== "active" || task.expiresAt < task.createdAt || reassigned.payload.task !== task.task
+		|| !sameEndpoint(envelope.source, task.origin) || !sameEndpoint(envelope.target, task.target)
+		|| !sameEndpoint(reassigned.source, task.origin) || !sameEndpoint(reassigned.target, task.target)
+		|| !carried || previous >= BigInt(reassigned.sequence)
+		|| (!truncated && (first?.type !== "task.created" || first.sequence !== "1" || first.payload.task !== task.task))) {
+		throw new TaskProtocolError("INVALID_ASSIGNMENT", "reassignment headers, payload or history do not match");
+	}
+	return { kind: "assignment", task, event: reassigned, history };
+}
+
+/** The task, its reassignment and as much of the latest history as fits the relay payload limit. */
+function reassignmentPayload(task: Omit<TaskRecord, "events">, reassigned: TaskEvent, history: readonly TaskEvent[]): unknown {
+	const bytes = (value: unknown): number => new TextEncoder().encode(JSON.stringify(value)).byteLength;
+	const complete = { task, event: reassigned, history };
+	if (bytes(complete) <= MAX_RELAY_PAYLOAD_BYTES) return complete;
+	// Keep the newest suffix: each kept event costs its JSON plus a separating comma.
+	let size = bytes({ task, event: reassigned, history: [], historyTruncated: true });
+	let start = history.length;
+	while (start > 0) {
+		const next = size + bytes(history[start - 1]) + (start === history.length ? 0 : 1);
+		if (next > MAX_RELAY_PAYLOAD_BYTES) break;
+		size = next;
+		start--;
+	}
+	if (size > MAX_RELAY_PAYLOAD_BYTES) throw new TaskProtocolError("PAYLOAD_TOO_LARGE", "reassignment exceeds the relay payload limit", { retryable: false });
+	return { task, event: reassigned, history: history.slice(start), historyTruncated: true };
+}
+
+/** The origin's active task whose current target has a recorded TARGET_NOT_REGISTERED loss. */
+function lostTarget(options: TaskCoreOptions, taskId: string): TaskSnapshot {
+	const task = requiredTask(options.store, taskId);
+	if (!sameEndpoint(task.origin, options.endpoint)) throw new TaskProtocolError("NOT_ORIGIN", "only the origin may reassign a task", { retryable: false });
+	if (task.status !== "active") throw reassignmentRefused(taskId, "the task is not active");
+	// Keyed on the current target: leftover envelopes to an earlier target never re-trigger.
+	const lost = options.store.quarantinedOutbox().some(record => record.errorCode === TARGET_LOSS_CODE && record.envelope.taskId === taskId && sameEndpoint(record.envelope.target, task.target));
+	if (!lost) throw reassignmentRefused(taskId, "no loss of the current target is recorded");
+	return task;
+}
+
+function reassignmentRefused(taskId: string, reason: string): TaskProtocolError {
+	return new TaskProtocolError("REASSIGNMENT_REFUSED", `task cannot be reassigned: ${reason}`, { retryable: false, details: { taskId } });
 }
 
 function validateIntent(options: TaskCoreOptions, envelope: RelayEnvelope, payload: unknown): ReceivedEnvelope {
@@ -453,6 +557,9 @@ function validateCanonicalEvent(options: TaskCoreOptions, envelope: RelayEnvelop
 function persistReceivedEnvelope(options: TaskCoreOptions, now: () => number, ids: () => string, received: ReceivedEnvelope, envelopeId: string): readonly string[] {
 	if (received.kind === "assignment") {
 		options.store.putTask(received.task);
+		// A known task follows the reassignment; carried history is append-only and skips events already held.
+		if (received.event.type === REASSIGNED_EVENT) options.store.setTarget(received.task.taskId, received.task.target);
+		for (const carried of received.history) options.store.appendEvent(carried);
 		options.store.appendEvent(received.event);
 		return [];
 	}
@@ -575,6 +682,7 @@ function inboxItems(store: TaskStore, deliveries: readonly RelayDelivery[]): rea
 type OutboxFlusher = (signal: AbortSignal | undefined, reportedEnvelopeIds: ReadonlySet<string> | undefined, work: TaskWorkScope, retry?: boolean) => Promise<void>;
 
 function createOutboxFlusher(options: TaskCoreOptions): OutboxFlusher {
+	const timers = options.timers ?? SYSTEM_TASK_TIMERS;
 	const inFlight = new Map<string, Promise<void>>();
 	const send = async (record: OutboxRecord, retry: boolean, work: TaskWorkScope): Promise<void> => {
 		const id = record.envelope.envelopeId;
@@ -582,13 +690,13 @@ function createOutboxFlusher(options: TaskCoreOptions): OutboxFlusher {
 		// older send already in flight instead of racing it; otherwise defer behind it.
 		for (let ahead = options.store.pendingOutboxAhead(id); ahead.length; ahead = options.store.pendingOutboxAhead(id)) {
 			const older = ahead.map(olderId => inFlight.get(olderId)).find(Boolean);
-			if (!older) throw deferredTaskDelivery({ envelopeId: id, blockedBy: ahead[0], retryAfterMs: Math.max(0, options.store.outboxRetryAt(ahead[0]!) - Date.now()) });
+			if (!older) throw deferredTaskDelivery({ envelopeId: id, blockedBy: ahead[0], retryAfterMs: Math.max(0, options.store.outboxRetryAt(ahead[0]!) - timers.now()) });
 			await waitForRelayOperation(older.catch(() => undefined), work.signal);
 		}
 		const joined = inFlight.get(id);
 		if (joined) { await waitForRelayOperation(joined, work.signal); return; }
 		const retryAt = options.store.outboxRetryAt(id);
-		if (retryAt > Date.now() || !work.claimSend(id, retry)) throw deferredTaskDelivery({ envelopeId: id, retryAfterMs: Math.max(0, retryAt - Date.now()) });
+		if (retryAt > timers.now() || !work.claimSend(id, retry)) throw deferredTaskDelivery({ envelopeId: id, retryAfterMs: Math.max(0, retryAt - timers.now()) });
 		const signal = retry ? work.backgroundSignal() : work.signal;
 		const delivery = (async (): Promise<void> => {
 			try {
@@ -597,14 +705,14 @@ function createOutboxFlusher(options: TaskCoreOptions): OutboxFlusher {
 				options.store.transaction(() => options.store.markOutboxAccepted(id));
 			} catch (error) {
 				if (signal.aborted) throw error;
-				const retryAt = capacityRetryAt(error);
+				const retryAt = capacityRetryAt(error, timers.now());
 				if (retryAt !== undefined) {
 					options.store.postponeOutbox(id, retryAt);
 					// A large foreground refusal does not prove smaller old mail cannot fit.
 					if (retry) work.blockedRetryTargets.add(JSON.stringify(record.envelope.target));
 				}
 				if (error instanceof TaskProtocolError && isBlockedOutboxDeliveryCode(error.code) && !error.retryable) options.store.transaction(() => {
-					options.store.quarantineOutbox(id, { errorCode: error.code, reason: error.message, details: error.details ?? {}, quarantinedAt: Date.now() });
+					options.store.quarantineOutbox(id, { errorCode: error.code, reason: error.message, details: error.details ?? {}, quarantinedAt: timers.now() });
 				});
 				throw error;
 			}
@@ -619,7 +727,7 @@ function createOutboxFlusher(options: TaskCoreOptions): OutboxFlusher {
 			const record = options.store.getOutboxRecord(id);
 			if (record?.state === "accepted") continue;
 			if (!record) {
-				const quarantined = options.store.quarantinedOutbox().find(item => item.envelope.envelopeId === id);
+				const quarantined = options.store.getQuarantine(id);
 				failure ??= quarantined ? new TaskProtocolError(quarantined.errorCode, quarantined.reason, { retryable: false, details: quarantined.details }) : deferredTaskDelivery({ envelopeId: id });
 				continue;
 			}
@@ -643,7 +751,7 @@ function createOutboxFlusher(options: TaskCoreOptions): OutboxFlusher {
 			for (let inspected = 0; inspected < TASK_WORK_LIMITS.retryInspections && attempts < TASK_WORK_LIMITS.retries; inspected++) {
 				if (!options.store.hasPendingOutbox() || !work.canRetry()) break;
 				// Advance one attempted/actually skipped ID, never an unattempted batch suffix.
-				const record = options.store.selectPendingOutbox(1, Date.now(), 1)[0];
+				const record = options.store.selectPendingOutbox(1, timers.now(), 1)[0];
 				if (!record) continue;
 				const id = record.envelope.envelopeId;
 				if (reportedEnvelopeIds?.has(id) || work.attemptedSends.has(id) || inFlight.has(id) || work.blockedRetryTargets.has(JSON.stringify(record.envelope.target))) continue;
@@ -660,6 +768,8 @@ function createOutboxFlusher(options: TaskCoreOptions): OutboxFlusher {
 }
 
 async function waitForRelayOperation(delivery: Promise<unknown>, signal: AbortSignal): Promise<void> {
+	// Observe the operation first: an abort found here must not leave its later rejection unhandled.
+	delivery.catch(() => undefined);
 	throwIfAborted(signal);
 	let abort!: () => void;
 	const cancelled = new Promise<never>((_, reject) => { abort = () => reject(new TaskProtocolError("ABORTED", "task operation aborted", { details: { mayHaveBeenDelivered: true } })); signal.addEventListener("abort", abort, { once: true }); });
@@ -693,9 +803,15 @@ function parsePayload(envelope: RelayEnvelope): unknown {
 	try { return JSON.parse(envelope.payload) as unknown; } catch { throw new TaskProtocolError("INVALID_PAYLOAD", "relay envelope payload is not valid task protocol JSON"); }
 }
 
+/** First of `envelopeIds`, in their order, that is quarantined and matches; indexed per id, not a quarantine scan. */
+function firstQuarantined(store: TaskStore, envelopeIds: readonly string[], matches: (record: OutboxQuarantineRecord) => boolean = () => true): OutboxQuarantineRecord | undefined {
+	for (const id of envelopeIds) { const record = store.getQuarantine(id); if (record && matches(record)) return record; }
+	return undefined;
+}
+
 function throwIfCancellationDeliveryBlocked(options: TaskCoreOptions, taskId: string, envelopeIds: readonly string[]): void {
 	const task = requiredTask(options.store, taskId);
-	const blocked = options.store.quarantinedOutbox().find((record) => envelopeIds.includes(record.envelope.envelopeId) && sameEndpoint(record.envelope.target, task.target));
+	const blocked = firstQuarantined(options.store, envelopeIds, (record) => sameEndpoint(record.envelope.target, task.target));
 	if (blocked === undefined) return;
 	throw new TaskOutboxDeliveryError(blocked.errorCode, blocked.reason, {
 		retryable: false,
@@ -704,7 +820,7 @@ function throwIfCancellationDeliveryBlocked(options: TaskCoreOptions, taskId: st
 }
 
 function throwIfDeliveryEvidenceBlocked(store: TaskStore, taskId: string, envelopeIds: readonly string[], evidence: DeliveryEvidence): void {
-	const blocked = store.quarantinedOutbox().find((record) => envelopeIds.includes(record.envelope.envelopeId));
+	const blocked = firstQuarantined(store, envelopeIds);
 	if (blocked === undefined) return;
 	throw new TaskOutboxDeliveryError(blocked.errorCode, "task delivery evidence is blocked", {
 		retryable: false,

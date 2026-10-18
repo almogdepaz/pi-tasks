@@ -5,11 +5,12 @@ import { deliverTaskInbox } from "../src/task-inbox";
 import { TaskProtocolError, type RelayDeliveryAck, type RelayEnvelope, type TaskRelay } from "../src/task-protocol";
 import { createTaskStore } from "../src/task-store";
 import { createTaskWorkScope } from "../src/task-work-scope";
+import { virtualTime } from "./virtual-time";
 
 const origin = { relay: "memory", id: "origin" }, peer = { relay: "memory", id: "peer" };
 
 async function fixture() {
-  const base: TaskRelay = createInMemoryTaskRelay("memory"), store = createTaskStore(), peerStore = createTaskStore();
+  const base: TaskRelay = createInMemoryTaskRelay("memory"), store = createTaskStore(), peerStore = createTaskStore(), time = virtualTime();
   let mode: "fail" | "slow" | "accept" | "capacity" = "fail", blocked: "none" | "full" | "partial" = "none";
   let release!: () => void, started!: () => void, settled!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
@@ -42,7 +43,7 @@ async function fixture() {
       await base.acknowledgeDelivery(input, signal);
     },
   };
-  const core = createTaskCore({ endpoint: origin, store, relay });
+  const core = createTaskCore({ endpoint: origin, store, relay, timers: time.timers });
   const child = createTaskCore({ endpoint: peer, store: peerStore, relay: base });
   await core.connect(); await child.connect();
   const old = await core.createTask({ target: peer, task: "outgoing assignment", timeoutMs: 60_000 });
@@ -62,7 +63,7 @@ async function fixture() {
   const canonical = () => store.outbox("accepted").filter(row => row.envelope.kind === "canonical_event").map(row => row.envelope);
   const retained = () => canonical().filter(envelope => originals.some(oldEnvelope => oldEnvelope.envelopeId === envelope.envelopeId));
   const refresh = (signal?: AbortSignal) => {
-    const work = createTaskWorkScope(signal, "phased");
+    const work = createTaskWorkScope(signal, "phased", time.timers);
     const pi = { sendMessage() { throw new Error("repair failure must stop presentation"); }, appendEntry() { throw new Error("repair failure must stop archive presentation"); } };
     const context = { isIdle: () => false, hasPendingMessages: () => true, sessionManager: { getEntries: () => [] } };
     return { work, run: async () => {
@@ -70,7 +71,7 @@ async function fixture() {
       await deliverTaskInbox(pi, core, context, work.signal, work);
     } };
   };
-  return { base, store, peerStore, core, fresh, requested, originals, originalAck, attempts, canonicalAttempts, pages, before,
+  return { base, store, peerStore, core, time, fresh, requested, originals, originalAck, attempts, canonicalAttempts, pages, before,
     pending, canonical, retained, refresh, gate, ackStarted, ackSettled, release,
     mode(value: typeof mode) { mode = value; }, block(value: typeof blocked) { blocked = value; },
     close() { store.close(); peerStore.close(); } };
@@ -110,8 +111,10 @@ for (const cancellation of ["background bound", "caller"] as const) {
         expect(f.core.getTask(f.fresh.taskId)?.status).toBe("active");
         controller.abort();
       }
-      const outcome = await Promise.race([drive, Bun.sleep(3_000).then(() => "repair did not yield within its background bound")]);
+      // The held repair ignores abort: the refresh yields at the 2s background bound, or at once when the caller cancels.
+      const outcome = await f.time.run(drive, 3_000);
       expect(outcome).toMatchObject({ code: "ABORTED", details: { mayHaveBeenDelivered: true } });
+      expect(f.time.timers.elapsed()).toBe(cancellation === "caller" ? 0 : 2_000);
       expect(f.core.getTask(f.fresh.taskId)?.status).toBe("active");
       expect(f.retained()).toEqual(f.originals); expect(f.canonical()).toHaveLength(2);
       expect(f.pending()).toHaveLength(2); expect(refresh.work.attemptedAcknowledgements.size).toBe(1);
@@ -178,7 +181,7 @@ test("raw replay staging preserves ACK cooldown while eligible later raw repair 
     await expect(f.refresh().run()).rejects.toMatchObject({ code: "RELAY_CAPACITY", retryable: true });
     expect(f.core.getTask(f.fresh.taskId)?.status).toBe("active");
     const retryAt = f.store.relayAcknowledgementRetryAt!(origin, f.originalAck.cursor);
-    expect(retryAt).toBeGreaterThan(Date.now() + 8_000);
+    expect(retryAt).toBe(f.time.now() + 10_000);
     f.mode("accept");
     await expect(f.refresh().run()).rejects.toMatchObject({ code: "TASK_DELIVERY_DEFERRED", retryable: true });
     expect(f.pending()).toEqual([{ cursor: f.originalAck.cursor, envelopeId: f.originalAck.envelopeId, retryAt }]);

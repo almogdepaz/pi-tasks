@@ -7,6 +7,7 @@ import { createInMemoryTaskRelay } from '../src/in-memory-task-relay';
 import { TASK_PROTOCOL_VERSION, TaskProtocolError } from '../src/task-protocol';
 import type { RelayDelivery, TaskRelay } from '../src/task-protocol';
 import type { TaskInboxItem } from '../src/task-core';
+import { virtualTime } from './virtual-time';
 
 const origin = { relay: 'memory', id: 'origin' }, target = { relay: 'memory', id: 'target' };
 const relayDeliveries = (items: readonly TaskInboxItem[]): RelayDelivery[] => items.flatMap(item => item.kind === 'relay' ? [item.delivery] : []);
@@ -17,7 +18,7 @@ function wrap(base: TaskRelay): TaskRelay {
 }
 
 test('deadline rotation gives every healthy old envelope an attempt', async () => {
-  const store = createTaskStore(), attempts: string[] = [];
+  const store = createTaskStore(), attempts: string[] = [], time = virtualTime();
   const transport = wrap(createInMemoryTaskRelay('memory'));
   let seeding = true, serial = 0;
   transport.resolve = async input => ({ relay: input.relay, id: input.reference });
@@ -27,11 +28,11 @@ test('deadline rotation gives every healthy old envelope an attempt', async () =
     if (input.envelopeId === 'old-0') await new Promise<void>(() => {});
     return { envelopeId: input.envelopeId };
   };
-  const core = createTaskCore({ endpoint: origin, store, relay: transport, ids: () => {
+  const core = createTaskCore({ endpoint: origin, store, relay: transport, timers: time.timers, ids: () => {
     const i = serial++; return ['task', 'event', 'old'][i % 3] + '-' + Math.floor(i / 3);
   } });
   for (let i = 0; i < 16; i++) {
-    const work = createTaskWorkScope(undefined, "phased");
+    const work = createTaskWorkScope(undefined, "phased", time.timers);
     try { await core.createTask({ target: { ...target, id: `target-${i}` }, task: `old-${i}`, timeoutMs: 60_000 }, work.signal, work); }
     catch (error) { expect(error).toMatchObject({ code: 'RELAY_UNAVAILABLE' }); }
   }
@@ -43,7 +44,7 @@ test('deadline rotation gives every healthy old envelope an attempt', async () =
   const failures: string[] = [];
   for (let i = 0; i < 6; i++) {
     inspections = 0; const before = attempts.length;
-    try { await core.flushOutbox(); } catch (error) { failures.push((error as TaskProtocolError).code); }
+    try { await time.run(core.flushOutbox()); } catch (error) { failures.push((error as TaskProtocolError).code); }
     expect(attempts.length - before).toBeLessThanOrEqual(8);
     expect(inspections).toBeLessThanOrEqual(64);
   }
@@ -52,8 +53,12 @@ test('deadline rotation gives every healthy old envelope an attempt', async () =
   const accepted = store.outbox('accepted').map(item => item.envelope.envelopeId);
   const pending = store.outbox('pending').map(item => item.envelope.envelopeId);
   console.log(JSON.stringify({ probe: 'deadline-fairness', attempts, accepted, pending, failures }));
-  try { expect(accepted).toHaveLength(15); } finally { store.close(); }
-}, 15_000);
+  try {
+    expect(accepted).toHaveLength(15);
+    // Five flushes each end at the background deadline on the held old-0; the one deferred flush spends none.
+    expect(time.timers.elapsed()).toBe(5 * 2_000);
+  } finally { store.close(); }
+});
 
 test('failed requested ACK repairs leave an initial receive opportunity', async () => {
   const base: TaskRelay = createInMemoryTaskRelay('memory');
@@ -95,6 +100,7 @@ test('slow ignored-abort ACK repair preserves protected intake and uncertain req
   const parentStore = createTaskStore(), childStore = createTaskStore();
   const transport = wrap(base);
   let seeding = true, receives = 0, repairs = 0, release!: () => void;
+  const time = virtualTime();
   const held = new Promise<void>(resolve => { release = resolve; });
   transport.receive = async input => { receives++; return base.receive(input); };
   transport.acknowledgeDelivery = async () => {
@@ -102,7 +108,7 @@ test('slow ignored-abort ACK repair preserves protected intake and uncertain req
     repairs++; await held; // Intentionally ignore abort; remote outcome remains uncertain.
   };
   const parent = createTaskCore({ endpoint: origin, store: parentStore, relay: base });
-  const child = createTaskCore({ endpoint: target, store: childStore, relay: transport });
+  const child = createTaskCore({ endpoint: target, store: childStore, relay: transport, timers: time.timers });
   await parent.connect(); await child.connect();
   await parent.createTask({ target, task: 'old one', timeoutMs: 60_000 });
   await parent.createTask({ target, task: 'old two', timeoutMs: 60_000 });
@@ -111,7 +117,7 @@ test('slow ignored-abort ACK repair preserves protected intake and uncertain req
   const requested = childStore.requestedRelayAcknowledgements(target);
   const fresh = await parent.createTask({ target, task: 'within the same held page', timeoutMs: 60_000 });
   seeding = false; receives = 0;
-  const work = createTaskWorkScope(undefined, "phased");
+  const work = createTaskWorkScope(undefined, "phased", time.timers);
   const errors: unknown[] = [];
   const drive = (async () => {
     try { await child.connect(work.signal, work); } catch (error) { errors.push(error); }
@@ -119,10 +125,9 @@ test('slow ignored-abort ACK repair preserves protected intake and uncertain req
       { isIdle: () => false, hasPendingMessages: () => true, sessionManager: { getEntries: () => [] } }, work.signal, work); }
     catch (error) { errors.push(error); }
   })();
-  let timer!: ReturnType<typeof setTimeout>;
   try {
-    const completed = await Promise.race([drive.then(() => true), new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), 3_000); })]);
-    expect(completed).toBe(true);
+    await time.run(drive, 3_000);
+    expect(time.timers.elapsed()).toBe(2_000);
     expect(receives).toBe(1); expect(repairs).toBe(1);
     expect(child.getTask(fresh.taskId)).toBeDefined();
     expect(errors).toEqual([expect.objectContaining({ code: 'ABORTED', details: { mayHaveBeenDelivered: true } })]);
@@ -131,7 +136,7 @@ test('slow ignored-abort ACK repair preserves protected intake and uncertain req
     release(); await drive; await Promise.resolve();
     expect(childStore.requestedRelayAcknowledgements(target)).toEqual(requested);
     expect(childStore.getReceiveCursor()).toBe('0');
-  } finally { clearTimeout(timer); release(); await drive; parentStore.close(); childStore.close(); }
+  } finally { release(); await drive; parentStore.close(); childStore.close(); }
 });
 
 test('public receive preserves raw-intent fanout and one-page array return', async () => {
@@ -178,4 +183,24 @@ test('caller cancellation leaves ignored-abort foreground work pending and immut
     waiting = false; await core.flushOutbox();
     expect(store.outbox('accepted').map(record => record.envelope)).toEqual([original]);
   } finally { release(); store.close(); }
+});
+
+test('a relay send that aborts the caller synchronously and rejects later leaves no unhandled rejection', async () => {
+  const controller = new AbortController(), unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const transport = wrap(createInMemoryTaskRelay('memory'));
+    let rejectLate!: (error: unknown) => void;
+    transport.resolve = async input => ({ relay: input.relay, id: input.reference });
+    transport.send = () => { controller.abort(); return new Promise((_, reject) => { rejectLate = reject; }); };
+    const store = createTaskStore();
+    const core = createTaskCore({ endpoint: origin, store, relay: transport });
+    await expect(core.createTask({ target, task: 'aborted while sending', timeoutMs: 60_000 }, controller.signal)).rejects.toMatchObject({ code: 'ABORTED' });
+    rejectLate(new TaskProtocolError('RELAY_UNAVAILABLE', 'late send failure', { retryable: true }));
+    // Two macrotask turns let an unobserved rejection reach the process hook.
+    for (let turn = 0; turn < 2; turn++) await new Promise(resolve => setImmediate(resolve));
+    expect(unhandled).toEqual([]);
+    store.close();
+  } finally { process.off('unhandledRejection', onUnhandled); }
 });

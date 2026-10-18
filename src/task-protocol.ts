@@ -26,6 +26,8 @@ const eventType = (flags: Partial<TaskEventTypeSpec>): TaskEventTypeSpec => ({ v
 /** Every canonical task event type this protocol version accepts, with its handling. */
 export const TASK_EVENT_TYPES: Readonly<Record<string, TaskEventTypeSpec>> = {
 	"task.created": eventType({}),
+	/** Origin moved an active task to its lost target's successor; travels as an assignment carrying the history. */
+	"task.reassigned": eventType({}),
 	"task.completed": eventType({ terminal: true, status: "completed", intent: true }),
 	"task.failed": eventType({ terminal: true, status: "failed", intent: true }),
 	"task.cancelled": eventType({ terminal: true, status: "cancelled", intent: true }),

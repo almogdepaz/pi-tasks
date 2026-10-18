@@ -5,7 +5,7 @@ import { Type } from "typebox";
 
 import { abortableSleep } from "./abortable-sleep";
 import { createTaskWorkScope } from "./task-work-scope";
-import { deliverTaskInbox, incorporatedTaskEvents } from "./task-inbox";
+import { deliverTaskInbox, taskEntryEvidence, type TaskEntryEvidence } from "./task-inbox";
 import { RELAY_LOSS_CODES, taskErrorClass } from "./task-errors";
 import { TASK_EVENT_TYPES, TaskDeliveryEvidenceState, TaskDeliveryStage, TaskOutboxDeliveryError, TaskProtocolError, isBlockedOutboxDeliveryCode } from "./task-protocol";
 import { createConfiguredTaskCore } from "./configured-task-core";
@@ -21,6 +21,8 @@ export const ACTIVE_POLL_MS = 1_000;
 /** Background cadence otherwise. */
 export const IDLE_POLL_MS = 5_000;
 const TARGET_NOT_REGISTERED_CODE = "TARGET_NOT_REGISTERED";
+/** Events that assign a task to their target: the original assignment and a reassignment to a lost target's successor. */
+const ASSIGNMENT_EVENTS: ReadonlySet<string> = new Set(["task.created", "task.reassigned"]);
 const RELAY_STATE_LOST_CODE = "RELAY_STATE_LOST";
 const RELAY_LOSS_CUSTOM_TYPE = "pi-tasks-relay-loss";
 const WAIT_BACKOFF_INITIAL_MS = 250;
@@ -327,7 +329,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		if (COORDINATOR_ONLY_TASK_TOOLS.has(event.toolName)) return { block: true, reason: WORKER_COORDINATION_FORBIDDEN_CODE };
 		try {
 			const activeCore = await configuredCore(context.signal);
-			const assignments = assignedWorkerTasks(activeCore, context.sessionManager.getEntries());
+			const assignments = assignedWorkerTasks(activeCore, taskEntryEvidence(context.sessionManager));
 			const taskId = inputTaskId(event.input);
 			if (event.toolName === "agent_task_done") {
 				const assigned = taskId === undefined ? undefined : assignments.find((task) => task.taskId === taskId);
@@ -522,7 +524,8 @@ function taskDeliveryEvidence(task: TaskSnapshot): TaskDeliveryEvidence {
 	let receiverReceipt: TaskDeliveryEvidence["receiverReceipt"] = "not_confirmed";
 	let piInsertion: TaskDeliveryEvidence["piInsertion"] = "not_confirmed";
 	let wakeAcceptance: TaskDeliveryEvidence["wakeAcceptance"] = "not_confirmed";
-	const assignmentEventId = task.events.find((event) => event.type === "task.created")?.eventId;
+	// After a reassignment, evidence describes the latest assignment.
+	const assignmentEventId = task.events.findLast((event) => ASSIGNMENT_EVENTS.has(event.type))?.eventId;
 	for (const event of task.events) {
 		if (event.type !== "task.delivery_receipt" || event.payload.eventId !== assignmentEventId) continue;
 		if (event.payload.stage === TaskDeliveryStage.receiverRecorded) receiverReceipt = "confirmed";
@@ -622,21 +625,20 @@ function terminal(status: string): boolean {
 
 function receiverAssignment(core: TaskCore, task: TaskSnapshot, context: Pick<ExtensionContext, "sessionManager">): string {
 	if (task.status !== "active" || sameEndpoint(task.origin, core.endpoint) || !sameEndpoint(task.target, core.endpoint)) return "";
-	const created = task.events.find((event) => event.type === "task.created");
-	if (!created || !incorporatedTaskEvents(context.sessionManager.getEntries()).some((evidence) => evidence.taskId === task.taskId && evidence.eventId === created.eventId)) return "";
+	const incorporated = taskEntryEvidence(context.sessionManager).incorporated.get(task.taskId);
+	if (!task.events.some((event) => ASSIGNMENT_EVENTS.has(event.type) && sameEndpoint(event.target, core.endpoint) && incorporated?.has(event.eventId) === true)) return "";
 	return `\n\n## task assignment\n${task.task}`;
 }
 
-function assignedWorkerTasks(core: TaskCore, entries: readonly unknown[]): readonly TaskSnapshot[] {
-	const assignments = new Map<string, TaskSnapshot>();
-	for (const evidence of incorporatedTaskEvents(entries)) {
-		const task = core.getTask(evidence.taskId);
+/** Session evidence is memoized; tasks are read fresh on every call so the gate follows current task state. */
+function assignedWorkerTasks(core: TaskCore, evidence: TaskEntryEvidence): readonly TaskSnapshot[] {
+	const assignments: TaskSnapshot[] = [];
+	for (const [taskId, eventIds] of evidence.incorporated) {
+		const task = core.getTask(taskId);
 		if (!task || !sameEndpoint(task.target, core.endpoint)) continue;
-		const created = task.events.find((event) => event.eventId === evidence.eventId);
-		if (!created || created.type !== "task.created" || !sameEndpoint(created.target, core.endpoint) || !sameEndpoint(created.source, task.origin)) continue;
-		assignments.set(task.taskId, task);
+		if (task.events.some((event) => eventIds.has(event.eventId) && ASSIGNMENT_EVENTS.has(event.type) && sameEndpoint(event.target, core.endpoint) && sameEndpoint(event.source, task.origin))) assignments.push(task);
 	}
-	return [...assignments.values()];
+	return assignments;
 }
 
 function eligibleWorkerTask(task: TaskSnapshot, closingTaskIds: ReadonlySet<string>): boolean {

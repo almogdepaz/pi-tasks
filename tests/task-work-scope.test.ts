@@ -6,6 +6,7 @@ import { createInMemoryTaskRelay } from "../src/in-memory-task-relay";
 import { deliverTaskInbox } from "../src/task-inbox";
 import { TASK_PROTOCOL_VERSION, TaskProtocolError } from "../src/task-protocol";
 import type { RelayEnvelope, TaskRelay } from "../src/task-protocol";
+import { virtualTime } from "./virtual-time";
 
 const origin = { relay: "memory", id: "origin" }, target = { relay: "memory", id: "target" };
 const envelope = (id: string, destination = target): RelayEnvelope => ({
@@ -254,13 +255,12 @@ test("a noncooperative old retry yields at the overall background bound and cann
   let release!: () => void;
   const held = new Promise<void>(resolve => { release = resolve; });
   let waiting = true, receives = 0;
-  const core = createTaskCore({ endpoint: origin, store, relay: relay(async input => {
+  const time = virtualTime();
+  const core = createTaskCore({ endpoint: origin, store, timers: time.timers, relay: relay(async input => {
     if (waiting) await held; return { envelopeId: input.envelopeId };
   }, async input => { receives++; return { deliveries: [], hasMore: false, nextCursor: input.cursor }; }) });
-  const started = Date.now();
-  await expect(core.flushOutbox()).rejects.toMatchObject({ code: "ABORTED" });
-  expect(Date.now() - started).toBeGreaterThanOrEqual(1_900);
-  expect(Date.now() - started).toBeLessThan(3_000);
+  await expect(time.run(core.flushOutbox())).rejects.toMatchObject({ code: "ABORTED" });
+  expect(time.timers.elapsed()).toBe(2_000);
   expect(store.outbox("accepted")).toEqual([]);
   waiting = false; await core.receive(); release(); await Promise.resolve();
   expect(receives).toBe(1); expect(store.outbox("accepted")[0]!.envelope).toEqual(original);

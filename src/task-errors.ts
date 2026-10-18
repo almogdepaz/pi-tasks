@@ -54,6 +54,7 @@ export const TASK_ERRORS: Readonly<Record<string, TaskErrorSpec>> = {
 	TERMINAL_INTENT_CONFLICT: { class: "state", retryable: false, message: "a different terminal intent was already submitted" },
 	NOT_ORIGIN: { class: "state", retryable: false, message: "only the origin may perform this operation" },
 	NOT_PARTICIPANT: { class: "state", retryable: false, message: "endpoint is not a task participant" },
+	REASSIGNMENT_REFUSED: { class: "state", retryable: false, message: "task cannot be reassigned" },
 	TASK_ERROR: { class: "state", retryable: true, message: "task operation failed" },
 	// delivery
 	TARGET_NOT_REGISTERED: { class: "delivery", retryable: false, blocksDelivery: true, message: "target is not registered" },

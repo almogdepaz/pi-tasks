@@ -18,7 +18,8 @@ test("persistence options are rejected rather than opening SQLite or importing h
 
 test("snapshots do not leak mutable live records and ordering is deterministic", () => {
   const store = createTaskStore(), input = task("a"); store.putTask(input); input.origin.id = "changed";
-  const snapshot = store.getTask("a")!; (snapshot.origin as { id: string }).id = "also-changed";
+  // Stored values are deep-frozen, so a write through a snapshot either throws or is lost; it never reaches the store.
+  const snapshot = store.getTask("a")!; expect(() => { (snapshot.origin as { id: string }).id = "also-changed"; }).toThrow(TypeError);
   expect(store.getTask("a")?.origin.id).toBe("a");
   store.putTask(task("b")); expect(store.listTasks().map(t => t.taskId)).toEqual(["a", "b"]); store.close();
 });

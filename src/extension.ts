@@ -6,7 +6,8 @@ import { Type } from "typebox";
 import { abortableSleep } from "./abortable-sleep";
 import { createTaskWorkScope } from "./task-work-scope";
 import { deliverTaskInbox, incorporatedTaskEvents } from "./task-inbox";
-import { TaskDeliveryEvidenceState, TaskDeliveryStage, TaskOutboxDeliveryError, TaskProtocolError, isBlockedOutboxDeliveryCode } from "./task-protocol";
+import { RELAY_LOSS_CODES, taskErrorClass } from "./task-errors";
+import { TASK_EVENT_TYPES, TaskDeliveryEvidenceState, TaskDeliveryStage, TaskOutboxDeliveryError, TaskProtocolError, isBlockedOutboxDeliveryCode } from "./task-protocol";
 import { createConfiguredTaskCore } from "./configured-task-core";
 import type { OwnedTaskCore } from "./configured-task-core";
 import type { SubmitIntentInput, SubmitIntentOutcome, TaskCore } from "./task-core";
@@ -22,7 +23,6 @@ export const IDLE_POLL_MS = 5_000;
 const TARGET_NOT_REGISTERED_CODE = "TARGET_NOT_REGISTERED";
 const RELAY_STATE_LOST_CODE = "RELAY_STATE_LOST";
 const RELAY_LOSS_CUSTOM_TYPE = "pi-tasks-relay-loss";
-const RELAY_LOSS_CODES = new Set(["RELAY_RESET", "RELAY_REBIND_REQUIRED"]);
 const WAIT_BACKOFF_INITIAL_MS = 250;
 const WAIT_BACKOFF_MAX_MS = 2_000;
 const SUMMARY_MAX_CHARS = 1_200;
@@ -118,8 +118,8 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		const epoch = lifecycleEpoch;
 		const isCurrent = (): boolean => inboxContext === context && lifecycleEpoch === epoch;
 		if (!context) return undefined;
-		const work = createTaskWorkScope(signal);
-		work.retryAllowed = false; // Reserve initial intake ahead of speculative backlog work and ACK repair.
+		// Phased: intake runs ahead of speculative backlog work and ACK repair.
+		const work = createTaskWorkScope(signal, "phased");
 		signal = work.signal;
 		const activeCore = await configuredCore(signal);
 		if (!isCurrent()) return undefined;
@@ -144,6 +144,17 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 				if (!isCurrent()) return [];
 				const deliveries = await activeCore.receive(receiveSignal, receiveWork);
 				return isCurrent() ? deliveries : [];
+			},
+			async intakeInbox(intakeSignal, intakeWork) {
+				if (!isCurrent()) return [];
+				const items = await activeCore.intakeInbox(intakeSignal, intakeWork);
+				return isCurrent() ? items : [];
+			},
+			async shipRequired(shipSignal, shipWork) {
+				if (isCurrent()) await activeCore.shipRequired(shipSignal, shipWork);
+			},
+			async repairAcknowledgements(repairSignal, repairWork) {
+				if (isCurrent()) await activeCore.repairAcknowledgements(repairSignal, repairWork);
 			},
 			async acknowledgeRelayDelivery(cursor, acknowledgementSignal, acknowledgementWork) {
 				if (isCurrent()) await activeCore.acknowledgeRelayDelivery(cursor, acknowledgementSignal, acknowledgementWork);
@@ -586,11 +597,17 @@ function blockedDeliveryWarning(error: TaskOutboxDeliveryError, target: TaskEndp
 	return { code: error.code, message: error.message, retryable: false, delivery: "blocked", target, details };
 }
 
-function outboxFailureStatus(error: unknown): string {
+/**
+ * Status-line text for a failed refresh. Actionable relay-state labels come first; otherwise
+ * `tasks: <class> (<CODE>) on <operation>` when the failed relay operation is known.
+ */
+export function outboxFailureStatus(error: unknown): string {
 	if (error instanceof TaskProtocolError) {
 		if (RELAY_LOSS_CODES.has(error.code)) return "tasks: relay state lost; rebinding automatically";
 		if (error.code === "RELAY_PROFILE_REQUIRED") return "tasks: compatible memory-owned relay required";
 		if (error.code === "RELAY_AUTH_REQUIRED") return "tasks: Wolfpack authentication required";
+		const operation = error.details?.operation;
+		if (typeof operation === "string") return `tasks: ${taskErrorClass(error.code)} (${error.code}) on ${operation}`;
 	}
 	return error instanceof TaskOutboxDeliveryError && isBlockedOutboxDeliveryCode(error.code) ? "tasks: outbox degraded" : "tasks: relay unavailable";
 }
@@ -600,7 +617,7 @@ function isRelayLoss(error: unknown): error is TaskProtocolError {
 }
 
 function terminal(status: string): boolean {
-	return ["completed", "failed", "cancelled", "timed_out"].includes(status);
+	return Object.values(TASK_EVENT_TYPES).some(type => type.status === status);
 }
 
 function receiverAssignment(core: TaskCore, task: TaskSnapshot, context: Pick<ExtensionContext, "sessionManager">): string {

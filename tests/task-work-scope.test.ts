@@ -169,7 +169,7 @@ test("foreground receipts use indexed lookups, not whole accepted/pending outbox
   store.close();
 });
 
-test("raw-intent ACK progress still fetches only one initial page per refresh", async () => {
+test("raw-intent intake follows further pages in one refresh while the pending set has room", async () => {
   const backing = createInMemoryTaskRelay("memory"), parentStore = createTaskStore(), childStore = createTaskStore();
   let pages = 0;
   const transport: TaskRelay = { id: backing.id, connect: input => backing.connect(input), resolve: input => backing.resolve(input),
@@ -190,16 +190,16 @@ test("raw-intent ACK progress still fetches only one initial page per refresh", 
     const candidate = entry as { customType?: string; details?: { taskId?: string } };
     return candidate.customType === "pi-tasks-event" ? [candidate.details?.taskId] : [];
   });
-  expect(pages).toBe(1);
-  expect(tasks.map(task => parent.getTask(task.taskId)?.status)).toEqual(["completed", "active"]);
-  // The canonicalized completion is presented locally in the same refresh, without another page.
-  expect(presented()).toEqual([tasks[0].taskId]);
+  // One-item pages report more; intake keeps fetching after the intake cursor in the same refresh.
+  expect(pages).toBe(2);
+  expect(tasks.map(task => parent.getTask(task.taskId)?.status)).toEqual(["completed", "completed"]);
+  // Both canonicalized completions are presented locally in the same refresh.
+  expect(presented()).toEqual([tasks[0].taskId, tasks[1].taskId]);
   await deliverTaskInbox({
     sendMessage(message) { entries.push({ type: "custom_message", ...message }); },
     appendEntry(customType, data) { entries.push({ type: "custom", customType, data }); },
   }, parent, { isIdle: () => true, hasPendingMessages: () => false, sessionManager: { getEntries: () => entries } });
-  expect(pages).toBe(2);
-  expect(tasks.map(task => parent.getTask(task.taskId)?.status)).toEqual(["completed", "completed"]);
+  expect(pages).toBe(3);
   expect(presented()).toEqual([tasks[0].taskId, tasks[1].taskId]);
   expect(BigInt(parentStore.getReceiveCursor())).toBeGreaterThan(0n);
   parentStore.close(); childStore.close();
@@ -211,9 +211,10 @@ test("reserved inbox intake runs before speculative retries without losing old w
   const core = createTaskCore({ endpoint: origin, store, relay: relay(async input => {
     sends++; return { envelopeId: input.envelopeId };
   }, async input => { receives++; expect(sends).toBe(0); return { deliveries: [], hasMore: false, nextCursor: input.cursor }; }) });
-  const scope = createTaskWorkScope(); scope.retryAllowed = false;
-  await expect(core.flushOutbox(scope.signal, scope)).rejects.toMatchObject({ code: "TASK_DELIVERY_DEFERRED" });
-  expect(store.outbox("pending")).toHaveLength(1);
+  // Core operations of a phased pass never start old-work retry; only its final phase does.
+  const scope = createTaskWorkScope(undefined, "phased");
+  await core.connect(scope.signal, scope); await core.evaluateTimeouts(scope.signal, scope);
+  expect(sends).toBe(0); expect(store.outbox("pending")).toHaveLength(1);
   await deliverTaskInbox({ sendMessage() {}, appendEntry() {} }, core,
     { isIdle: () => true, hasPendingMessages: () => false, sessionManager: { getEntries: () => [] } }, scope.signal, scope);
   expect(receives).toBe(1); expect(sends).toBe(1); expect(store.outbox("pending")).toEqual([]);

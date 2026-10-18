@@ -5,17 +5,41 @@ export const ORIGIN_CANCELLATION_OPERATION = "origin_cancellation";
 export const PARENT_ACKNOWLEDGMENT_OPERATION = "parent_acknowledgment";
 export const TERMINAL_INTENT_OPERATION = "terminal_intent";
 
-const BLOCKED_OUTBOX_DELIVERY_CODES: ReadonlySet<string> = new Set([
-	"TARGET_NOT_REGISTERED",
-	INVALID_RELAY_METADATA,
-	"DELIVERY_UNCONFIRMED",
-	"ENVELOPE_EXPIRED",
-	"ENVELOPE_CONFLICT",
-	"CROSS_RELAY_ENDPOINT",
-]);
+export { isBlockedOutboxDeliveryCode } from "./task-errors";
 
-export function isBlockedOutboxDeliveryCode(code: string): boolean {
-	return BLOCKED_OUTBOX_DELIVERY_CODES.has(code);
+export interface TaskEventTypeSpec {
+	/** Inserted into the model and woken; otherwise archived as evidence only. */
+	readonly visible: boolean;
+	/** Ends the task; `status` is the task status it sets. */
+	readonly terminal: boolean;
+	readonly status?: Exclude<TaskRecord["status"], "active">;
+	/** Peer conversation that carries the sender's intent identity. */
+	readonly conversational: boolean;
+	/** Origin-local delivery evidence, never forwarded to the worker. */
+	readonly evidence: boolean;
+	/** A receiver may submit it as a raw intent. */
+	readonly intent: boolean;
+}
+
+const eventType = (flags: Partial<TaskEventTypeSpec>): TaskEventTypeSpec => ({ visible: true, terminal: false, conversational: false, evidence: false, intent: false, ...flags });
+
+/** Every canonical task event type this protocol version accepts, with its handling. */
+export const TASK_EVENT_TYPES: Readonly<Record<string, TaskEventTypeSpec>> = {
+	"task.created": eventType({}),
+	"task.completed": eventType({ terminal: true, status: "completed", intent: true }),
+	"task.failed": eventType({ terminal: true, status: "failed", intent: true }),
+	"task.cancelled": eventType({ terminal: true, status: "cancelled", intent: true }),
+	"task.timed_out": eventType({ terminal: true, status: "timed_out" }),
+	"task.information": eventType({ conversational: true, intent: true }),
+	"task.question": eventType({ conversational: true, intent: true }),
+	"task.answer": eventType({ conversational: true, intent: true }),
+	"task.delivery_receipt": eventType({ visible: false, evidence: true, intent: true }),
+	"task.parent_acknowledged": eventType({ visible: false }),
+	"task.late_terminal": eventType({ visible: false }),
+};
+
+export function taskEventTypes(predicate: (type: TaskEventTypeSpec) => boolean): ReadonlySet<string> {
+	return new Set(Object.entries(TASK_EVENT_TYPES).flatMap(([type, spec]) => predicate(spec) ? [type] : []));
 }
 
 /**

@@ -2,6 +2,7 @@ import {
 	MAX_RELAY_PAYLOAD_BYTES,
 	ORIGIN_CANCELLATION_OPERATION,
 	PARENT_ACKNOWLEDGMENT_OPERATION,
+	TASK_EVENT_TYPES,
 	TASK_PROTOCOL_VERSION,
 	TERMINAL_INTENT_OPERATION,
 	TaskDeliveryEvidenceState,
@@ -10,6 +11,7 @@ import {
 	TaskOutboxDeliveryError,
 	TaskProtocolError,
 	isBlockedOutboxDeliveryCode,
+	taskEventTypes,
 } from "./task-protocol";
 import type {
 	RelayDelivery,
@@ -23,21 +25,16 @@ import type {
 } from "./task-protocol";
 import type { TaskStore, OutboxRecord } from "./task-store";
 import { TASK_WORK_LIMITS, capacityRetryAt, createTaskWorkScope, deferredTaskDelivery } from "./task-work-scope";
-import type { TaskWorkScope } from "./task-work-scope";
+import type { TaskShipment, TaskWorkScope } from "./task-work-scope";
 
 const RECEIVE_PAGE_SIZE = TASK_WORK_LIMITS.pageItems;
 const DELIVERY_EVIDENCE_OPERATION = "delivery_evidence";
 const RECEIVED_INTENT_OPERATION = "received_intent";
-const TERMINAL_STATUSES = new Set<TaskRecord["status"]>(["completed", "failed", "cancelled", "timed_out"]);
-const TERMINAL_EVENTS = new Set(["task.completed", "task.failed", "task.cancelled", "task.timed_out"]);
-const CONVERSATIONAL_EVENTS = new Set(["task.information", "task.question", "task.answer"]);
-const CANONICAL_EVENTS = new Set([
-	"task.created", "task.completed", "task.failed", "task.cancelled", "task.timed_out",
-	"task.information", "task.question", "task.answer", "task.delivery_receipt", "task.parent_acknowledged", "task.late_terminal",
-]);
-const RECEIVER_INTENT_TYPES = new Set<TaskIntent["type"]>([
-	"task.completed", "task.failed", "task.cancelled", "task.information", "task.question", "task.answer", "task.delivery_receipt",
-]);
+const TERMINAL_STATUSES: ReadonlySet<TaskRecord["status"]> = new Set(Object.values(TASK_EVENT_TYPES).flatMap(type => type.status ?? []));
+const TERMINAL_EVENTS = taskEventTypes(type => type.terminal);
+const CONVERSATIONAL_EVENTS = taskEventTypes(type => type.conversational);
+const CANONICAL_EVENTS = taskEventTypes(() => true);
+const RECEIVER_INTENT_TYPES = taskEventTypes(type => type.intent);
 const IGNORE_OUTBOX_FAILURES: ReadonlySet<string> = new Set();
 
 export interface TaskCoreOptions {
@@ -88,8 +85,15 @@ export interface TaskCore {
 	onChange(listener: () => void): () => void;
 	/** Correlate a receiver conversation with a locally recorded outbound intent, never session history or payload author claims. */
 	isSelfAuthoredConversation(event: TaskEvent): boolean;
+	/** Offers pending mail with bounded old-work retry; in a phased pass this is the explicit final retry phase. */
 	flushOutbox(signal?: AbortSignal, work?: TaskWorkScope): Promise<void>;
 	receive(signal?: AbortSignal, work?: TaskWorkScope): Promise<readonly TaskInboxItem[]>;
+	/** Intake phase of a phased pass: persists and canonicalizes without sending or ACKing; required fan-out joins `work.shipments`. */
+	intakeInbox(signal?: AbortSignal, work?: TaskWorkScope): Promise<readonly TaskInboxItem[]>;
+	/** Ship phase of a phased pass: sends `work.shipments` in persist order and records each outcome; only abort throws. */
+	shipRequired(signal?: AbortSignal, work?: TaskWorkScope): Promise<void>;
+	/** Acknowledge-phase repair: retries staged raw ACKs, then reports local deferral of a raw intent still pending. */
+	repairAcknowledgements(signal?: AbortSignal, work?: TaskWorkScope): Promise<void>;
 	/** Retire a local item after its Pi insertion and wake evidence exist; no relay ACK or receipt. */
 	completeLocalPresentation(eventId: string): void;
 	acknowledgeRelayDelivery(cursor: string, signal?: AbortSignal, work?: TaskWorkScope): Promise<void>;
@@ -135,6 +139,93 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 			if (!work.attemptedAcknowledgements.has(cursor) && options.store.pendingRelayEnvelopeId(options.endpoint, cursor) !== undefined) await acknowledgeWithSignal(cursor, work.backgroundSignal(), work);
 		}
 	};
+	/** Sends required envelopes now, or defers them to the ship phase of a phased pass. */
+	const ship = async (signal: AbortSignal, envelopeIds: readonly string[], work: TaskWorkScope, verify?: () => void): Promise<void> => {
+		if (work.phased) { work.shipments.push({ envelopeIds, verify, shipped: false }); return; }
+		try {
+			if (envelopeIds.length > 0) await flush(signal, new Set(envelopeIds), work);
+		} catch (error) {
+			verify?.();
+			throw error;
+		}
+		verify?.();
+	};
+	/** Ship phase: sends each shipment in persist order and records its outcome; only abort throws. */
+	const shipAll = async (shipments: readonly TaskShipment[], work: TaskWorkScope): Promise<void> => {
+		for (const shipment of shipments) {
+			if (shipment.shipped) continue;
+			let failure: unknown;
+			try { if (shipment.envelopeIds.length > 0) await flush(work.signal, new Set(shipment.envelopeIds), work, false); } catch (error) {
+				if (work.signal.aborted) throw error;
+				failure = error;
+			}
+			// A blocked-delivery error replaces the send failure, as for an immediate send.
+			try { shipment.verify?.(); } catch (error) { failure = error; }
+			shipment.shipped = true;
+			shipment.failure = failure;
+			if (failure === undefined) shipment.accepted?.();
+		}
+	};
+	/** Acknowledge-phase repair of staged raw ACKs; a raw intent still pending afterwards reports local deferral. */
+	const repairAcknowledgements = async (work: TaskWorkScope): Promise<void> => {
+		await retryRequestedAcknowledgements(work);
+		const pendingRaw = options.store.pendingRelayDeliveries(options.endpoint).find(pending => options.store.inboxEnvelope(pending.envelopeId)?.kind === TaskEnvelopeKind.intent);
+		if (pendingRaw) throw deferredTaskDelivery({ cursor: pendingRaw.cursor,
+			retryAfterMs: Math.max(0, options.store.relayAcknowledgementRetryAt(options.endpoint, pendingRaw.cursor) - Date.now()) });
+	};
+	/**
+	 * Intake phase: re-drives tracked, unacknowledged relay deliveries from the local inbox, then fetches
+	 * after the intake cursor while the pending set has room. It persists and canonicalizes without sending:
+	 * each raw intent's required fan-out becomes a shipment whose acceptance stages that intent's ACK.
+	 */
+	const intake = async (signal: AbortSignal, shipments: TaskShipment[]): Promise<readonly TaskInboxItem[]> => {
+		const visibleDeliveries: RelayDelivery[] = [];
+		const settle = (delivery: RelayDelivery, received: ReceivedEnvelope, persistedEnvelopeIds: readonly string[]): void => {
+			if (received.kind !== "intent") { visibleDeliveries.push(delivery); return; }
+			// Accepted fan-out authorizes the ACK; the checkpoint owns the staged request.
+			shipments.push({ envelopeIds: persistedEnvelopeIds, shipped: false, accepted: () => options.store.transaction(() => options.store.requestRelayAcknowledgement(
+				options.endpoint, delivery.cursor, options.store.relayAcknowledgementRetryAt(options.endpoint, delivery.cursor))) });
+		};
+		// A staged ACK request already proves accepted fanout; re-drive the rest.
+		const staged = new Set(options.store.requestedRelayAcknowledgements(options.endpoint, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER));
+		for (const pending of options.store.pendingRelayDeliveries(options.endpoint)) {
+			if (staged.has(pending.cursor)) continue;
+			const envelope = options.store.inboxEnvelope(pending.envelopeId);
+			if (envelope === undefined) throw new Error("pending relay delivery was not persisted");
+			const received = validateReceivedEnvelope(options, envelope);
+			const persistedEnvelopeIds = received.kind === "intent" ? options.store.transaction(() => persistReceivedEnvelope(options, clock.now, ids, received, envelope.envelopeId)) : [];
+			settle({ cursor: pending.cursor, envelope }, received, persistedEnvelopeIds);
+		}
+		let cursor = options.store.relayIntakeCursor(options.endpoint);
+		for (let room = TASK_WORK_LIMITS.pendingDeliveries - options.store.pendingRelayDeliveries(options.endpoint).length; room > 0;
+			room = TASK_WORK_LIMITS.pendingDeliveries - options.store.pendingRelayDeliveries(options.endpoint).length) {
+			const limit = Math.min(RECEIVE_PAGE_SIZE, room);
+			const page = await options.relay.receive({ endpoint: options.endpoint, cursor, limit }, signal);
+			throwIfAborted(signal);
+			if (!isInboxPage(page) || page.deliveries.length > limit) throw new TaskProtocolError("INVALID_INBOX", "relay returned an invalid inbox page");
+			let previous = BigInt(cursor);
+			for (const delivery of page.deliveries) {
+				if (!isDelivery(delivery) || !sameEndpoint(delivery.envelope.target, options.endpoint) || BigInt(delivery.cursor) <= previous) throw new TaskProtocolError("INVALID_DELIVERY", "relay returned an invalid or unordered delivery");
+				previous = BigInt(delivery.cursor);
+			}
+			if (page.nextCursor !== (page.deliveries.at(-1)?.cursor ?? cursor) || (!page.deliveries.length && page.hasMore)) throw new TaskProtocolError("INVALID_INBOX", "relay page cursor does not describe its deliveries");
+			for (const delivery of page.deliveries) {
+				const received = validateReceivedEnvelope(options, delivery.envelope);
+				let persistedEnvelopeIds: readonly string[] = [];
+				options.store.transaction(() => {
+					// Track only with persistence: the intake cursor never passes an unpersisted delivery,
+					// so an abort or a rejected envelope leaves the suffix to be fetched again.
+					options.store.trackRelayDeliveries(options.endpoint, [{ cursor: delivery.cursor, envelopeId: delivery.envelope.envelopeId }]);
+					if (!options.store.persistInbox(delivery.envelope, delivery.cursor) && received.kind !== "intent") return;
+					persistedEnvelopeIds = persistReceivedEnvelope(options, clock.now, ids, received, delivery.envelope.envelopeId);
+				});
+				settle(delivery, received, persistedEnvelopeIds);
+			}
+			cursor = page.nextCursor;
+			if (!page.hasMore) break;
+		}
+		return inboxItems(options.store, visibleDeliveries);
+	};
 	const submitIntentWithOutcome = async (input: SubmitIntentInput, signal?: AbortSignal, work = createTaskWorkScope(signal, "foreground")): Promise<SubmitIntentOutcome> => {
 		signal = work.signal;
 		if (!RECEIVER_INTENT_TYPES.has(input.type) || !isRecord(input.payload)) throw new TaskProtocolError("INVALID_INTENT", "intent type or payload is invalid");
@@ -152,7 +243,7 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 			outcome = persisted.outcome;
 		});
 		if (evidence !== undefined) {
-			await flushDeliveryEvidence(options, signal, input.taskId, persistedEnvelopeIds, evidence, work, flush);
+			await ship(signal, persistedEnvelopeIds, work, () => throwIfDeliveryEvidenceBlocked(options.store, input.taskId, persistedEnvelopeIds, evidence));
 		} else {
 			try {
 				await flush(signal, new Set(persistedEnvelopeIds), work);
@@ -174,8 +265,8 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 			const connection = await options.relay.connect({ endpoint: options.endpoint, protocolVersion: TASK_PROTOCOL_VERSION, receiveCursor: options.store.getReceiveCursor() }, signal);
 			if (!sameEndpoint(connection.endpoint, options.endpoint)) throw new TaskProtocolError("INVALID_CONNECTION", "relay connected a different endpoint");
 			throwIfAborted(signal);
-			// A reserved refresh repairs only after the initial page has been intaken.
-			if (work.retryAllowed) await retryRequestedAcknowledgements(work);
+			// A phased pass repairs in its acknowledge phase, after intake.
+			if (!work.phased) await retryRequestedAcknowledgements(work);
 		},
 		async createTask(input, signal, work = createTaskWorkScope(signal, "foreground")) {
 			signal = work.signal;
@@ -218,56 +309,29 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 			const intent = parsePayload(localEnvelope);
 			return isTaskIntent(intent) && intent.taskId === event.taskId && intent.type === event.type && intent.intentId === event.payload.intentId;
 		},
-		async flushOutbox(signal, work = createTaskWorkScope(signal)) { await flush(work.signal, undefined, work); },
+		async flushOutbox(signal, work = createTaskWorkScope(signal)) { await flush(work.signal, undefined, work, true); },
 		async receive(signal, work = createTaskWorkScope(signal)) {
-			signal = work.signal;
-			const retryAllowed = work.retryAllowed;
-			work.retryAllowed = false; // Nested fanout must finish this page before unrelated retries.
+			// The phases of a pass without presentation; the first fan-out or repair failure surfaces after them.
+			const shipments: TaskShipment[] = [];
+			let items: readonly TaskInboxItem[], failure: unknown;
 			try {
-				const cursor = options.store.getReceiveCursor();
-				const page = await options.relay.receive({ endpoint: options.endpoint, cursor, limit: RECEIVE_PAGE_SIZE }, signal);
-				throwIfAborted(signal);
-				if (!isInboxPage(page) || page.deliveries.length > RECEIVE_PAGE_SIZE) throw new TaskProtocolError("INVALID_INBOX", "relay returned an invalid inbox page");
-				let previous = BigInt(cursor);
-				for (const delivery of page.deliveries) {
-					if (!isDelivery(delivery) || !sameEndpoint(delivery.envelope.target, options.endpoint) || BigInt(delivery.cursor) <= previous) throw new TaskProtocolError("INVALID_DELIVERY", "relay returned an invalid or unordered delivery");
-					previous = BigInt(delivery.cursor);
+				items = await intake(work.signal, shipments);
+				await shipAll(shipments, work);
+				failure = shipments.find(shipment => shipment.failure !== undefined)?.failure;
+				try { await repairAcknowledgements(work); } catch (error) {
+					if (work.signal.aborted) throw error;
+					failure ??= error;
 				}
-				if (page.nextCursor !== (page.deliveries.at(-1)?.cursor ?? cursor) || (!page.deliveries.length && page.hasMore)) throw new TaskProtocolError("INVALID_INBOX", "relay page cursor does not describe its deliveries");
-				// Track the entire observed prefix before an intent can ACK a later
-				// delivery. Keep only pending IDs plus a high-water mark, durably.
-				options.store.transaction(() => options.store.trackRelayDeliveries(options.endpoint, page.deliveries.map(delivery => ({ cursor: delivery.cursor, envelopeId: delivery.envelope.envelopeId }))));
-				const visibleDeliveries: RelayDelivery[] = [];
-				for (const delivery of page.deliveries) {
-					if (options.store.pendingRelayEnvelopeId(options.endpoint, delivery.cursor) === undefined) continue;
-					const received = validateReceivedEnvelope(options, delivery.envelope);
-					let persistedEnvelopeIds: readonly string[] = [];
-					options.store.transaction(() => {
-						if (!options.store.persistInbox(delivery.envelope, delivery.cursor) && received.kind !== "intent") return;
-						persistedEnvelopeIds = persistReceivedEnvelope(options, clock.now, ids, received, delivery.envelope.envelopeId);
-					});
-					if (persistedEnvelopeIds.length > 0) await flush(signal, new Set(persistedEnvelopeIds), work);
-					if (received.kind === "intent") {
-						// Accepted fanout authorizes ACK, but raw repair must not gate later
-						// facts in this fetched page. The checkpoint owns the staged request.
-						options.store.transaction(() => options.store.requestRelayAcknowledgement(options.endpoint, delivery.cursor,
-							options.store.relayAcknowledgementRetryAt(options.endpoint, delivery.cursor)));
-						continue;
-					}
-					visibleDeliveries.push(delivery);
-				}
-				// Repair failure remains visible, but cannot gate this page's protocol intake.
-				await retryRequestedAcknowledgements(work);
-				const pendingRaw = page.deliveries.find(delivery => delivery.envelope.kind === "intent" && options.store.pendingRelayEnvelopeId(options.endpoint, delivery.cursor) !== undefined);
-				if (pendingRaw) throw deferredTaskDelivery({ cursor: pendingRaw.cursor,
-					retryAfterMs: Math.max(0, options.store.relayAcknowledgementRetryAt(options.endpoint, pendingRaw.cursor) - Date.now()) });
-				return inboxItems(options.store, visibleDeliveries);
 			} finally {
-				work.retryAllowed = retryAllowed;
-				// Inbox delivery owns the later retry share; direct receive retains its own.
-				if (retryAllowed && !work.signal.aborted) await flush(work.signal, IGNORE_OUTBOX_FAILURES, work);
+				// A phased driver owns the later retry share; direct receive retains its own.
+				if (!work.phased && !work.signal.aborted) await flush(work.signal, IGNORE_OUTBOX_FAILURES, work, true);
 			}
+			if (failure !== undefined) throw failure;
+			return items;
 		},
+		async intakeInbox(signal, work = createTaskWorkScope(signal, "phased")) { return intake(work.signal, work.shipments); },
+		async shipRequired(signal, work = createTaskWorkScope(signal, "phased")) { await shipAll(work.shipments, work); },
+		async repairAcknowledgements(signal, work = createTaskWorkScope(signal)) { await repairAcknowledgements(work); },
 		acknowledgeRelayDelivery,
 		completeLocalPresentation(eventId) { options.store.completePresentation(eventId); },
 		async submitIntent(input, signal, work) { await submitIntentWithOutcome(input, signal, work); },
@@ -285,7 +349,7 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 					payload: { eventId: input.eventId, stage: evidence.stage, state: evidence.state },
 				}, deliveryEvidenceOperation(evidence)).envelopeIds;
 			});
-			await flushDeliveryEvidence(options, signal, input.taskId, persistedEnvelopeIds, evidence, work, flush);
+			await ship(signal, persistedEnvelopeIds, work, () => throwIfDeliveryEvidenceBlocked(options.store, input.taskId, persistedEnvelopeIds, evidence));
 		},
 		recordWakeRequest(input, work) {
 			const evidence: DeliveryEvidence = { eventId: input.eventId, stage: TaskDeliveryStage.wakeAccepted, state: TaskDeliveryEvidenceState.confirmed };
@@ -303,9 +367,9 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 			let persisted = sameEndpoint(options.endpoint, requiredTask(options.store, input.taskId).origin) ? undefined : persist();
 			return {
 				flush: async (signal?: AbortSignal): Promise<void> => {
-					persisted ??= persist();
+					const { envelopeIds } = persisted ??= persist();
 					const activeWork = work ?? createTaskWorkScope(signal);
-					await flushDeliveryEvidence(options, activeWork.signal, input.taskId, persisted.envelopeIds, evidence, activeWork, flush);
+					await ship(activeWork.signal, envelopeIds, activeWork, () => throwIfDeliveryEvidenceBlocked(options.store, input.taskId, envelopeIds, evidence));
 				},
 				discard: () => {
 					// No await separates the write from this call, so the envelope was never offered to the relay.
@@ -325,7 +389,7 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 					persistedEnvelopeIds.push(...canonicalize(options, clock.now, ids, task, { intentId: ids(), taskId: task.taskId, type: "task.cancelled", payload: {} }, "task.timed_out").envelopeIds);
 				});
 			}
-			if (persistedEnvelopeIds.length > 0) await flush(signal, new Set(persistedEnvelopeIds), work);
+			if (persistedEnvelopeIds.length > 0) await ship(signal, persistedEnvelopeIds, work);
 		},
 		async acknowledgeParent(taskId, signal, work = createTaskWorkScope(signal)) {
 			signal = work.signal;
@@ -479,7 +543,7 @@ function canonicalize(options: TaskCoreOptions, now: () => number, ids: () => st
 	// A self-targeted task presents through its target envelope; suppress that for its own conversations.
 	const selfTarget = sameEndpoint(task.origin, task.target);
 	// Delivery evidence is origin-local status: no fan-out to the target and no presentation.
-	const originLocal = requestedType === "task.delivery_receipt";
+	const originLocal = TASK_EVENT_TYPES[requestedType]?.evidence === true;
 	const targetEnvelope = originLocal || (!presentToOrigin && selfTarget) ? undefined : envelope(ids(), options.endpoint, task.target, task.taskId, TaskEnvelopeKind.canonicalEvent, canonical, canonical.occurredAt);
 	const persistedEnvelopeIds = targetEnvelope === undefined ? [] : [targetEnvelope.envelopeId];
 	if (operation !== undefined) {
@@ -507,17 +571,8 @@ function inboxItems(store: TaskStore, deliveries: readonly RelayDelivery[]): rea
 	return items.sort((left, right) => left.order - right.order);
 }
 
-async function flushDeliveryEvidence(options: TaskCoreOptions, signal: AbortSignal | undefined, taskId: string, envelopeIds: readonly string[], evidence: DeliveryEvidence, work: TaskWorkScope, flush: OutboxFlusher): Promise<void> {
-	try {
-		if (envelopeIds.length > 0) await flush(signal, new Set(envelopeIds), work);
-	} catch (error) {
-		throwIfDeliveryEvidenceBlocked(options.store, taskId, envelopeIds, evidence);
-		throw error;
-	}
-	throwIfDeliveryEvidenceBlocked(options.store, taskId, envelopeIds, evidence);
-}
-
-type OutboxFlusher = (signal: AbortSignal | undefined, reportedEnvelopeIds: ReadonlySet<string> | undefined, work: TaskWorkScope) => Promise<void>;
+/** Sends the reported envelopes, then at most once per scope offers bounded old-work retry when `retry` (default: outside a phased pass). */
+type OutboxFlusher = (signal: AbortSignal | undefined, reportedEnvelopeIds: ReadonlySet<string> | undefined, work: TaskWorkScope, retry?: boolean) => Promise<void>;
 
 function createOutboxFlusher(options: TaskCoreOptions): OutboxFlusher {
 	const inFlight = new Map<string, Promise<void>>();
@@ -557,7 +612,7 @@ function createOutboxFlusher(options: TaskCoreOptions): OutboxFlusher {
 		inFlight.set(id, delivery);
 		try { await delivery; } finally { if (inFlight.get(id) === delivery) inFlight.delete(id); }
 	};
-	return async (signal, reportedEnvelopeIds, work) => {
+	return async (signal, reportedEnvelopeIds, work, retry = !work.phased) => {
 		throwIfAborted(signal);
 		let failure: unknown;
 		if (reportedEnvelopeIds) for (const id of reportedEnvelopeIds) {
@@ -582,7 +637,7 @@ function createOutboxFlusher(options: TaskCoreOptions): OutboxFlusher {
 				if (error instanceof TaskProtocolError && error.code === "TASK_DELIVERY_DEFERRED") break;
 			}
 		}
-		if (work.retryAllowed && !work.retryStarted) {
+		if (retry && !work.retryStarted) {
 			work.retryStarted = true;
 			let attempts = 0;
 			for (let inspected = 0; inspected < TASK_WORK_LIMITS.retryInspections && attempts < TASK_WORK_LIMITS.retries; inspected++) {
@@ -682,10 +737,7 @@ function requiredTask(store: TaskStore, taskId: string): TaskSnapshot {
 }
 
 function statusFor(type: string): TaskRecord["status"] {
-	if (type === "task.completed") return "completed";
-	if (type === "task.failed") return "failed";
-	if (type === "task.cancelled") return "cancelled";
-	return "timed_out";
+	return TASK_EVENT_TYPES[type]?.status ?? "timed_out";
 }
 
 function isInboxPage(value: unknown): value is { readonly deliveries: readonly RelayDelivery[]; readonly nextCursor: string; readonly hasMore: boolean } {

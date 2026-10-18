@@ -1,5 +1,5 @@
 import { TASK_WORK_LIMITS } from "./task-work-scope";
-import { TERMINAL_INTENT_OPERATION, TaskProtocolError } from "./task-protocol";
+import { TASK_EVENT_TYPES, TERMINAL_INTENT_OPERATION, TaskProtocolError } from "./task-protocol";
 import type { RelayTransportBinding, RelayEnvelope, TaskEndpoint, TaskEvent, TaskRecord, TaskSnapshot, TerminalDeliveryState, TerminalTaskIntentType } from "./task-protocol";
 
 export interface TaskStoreOptions {
@@ -45,6 +45,7 @@ export interface TaskStore {
   persistInbox(envelope: RelayEnvelope, cursor: string): boolean;
   /** Store arrival order of a persisted inbox envelope; shares the presentation order sequence. */
   inboxOrder(envelopeId: string): number | undefined;
+  inboxEnvelope(envelopeId: string): RelayEnvelope | undefined;
   /** Origin-local canonical events awaiting Pi presentation; ids only, events stay in the task log. */
   enqueuePresentation(details: PresentationRecord): void;
   pendingPresentations(): readonly PendingPresentation[];
@@ -53,6 +54,10 @@ export interface TaskStore {
   setReceiveCursor(cursor: string): void;
   trackRelayDeliveries(endpoint: TaskEndpoint, deliveries: readonly { readonly cursor: string; readonly envelopeId: string }[]): void;
   pendingRelayEnvelopeId(endpoint: TaskEndpoint, cursor: string): string | undefined;
+  /** Tracked, unacknowledged deliveries in this endpoint scope, oldest cursor first. */
+  pendingRelayDeliveries(endpoint: TaskEndpoint): readonly { readonly cursor: string; readonly envelopeId: string }[];
+  /** Highest tracked cursor in this endpoint scope; intake fetches after it. */
+  relayIntakeCursor(endpoint: TaskEndpoint): string;
   requestRelayAcknowledgement(endpoint: TaskEndpoint, cursor: string, retryAt?: number): void;
   requestedRelayAcknowledgements(endpoint: TaskEndpoint, limit?: number, now?: number): readonly string[];
   relayAcknowledgementRetryAt(endpoint: TaskEndpoint, cursor: string): number;
@@ -149,7 +154,8 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
   const terminal = (task: Omit<TaskRecord, "events">): TerminalDeliveryState => {
     const record = get<TaskOperationRecord>("operations", pair(task.taskId, TERMINAL_INTENT_OPERATION));
     if (!record) return { state: "not_submitted" };
-    if (!["task.completed", "task.failed", "task.cancelled"].includes(record.logicalType) || record.envelopeIds.length !== 1) throw new Error("terminal operation is malformed");
+    const type = TASK_EVENT_TYPES[record.logicalType];
+    if (!type?.terminal || !type.intent || record.envelopeIds.length !== 1) throw new Error("terminal operation is malformed");
     const identity = { intentId: record.logicalId, intentType: record.logicalType as TerminalTaskIntentType, envelopeId: record.envelopeIds[0]!, origin: task.origin };
     const outbox = get<OutboxRecord>("outbox", identity.envelopeId);
     if (outbox) return { state: outbox.state, ...identity };
@@ -232,6 +238,7 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
     quarantinedOutbox() { return rows<OutboxQuarantineRecord>("quarantine"); },
     persistInbox(envelope, cursor) { return put("inbox", envelope.envelopeId, { envelope, cursor }, true); },
     inboxOrder(id) { return table("inbox").get(id)?.order; },
+    inboxEnvelope(id) { return get<{ envelope: RelayEnvelope }>("inbox", id)?.envelope; },
     enqueuePresentation(details) { requireTask(details.taskId); put("presentation", details.eventId, { taskId: details.taskId, eventId: details.eventId }, true); },
     pendingPresentations() { return [...table("presentation").values()].sort((a, b) => a.order - b.order).map(row => ({ ...JSON.parse(row.text) as PresentationRecord, order: row.order })); },
     completePresentation(eventId) { remove("presentation", eventId); },
@@ -248,6 +255,11 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
       writeCheckpoint(endpoint, value);
     },
     pendingRelayEnvelopeId(endpoint, cursor) { return checkpoint(endpoint).pending[cursor]; },
+    pendingRelayDeliveries(endpoint) {
+      return Object.entries(checkpoint(endpoint).pending).map(([cursor, envelopeId]) => ({ cursor, envelopeId }))
+        .sort((left, right) => BigInt(left.cursor) < BigInt(right.cursor) ? -1 : 1);
+    },
+    relayIntakeCursor(endpoint) { return checkpoint(endpoint).highWater; },
     requestRelayAcknowledgement(endpoint, cursor, retryAt = 0) {
       const value = checkpoint(endpoint);
       if (value.pending[cursor] === undefined) throw new TaskProtocolError("INVALID_CURSOR", "relay delivery is not pending in this endpoint scope");

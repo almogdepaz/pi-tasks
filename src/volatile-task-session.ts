@@ -1,5 +1,6 @@
 import { createTaskCore } from "./task-core";
 import type { TaskCore } from "./task-core";
+import { RESET_CODES, RETRY_CODES, taskErrorMessage } from "./task-errors";
 import { TASK_PROTOCOL_VERSION, TaskProtocolError } from "./task-protocol";
 import type { RelayTransportBinding, TaskEndpoint, TaskRelay } from "./task-protocol";
 import type { TaskStore } from "./task-store";
@@ -8,8 +9,6 @@ import { fromWolfpackEnvelope, toWolfpackEnvelope, WOLFPACK_TASK_RELAY_ID } from
 export const VOLATILE_PROFILE = "volatile-v1";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CURSOR = /^(0|[1-9][0-9]{0,31})$/;
-const RESET_CODES = new Set(["RELAY_RESET", "REGISTRATION_EXPIRED", "SOURCE_MISMATCH", "CALLER_DEAD", "CALLER_NOT_FOUND"]);
-const RETRY_CODES = new Set(["RELAY_CAPACITY", "RELAY_UNAVAILABLE", "PEER_UNREACHABLE"]);
 
 export interface VolatileTaskSessionOptions {
   /** Explicit trusted endpoint ingress URL. No default route or installed server. */
@@ -290,14 +289,15 @@ class Transport {
       if (!result.ok || data.ok !== true || !uuid(data.epoch)) throw failure("INVALID_RESPONSE", true);
       return { epoch: data.epoch, value: data.value };
     } catch (error) {
-      if (error instanceof TaskProtocolError) throw error;
-      throw failure("RELAY_UNAVAILABLE", true, { mayHaveBeenDelivered: true });
+      // Every failure of an admitted request names its relay operation for the status line.
+      const known = error instanceof TaskProtocolError ? error : failure("RELAY_UNAVAILABLE", true, { mayHaveBeenDelivered: true });
+      throw new TaskProtocolError(known.code, known.message, { retryable: known.retryable, details: { ...known.details, operation: body.operation } });
     } finally {
       clearTimeout(timer); this.release(); signal?.removeEventListener("abort", abort); this.stopSignal.signal.removeEventListener("abort", abort); controller.signal.removeEventListener("abort", rejectAbort);
     }
   }
 }
-function failure(code: string, retryable: boolean, details?: Record<string, unknown>): TaskProtocolError { return new TaskProtocolError(code, code, { retryable, details }); }
+function failure(code: string, retryable: boolean, details?: Record<string, unknown>): TaskProtocolError { return new TaskProtocolError(code, taskErrorMessage(code), { retryable, details }); }
 function record(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
 function text(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.length <= 512; }
 function uuid(value: unknown): value is string { return typeof value === "string" && UUID.test(value); }

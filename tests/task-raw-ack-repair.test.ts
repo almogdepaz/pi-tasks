@@ -62,7 +62,7 @@ async function fixture() {
   const canonical = () => store.outbox("accepted").filter(row => row.envelope.kind === "canonical_event").map(row => row.envelope);
   const retained = () => canonical().filter(envelope => originals.some(oldEnvelope => oldEnvelope.envelopeId === envelope.envelopeId));
   const refresh = (signal?: AbortSignal) => {
-    const work = createTaskWorkScope(signal); work.retryAllowed = false;
+    const work = createTaskWorkScope(signal, "phased");
     const pi = { sendMessage() { throw new Error("repair failure must stop presentation"); }, appendEntry() { throw new Error("repair failure must stop archive presentation"); } };
     const context = { isIdle: () => false, hasPendingMessages: () => true, sessionManager: { getEntries: () => [] } };
     return { work, run: async () => {
@@ -85,7 +85,8 @@ test("raw ACK replay failure cannot gate initial intake behind a second new raw 
       expect(refresh.work.attemptedAcknowledgements.size).toBe(1);
     }
     expect(f.pages.length - f.before).toBe(4);
-    expect(f.pages[f.before]).toEqual({ count: 3, hasMore: false, kinds: ["intent", "intent", "assignment"] });
+    // The original raw intent is pending and re-driven from the local inbox; intake fetches only after it.
+    expect(f.pages[f.before]).toEqual({ count: 2, hasMore: false, kinds: ["intent", "assignment"] });
     // Newly accepted canonical copies can join subsequent initial pages; none needs read-ahead.
     expect(f.pages.slice(f.before).every(page => page.count < 50 && !page.hasMore)).toBe(true);
     expect(f.retained()).toEqual(f.originals);
@@ -131,7 +132,7 @@ for (const cancellation of ["background bound", "caller"] as const) {
 }
 
 for (const blocked of ["full", "partial"] as const) {
-  test(`${blocked} required fanout still stops intake before authorizing the new raw ACK`, async () => {
+  test(`${blocked} required fanout still withholds the new raw ACK while later intake proceeds`, async () => {
     const f = await fixture(); f.block(blocked);
     try {
       const attempts = f.attempts.length;
@@ -145,8 +146,10 @@ for (const blocked of ["full", "partial"] as const) {
         expect(sent).toHaveLength(1);
         expect(new Set(sent).size).toBe(sent.length);
       }
-      expect(f.core.getTask(f.fresh.taskId)).toBeUndefined();
-      expect(f.attempts.length).toBe(attempts); expect(f.store.requestedRelayAcknowledgements(origin)).toEqual(f.requested);
+      // A refused fanout no longer stops intake of later deliveries or repair of the staged original ACK (one per refresh); it only withholds that intent's ACK.
+      expect(f.core.getTask(f.fresh.taskId)?.status).toBe("active");
+      expect(f.attempts.slice(attempts).map(ack => ack.cursor)).toEqual([f.originalAck.cursor, f.originalAck.cursor]);
+      expect(f.store.requestedRelayAcknowledgements(origin)).toEqual(f.requested);
       expect(f.retained()).toEqual(f.originals); expect(f.store.getReceiveCursor()).toBe("0");
       expect(f.canonical()).toHaveLength(1);
       expect(f.store.outbox("pending")).toHaveLength(1);

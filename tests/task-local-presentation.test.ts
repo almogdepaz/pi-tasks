@@ -181,17 +181,19 @@ test("a self-targeted task presents its completion once through the relay", asyn
 	f.close();
 });
 
-test("a deferred receive keeps local items for the next refresh", async () => {
+test("a failed raw ACK still surfaces but no longer holds back the local item it produced", async () => {
 	const f = await fixture();
 	await f.child.submitIntent({ taskId: f.taskId, type: "task.completed", payload: { summary: "done" } });
 	const acknowledge = f.relay.acknowledgeDelivery.bind(f.relay);
 	let fail = true;
 	f.relay.acknowledgeDelivery = async (input) => { if (fail) throw new TaskProtocolError("RELAY_UNAVAILABLE", "fixture ack unavailable", { retryable: true }); return acknowledge(input); };
-	await expect(deliverTaskInbox(f.parentPi.pi, f.parent, f.parentPi.context)).rejects.toThrow();
-	expect(f.parentPi.messages).toEqual([]);
-	expect(f.stores.origin.pendingPresentations()).toHaveLength(1);
+	await expect(deliverTaskInbox(f.parentPi.pi, f.parent, f.parentPi.context)).rejects.toThrow("fixture ack unavailable");
+	expect(f.parentPi.events()).toEqual([completion(f).eventId]);
+	expect(f.stores.origin.pendingPresentations()).toEqual([]);
+	expect(f.stores.origin.requestedRelayAcknowledgements(f.parent.endpoint, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER)).toHaveLength(1);
 	fail = false;
 	await deliverTaskInbox(f.parentPi.pi, f.parent, f.parentPi.context);
 	expect(f.parentPi.events()).toEqual([completion(f).eventId]);
+	expect(f.stores.origin.requestedRelayAcknowledgements(f.parent.endpoint, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER)).toEqual([]);
 	f.close();
 });

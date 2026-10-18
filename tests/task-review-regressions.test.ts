@@ -31,7 +31,7 @@ test('deadline rotation gives every healthy old envelope an attempt', async () =
     const i = serial++; return ['task', 'event', 'old'][i % 3] + '-' + Math.floor(i / 3);
   } });
   for (let i = 0; i < 16; i++) {
-    const work = createTaskWorkScope(); work.retryAllowed = false;
+    const work = createTaskWorkScope(undefined, "phased");
     try { await core.createTask({ target: { ...target, id: `target-${i}` }, task: `old-${i}`, timeoutMs: 60_000 }, work.signal, work); }
     catch (error) { expect(error).toMatchObject({ code: 'RELAY_UNAVAILABLE' }); }
   }
@@ -75,7 +75,7 @@ test('failed requested ACK repairs leave an initial receive opportunity', async 
   const before = receives, errors: string[] = [];
   const entries: any[] = [];
   for (let i = 0; i < 4; i++) {
-    const work = createTaskWorkScope(); work.retryAllowed = false;
+    const work = createTaskWorkScope(undefined, "phased");
     try { await child.connect(work.signal, work); } catch (error) { errors.push((error as TaskProtocolError).code); }
     try { await child.evaluateTimeouts(work.signal, work); } catch (error) { errors.push((error as TaskProtocolError).code); }
     try {
@@ -111,7 +111,7 @@ test('slow ignored-abort ACK repair preserves protected intake and uncertain req
   const requested = childStore.requestedRelayAcknowledgements(target);
   const fresh = await parent.createTask({ target, task: 'within the same held page', timeoutMs: 60_000 });
   seeding = false; receives = 0;
-  const work = createTaskWorkScope(); work.retryAllowed = false;
+  const work = createTaskWorkScope(undefined, "phased");
   const errors: unknown[] = [];
   const drive = (async () => {
     try { await child.connect(work.signal, work); } catch (error) { errors.push(error); }

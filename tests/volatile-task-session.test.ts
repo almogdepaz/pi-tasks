@@ -30,8 +30,9 @@ function assignment(cursor: string) {
 
 test("negotiates and persists scope, keeps true sparse bigint cursors, and ACKs actual IDs", async () => {
   const cursors = ["9007199254740993", "99999999999999999999999999999999"];
+  // Intake follows `hasMore` from the intake cursor; the relay's next page is empty.
   const f = fixture(body => body.operation === "connect" ? connected() : body.operation === "receive"
-    ? reply({ kind: "page", deliveries: cursors.map(assignment), nextCursor: cursors[1], hasMore: true })
+    ? reply(body.cursor === "0" ? { kind: "page", deliveries: cursors.map(assignment), nextCursor: cursors[1], hasMore: true } : { kind: "page", deliveries: [], nextCursor: body.cursor, hasMore: false })
     : reply({ kind: "acknowledged", duplicate: false }));
   try {
     const core = await f.session.connect();
@@ -40,6 +41,7 @@ test("negotiates and persists scope, keeps true sparse bigint cursors, and ACKs 
     const page = await core.receive();
     expect(page.map(item => item.kind === "relay" ? item.delivery.cursor : undefined)).toEqual(cursors);
     expect(f.requests[1]).toMatchObject({ epoch, endpoint, operation: "receive", cursor: "0", limit: 50 });
+    expect(f.requests[2]).toMatchObject({ epoch, endpoint, operation: "receive", cursor: cursors[1], limit: 50 });
     await core.acknowledgeRelayDelivery(cursors[1]!);
     expect(f.store.getReceiveCursor()).toBe("0");
     expect(f.requests.at(-1).envelopeId).toBe(`envelope-${cursors[1]}`);
@@ -274,4 +276,16 @@ test("in-flight request cap queues the ninth request instead of failing locally,
     expect(resolves()).toBe(25);
     gate.resolve(); await Promise.all(again);
   } finally { gate.resolve(); f.close(); }
+});
+
+test("transport failures name the relay operation for the status line", async () => {
+  const f = fixture(body => body.operation === "connect" ? connected() : body.operation === "resolve" ? reply({ kind: "resolved", endpoint: body.target })
+    : body.operation === "send" ? Response.json({ ok: false, profile: VOLATILE_PROFILE, epoch, error: { code: "RELAY_CAPACITY", retryable: true, retryAfterMs: 10 } })
+    : new Response("not json"));
+  try {
+    const core = await f.session.connect();
+    await expect(core.createTask({ target: endpoint, task: "busy", timeoutMs: 60_000 })).rejects.toMatchObject({ code: "RELAY_CAPACITY", retryable: true, details: { operation: "send", retryAfterMs: 10 } });
+    // A malformed reply surfaces as the catch-all transport failure, still naming its operation.
+    await expect(core.receive()).rejects.toMatchObject({ details: { operation: "receive" } });
+  } finally { f.close(); }
 });

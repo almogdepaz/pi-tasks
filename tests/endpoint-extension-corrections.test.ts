@@ -99,6 +99,9 @@ test("continues timeout and inbox processing while reporting degraded outbox del
 			throw new TaskOutboxDeliveryError("TARGET_NOT_REGISTERED", "target is inactive", { retryable: false });
 		},
 		async evaluateTimeouts(): Promise<void> { calls.push("timeout"); },
+		async intakeInbox(this: Pick<TaskCore, "receive">) { return this.receive(); },
+		async shipRequired() {},
+		async repairAcknowledgements() {},
 		async receive(): Promise<readonly []> { calls.push("receive"); return []; },
 		hasPendingWork: () => false,
 	} as unknown as TaskCore;
@@ -139,6 +142,9 @@ test("continues inbox receive and reports degradation when timeout delivery fail
 			calls.push("timeout");
 			throw new TaskOutboxDeliveryError("TARGET_NOT_REGISTERED", "timed-out task target is inactive", { retryable: false });
 		},
+		async intakeInbox(this: Pick<TaskCore, "receive">) { return this.receive(); },
+		async shipRequired() {},
+		async repairAcknowledgements() {},
 		async receive(): Promise<readonly []> { calls.push("receive"); return []; },
 		hasPendingWork: () => false,
 	} as unknown as TaskCore;
@@ -175,6 +181,9 @@ test("reports receive-created delivery failures as outbox degradation", async ()
 		async connect(): Promise<void> { undefined; },
 		async flushOutbox(): Promise<void> { undefined; },
 		async evaluateTimeouts(): Promise<void> { undefined; },
+		async intakeInbox(this: Pick<TaskCore, "receive">) { return this.receive(); },
+		async shipRequired() {},
+		async repairAcknowledgements() {},
 		async receive(): Promise<readonly []> {
 			throw new TaskOutboxDeliveryError("TARGET_NOT_REGISTERED", "canonical event target is inactive", { retryable: false });
 		},
@@ -232,21 +241,24 @@ test("reports inbox delivery evidence failure as outbox degradation after advanc
 		async connect(): Promise<void> { undefined; },
 		async flushOutbox(): Promise<void> { undefined; },
 		async evaluateTimeouts(): Promise<void> { undefined; },
+		async intakeInbox(this: Pick<TaskCore, "receive">) { return this.receive(); },
+		async shipRequired() {},
+		async repairAcknowledgements() {},
 		async receive() { return acknowledgements === 0 ? [{ kind: "relay" as const, delivery, order: 1 }] : []; },
 		isSelfAuthoredConversation() { return false; },
 		async recordInsertion(): Promise<void> { undefined; },
 		async submitIntent(): Promise<void> { undefined; },
-		recordWakeRequest() {
+		recordWakeRequest(_input, work) {
 			wakeRequests += 1;
 			wakeOrder.push("request");
-			// The common path's only receipt is the wake evidence; its delivery is blocked.
+			// The common path's only receipt is the wake evidence; the ship phase finds its delivery blocked.
 			return {
-				async flush(): Promise<never> {
+				async flush(): Promise<void> {
 					wakeFlushes += 1; wakeOrder.push("flush");
-					throw new TaskOutboxDeliveryError("DELIVERY_UNCONFIRMED", "peer delivery outcome is unknown", {
+					work!.shipments.push({ envelopeIds: [], shipped: true, failure: new TaskOutboxDeliveryError("DELIVERY_UNCONFIRMED", "peer delivery outcome is unknown", {
 						retryable: false,
 						details: { mayHaveBeenDelivered: true },
-					});
+					}) });
 				},
 				discard(): void { undefined; },
 			};
@@ -300,6 +312,9 @@ test("does not mislabel relay failures during outbox delivery as degradation", a
 			throw new TaskOutboxDeliveryError("RELAY_UNAVAILABLE", "relay is unavailable");
 		},
 		async evaluateTimeouts(): Promise<void> { undefined; },
+		async intakeInbox(this: Pick<TaskCore, "receive">) { return this.receive(); },
+		async shipRequired() {},
+		async repairAcknowledgements() {},
 		async receive(): Promise<readonly []> { return []; },
 		hasPendingWork: () => false,
 	} as unknown as TaskCore;
@@ -327,6 +342,46 @@ test("does not mislabel relay failures during outbox delivery as degradation", a
 	}
 });
 
+test("names the class, code and relay operation of a capacity failure on send", async () => {
+	let sessionStart: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
+	let sessionShutdown: (() => void) | undefined;
+	const statuses: Array<string | undefined> = [];
+	const core = {
+		async connect(): Promise<void> { undefined; },
+		async flushOutbox(): Promise<void> {
+			throw new TaskProtocolError("RELAY_CAPACITY", "relay is at capacity", { details: { operation: "send", retryAfterMs: 10 } });
+		},
+		async evaluateTimeouts(): Promise<void> { undefined; },
+		async intakeInbox(this: Pick<TaskCore, "receive">) { return this.receive(); },
+		async shipRequired() {},
+		async repairAcknowledgements() {},
+		async receive(): Promise<readonly []> { return []; },
+		hasPendingWork: () => false,
+	} as unknown as TaskCore;
+	const context = {
+		hasPendingMessages: (): boolean => true,
+		sessionManager: { getEntries: (): readonly unknown[] => [] },
+		ui: {
+			setStatus: (_key: string, value: string | undefined): void => { statuses.push(value); },
+			theme: { fg: (_color: string, text: string): string => text },
+		},
+	};
+	registerAgentTaskTools({
+		on(event: string, handler: unknown): void {
+			if (event === "session_start") sessionStart = handler as (event: unknown, context: unknown) => Promise<unknown>;
+			if (event === "session_shutdown") sessionShutdown = handler as () => void;
+		},
+		registerTool(): void { undefined; },
+	} as unknown as ExtensionAPI, core);
+
+	try {
+		await sessionStart!({}, context);
+		expect(statuses.at(-1)).toBe("tasks: capacity (RELAY_CAPACITY) on send");
+	} finally {
+		sessionShutdown?.();
+	}
+});
+
 test("does not mislabel relay receive failures as outbox degradation", async () => {
 	let sessionStart: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
 	let sessionShutdown: (() => void) | undefined;
@@ -335,6 +390,9 @@ test("does not mislabel relay receive failures as outbox degradation", async () 
 		async connect(): Promise<void> { undefined; },
 		async flushOutbox(): Promise<void> { undefined; },
 		async evaluateTimeouts(): Promise<void> { undefined; },
+		async intakeInbox(this: Pick<TaskCore, "receive">) { return this.receive(); },
+		async shipRequired() {},
+		async repairAcknowledgements() {},
 		async receive(): Promise<readonly []> {
 			throw new TaskProtocolError("TARGET_NOT_REGISTERED", "relay receive registration is absent", { retryable: false });
 		},
@@ -376,6 +434,9 @@ test("starts polling after rejected startup and clears the warning after autonom
 		async connect(): Promise<void> { undefined; },
 		async flushOutbox(): Promise<void> { undefined; },
 		async evaluateTimeouts(): Promise<void> { undefined; },
+		async intakeInbox(this: Pick<TaskCore, "receive">) { return this.receive(); },
+		async shipRequired() {},
+		async repairAcknowledgements() {},
 		async receive(): Promise<readonly []> { return []; },
 		hasPendingWork: () => false,
 	} as unknown as TaskCore;
@@ -540,6 +601,9 @@ test("continues autonomous polling after Pi replaces the extension context at ag
 			if (refreshes === 3) polled?.();
 		},
 		async evaluateTimeouts(): Promise<void> { undefined; },
+		async intakeInbox(this: Pick<TaskCore, "receive">) { return this.receive(); },
+		async shipRequired() {},
+		async repairAcknowledgements() {},
 		async receive(): Promise<readonly []> { return []; },
 		hasPendingWork: () => false,
 	} as unknown as TaskCore;
@@ -593,6 +657,9 @@ test("keeps missing idle insertion evidence unacknowledged and retryable after p
 		async connect(): Promise<void> { undefined; },
 		async flushOutbox(): Promise<void> { undefined; },
 		async evaluateTimeouts(): Promise<void> { undefined; },
+		async intakeInbox(this: Pick<TaskCore, "receive">) { return this.receive(); },
+		async shipRequired() {},
+		async repairAcknowledgements() {},
 		async receive() { return [{ kind: "relay" as const, delivery, order: 1 }]; },
 		isSelfAuthoredConversation() { return false; },
 		async submitIntent(input: { readonly payload: { readonly stage: string; readonly state: string } }): Promise<void> { deliveryEvidence.add(`${input.payload.stage}:${input.payload.state}`); },
@@ -670,6 +737,9 @@ test("persists an idle task event before sending one separate wake", async () =>
 		async connect(): Promise<void> { undefined; },
 		async flushOutbox(): Promise<void> { undefined; },
 		async evaluateTimeouts(): Promise<void> { undefined; },
+		async intakeInbox(this: Pick<TaskCore, "receive">) { return this.receive(); },
+		async shipRequired() {},
+		async repairAcknowledgements() {},
 		async receive() { return acknowledgements === 0 ? [{ kind: "relay" as const, delivery, order: 1 }] : []; },
 		isSelfAuthoredConversation() { return false; },
 		async submitIntent(input): Promise<void> {
@@ -768,6 +838,9 @@ test("does not flush or acknowledge a captured wake request after session shutdo
 		async connect(): Promise<void> { undefined; },
 		async flushOutbox(): Promise<void> { undefined; },
 		async evaluateTimeouts(): Promise<void> { undefined; },
+		async intakeInbox(this: Pick<TaskCore, "receive">) { return this.receive(); },
+		async shipRequired() {},
+		async repairAcknowledgements() {},
 		async receive() { return acknowledgements === 0 ? [{ kind: "relay" as const, delivery, order: 1 }] : []; },
 		isSelfAuthoredConversation() { return false; },
 		async recordInsertion(): Promise<void> { undefined; },
@@ -827,6 +900,9 @@ test("invalidates a pending lifecycle poll when the session shuts down", async (
 		async connect(): Promise<void> { undefined; },
 		async flushOutbox(): Promise<void> { undefined; },
 		async evaluateTimeouts(): Promise<void> { undefined; },
+		async intakeInbox(this: Pick<TaskCore, "receive">) { return this.receive(); },
+		async shipRequired() {},
+		async repairAcknowledgements() {},
 		async receive() {
 			receiveCalls += 1;
 			if (receiveCalls === 1) return [];
@@ -937,6 +1013,9 @@ test.each(["RELAY_RESET", "RELAY_REBIND_REQUIRED"] as const)("automatically repl
 			if (oldFlushes > 1 && relayLossCode === "RELAY_REBIND_REQUIRED") throw new TaskProtocolError(relayLossCode, "relay lifetime was replaced", { retryable: false });
 		},
 		async evaluateTimeouts(): Promise<void> { oldEvaluations += 1; },
+		async intakeInbox(this: Pick<TaskCore, "receive">) { return this.receive(); },
+		async shipRequired() {},
+		async repairAcknowledgements() {},
 		async receive(): Promise<readonly []> { oldReceives += 1; return []; },
 		listTasks: () => [
 			{ taskId: "active-task", status: "active" },
@@ -950,6 +1029,9 @@ test.each(["RELAY_RESET", "RELAY_REBIND_REQUIRED"] as const)("automatically repl
 		async connect(): Promise<void> { if (freshConnectionError) throw freshConnectionError; },
 		async flushOutbox(): Promise<void> { undefined; },
 		async evaluateTimeouts(): Promise<void> { undefined; },
+		async intakeInbox(this: Pick<TaskCore, "receive">) { return this.receive(); },
+		async shipRequired() {},
+		async repairAcknowledgements() {},
 		async receive(): Promise<readonly []> { return []; },
 		listTasks: () => [],
 		getTask: () => undefined,
@@ -1034,6 +1116,9 @@ test("retries a rejected configured core during a later lifecycle inbox refresh"
 		async connect(): Promise<void> { calls.push("connect"); },
 		async flushOutbox(): Promise<void> { calls.push("flush"); },
 		async evaluateTimeouts(): Promise<void> { calls.push("timeout"); },
+		async intakeInbox(this: Pick<TaskCore, "receive">) { return this.receive(); },
+		async shipRequired() {},
+		async repairAcknowledgements() {},
 		async receive(): Promise<readonly []> { calls.push("receive"); return []; },
 		hasPendingWork: () => false,
 	} as unknown as TaskCore;

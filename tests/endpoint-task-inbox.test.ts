@@ -237,7 +237,8 @@ test.each(["task.completed", "task.failed", "task.cancelled", "task.timed_out"] 
 
 		pending = false;
 		await deliverTaskInbox(pi, parent, context);
-		expect(entries).toEqual([]);
+		// The later control fact is archived while the busy parent still holds the terminal; nothing model-visible yet.
+		expect(entries).toEqual([expect.objectContaining({ type: "custom", customType: "pi-tasks-event-record", data: expect.objectContaining({ event: expect.objectContaining({ type: "task.parent_acknowledged" }) }) })]);
 		idle = true;
 		await deliverTaskInbox(pi, parent, context);
 		await deliverTaskInbox(pi, parent, context);

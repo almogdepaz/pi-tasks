@@ -49,7 +49,7 @@ function presentation(idle: boolean, queued: boolean) {
 }
 
 async function refresh(core: ReturnType<typeof createTaskCore>, ui: ReturnType<typeof presentation>) {
-  const work = createTaskWorkScope(); work.retryAllowed = false;
+  const work = createTaskWorkScope(undefined, "phased");
   await core.connect(work.signal, work);
   // The speculative timeout stays visible, but cannot undo current-page progress.
   await expect(deliverTaskInbox(ui.pi, core, ui.context, work.signal, work)).rejects.toMatchObject({ code: "ABORTED" });

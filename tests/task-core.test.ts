@@ -251,7 +251,8 @@ describe("endpoint-owned task core", () => {
 		]);
 
 		expect(value.origin.getTask(created.taskId)?.events.filter((event) => event.type === "task.parent_acknowledged")).toHaveLength(1);
-		expect(value.originStore.outbox("accepted").filter((record) => !outboxIdsBefore.has(record.envelope.envelopeId))).toHaveLength(2);
+		// One receiver replica; the origin's own view is local, not a self-addressed envelope.
+		expect(value.originStore.outbox("accepted").filter((record) => !outboxIdsBefore.has(record.envelope.envelopeId))).toHaveLength(1);
 	});
 
 	test("only the resumed origin evaluates timeout and acknowledgement plus insertion receipts remain logical events", async () => {

@@ -5,7 +5,10 @@ import { join } from "node:path";
 import { createTaskCore } from "../src/task-core";
 import { createTaskStore } from "../src/task-store";
 import { createInMemoryTaskRelay } from "../src/in-memory-task-relay";
-import type { TaskRelay } from "../src/task-protocol";
+import type { RelayDelivery, TaskRelay } from "../src/task-protocol";
+import type { TaskInboxItem } from "../src/task-core";
+
+const relayDeliveries = (items: readonly TaskInboxItem[]): RelayDelivery[] => items.flatMap(item => item.kind === "relay" ? [item.delivery] : []);
 
 const endpoint = { relay: "memory", id: "a" };
 
@@ -22,19 +25,22 @@ test("later automatic intent ACK cannot skip an assignment across same-lifetime 
     await b!.receive();
     const incoming = await c!.createTask({ target: endpoints[0]!, task: "c-to-a", timeoutMs: 60_000 });
     await b!.submitIntent({ taskId: parent.taskId, type: "task.information", payload: { message: "later intent" } });
-    const visible = await a!.receive();
-    const assignment = visible.find(d => d.envelope.taskId === incoming.taskId)!;
+    await c!.submitIntent({ taskId: incoming.taskId, type: "task.information", payload: { message: "later visible" } });
+    const visible = relayDeliveries(await a!.receive());
+    const assignment = visible.find(d => d.envelope.taskId === incoming.taskId && d.envelope.kind === "assignment")!;
     expect(stores[0]!.getReceiveCursor()).toBe("0");
     const resumed = createTaskCore({ endpoint: endpoints[0]!, relay, store: stores[0]! });
-    const again = await resumed.receive();
+    const again = relayDeliveries(await resumed.receive());
     expect(again.some(d => d.envelope.envelopeId === assignment.envelope.envelopeId)).toBe(true);
     // Completing a later visible delivery first still cannot skip assignment.
     const later = again.filter(d => d.cursor !== assignment.cursor);
+    expect(later).toHaveLength(1);
     for (const delivery of later) await resumed.acknowledgeRelayDelivery(delivery.cursor);
     expect(stores[0]!.getReceiveCursor()).toBe("0");
     await resumed.acknowledgeRelayDelivery(assignment.cursor);
     expect(BigInt(stores[0]!.getReceiveCursor())).toBeGreaterThanOrEqual(BigInt(assignment.cursor));
-    expect(await resumed.receive()).toEqual([]);
+    // The b intent's canonical event stays queued for local presentation; no relay delivery remains.
+    expect(relayDeliveries(await resumed.receive())).toEqual([]);
   } finally { for (const store of stores) store.close(); rmSync(root, { recursive: true, force: true }); }
 });
 

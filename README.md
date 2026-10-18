@@ -140,16 +140,18 @@ try {
   });
 
   // a real application would consume the assignment and do the work here.
-  for (const delivery of await worker.receive()) {
-    await worker.acknowledgeRelayDelivery(delivery.cursor);
+  for (const item of await worker.receive()) {
+    if (item.kind === "relay") await worker.acknowledgeRelayDelivery(item.delivery.cursor);
   }
   await worker.submitIntent({
     taskId,
     type: "task.completed",
     payload: { summary: "the change adds task coordination" },
   });
-  for (const delivery of await parent.receive()) {
-    await parent.acknowledgeRelayDelivery(delivery.cursor);
+  // relay items carry peer mail; local items are the parent's own view of events it canonicalized.
+  for (const item of await parent.receive()) {
+    if (item.kind === "relay") await parent.acknowledgeRelayDelivery(item.delivery.cursor);
+    else parent.completeLocalPresentation(item.event.eventId);
   }
 
   console.log(parent.getTask(taskId)?.status); // completed
@@ -165,6 +167,8 @@ this demonstrates task coordination, not agent execution. both endpoints share o
 ### integrate your own transport
 
 implement the exported [`TaskRelay` interface](src/task-protocol.ts) to connect endpoints, resolve targets, send envelopes, receive mail, and acknowledge individual deliveries. provide a separate `createTaskStore()` and `createTaskCore()` for each endpoint. `runTaskRelayConformance` is available to check a relay implementation.
+
+`receive()` returns items in order: `relay` items wrap a delivery you acknowledge with `acknowledgeRelayDelivery`, and `local` items carry an event the origin itself canonicalized, which you complete with `completeLocalPresentation` once presented.
 
 your application owns polling, retries, timeout evaluation, delivery acknowledgments, and shutdown. it also owns how assignments reach an agent and how that agent runs them. the core alone does not install pi tools or wake a model.
 

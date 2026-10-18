@@ -65,7 +65,8 @@ for (const operation of ["send", "message", "done"] as const) {
         await core.submitIntent({ taskId: task.taskId, type: operation === "message" ? "task.information" : "task.completed", payload: {} }, AbortSignal.timeout(6_000));
       }
       expect(store.outbox("pending")).toEqual([]);
-      expect(store.outbox("accepted")).toHaveLength(operation === "send" ? 1 : operation === "message" ? 2 : 3);
+      // done no longer adds an origin self-echo envelope; its origin view is a local presentation.
+      expect(store.outbox("accepted")).toHaveLength(operation === "send" ? 1 : 2);
     } finally { store.close(); }
   }, 8_000);
 }

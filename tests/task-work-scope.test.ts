@@ -59,12 +59,13 @@ test("old work has a positive share during continuous fresh scoped operations", 
   store.close();
 });
 
-test("omitted scoped IDs and partial canonical fanout never report acceptance", async () => {
+test("omitted scoped IDs in canonical fanout never report acceptance", async () => {
   const store = createTaskStore(), attempts: RelayEnvelope[] = [];
   const core = createTaskCore({ endpoint: origin, store, relay: relay(async input => { attempts.push(input); return { envelopeId: input.envelopeId }; }) });
   const task = await core.createTask({ target, task: "partial", timeoutMs: 60_000 });
   const scope = createTaskWorkScope();
-  for (let i = 0; i < 55; i++) expect(scope.claimSend(`spent-${i}`, false)).toBe(true);
+  // Canonical fanout is a single target replica (the origin view is local), so the whole scoped send budget is spent.
+  for (let i = 0; i < 56; i++) expect(scope.claimSend(`spent-${i}`, false)).toBe(true);
   await expect(core.submitIntent({ taskId: task.taskId, type: "task.completed", payload: { summary: "done" } }, scope.signal, scope)).rejects.toMatchObject({ code: "TASK_DELIVERY_DEFERRED" });
   expect(store.outbox("pending")).toHaveLength(1);
   const pending = store.outbox("pending")[0]!.envelope;
@@ -167,15 +168,21 @@ test("raw-intent ACK progress still fetches only one initial page per refresh", 
     sendMessage(message) { entries.push({ type: "custom_message", ...message }); },
     appendEntry(customType, data) { entries.push({ type: "custom", customType, data }); },
   }, parent, { isIdle: () => true, hasPendingMessages: () => false, sessionManager: { getEntries: () => entries } });
+  const presented = () => entries.flatMap(entry => {
+    const candidate = entry as { customType?: string; details?: { taskId?: string } };
+    return candidate.customType === "pi-tasks-event" ? [candidate.details?.taskId] : [];
+  });
   expect(pages).toBe(1);
   expect(tasks.map(task => parent.getTask(task.taskId)?.status)).toEqual(["completed", "active"]);
-  expect(entries).toEqual([]);
+  // The canonicalized completion is presented locally in the same refresh, without another page.
+  expect(presented()).toEqual([tasks[0].taskId]);
   await deliverTaskInbox({
     sendMessage(message) { entries.push({ type: "custom_message", ...message }); },
     appendEntry(customType, data) { entries.push({ type: "custom", customType, data }); },
   }, parent, { isIdle: () => true, hasPendingMessages: () => false, sessionManager: { getEntries: () => entries } });
   expect(pages).toBe(2);
   expect(tasks.map(task => parent.getTask(task.taskId)?.status)).toEqual(["completed", "completed"]);
+  expect(presented()).toEqual([tasks[0].taskId, tasks[1].taskId]);
   expect(BigInt(parentStore.getReceiveCursor())).toBeGreaterThan(0n);
   parentStore.close(); childStore.close();
 });

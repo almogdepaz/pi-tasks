@@ -38,7 +38,7 @@ test("negotiates and persists scope, keeps true sparse bigint cursors, and ACKs 
     expect(Object.isFrozen(core.endpoint)).toBe(true);
     expect(f.store.getRelayTransportBinding()).toMatchObject({ profile: VOLATILE_PROFILE, epoch, endpoint });
     const page = await core.receive();
-    expect(page.map(d => d.cursor)).toEqual(cursors);
+    expect(page.map(item => item.kind === "relay" ? item.delivery.cursor : undefined)).toEqual(cursors);
     expect(f.requests[1]).toMatchObject({ epoch, endpoint, operation: "receive", cursor: "0", limit: 50 });
     await core.acknowledgeRelayDelivery(cursors[1]!);
     expect(f.store.getReceiveCursor()).toBe("0");

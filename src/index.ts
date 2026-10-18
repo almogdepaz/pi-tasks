@@ -30,5 +30,5 @@ export type {
 	TaskRecord,
 	TaskRelay,
 } from "./task-protocol";
-export type { SubmitIntentOutcome, TaskCore, TaskCoreOptions } from "./task-core";
-export type { TaskStore, TaskStoreOptions } from "./task-store";
+export type { SubmitIntentOutcome, TaskCore, TaskCoreOptions, TaskInboxItem } from "./task-core";
+export type { PendingPresentation, PresentationRecord, TaskStore, TaskStoreOptions } from "./task-store";

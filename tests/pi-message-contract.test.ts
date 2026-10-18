@@ -115,6 +115,7 @@ test("automatic relay-loss evidence is durable before another prompt and does no
 		async receive(): Promise<readonly []> { return []; },
 		listTasks: () => [{ taskId: "lost-task", status: "active" }],
 		async close(): Promise<void> { undefined; },
+		hasPendingWork: () => true,
 	} as unknown as TaskCore & { close(): Promise<void> };
 	const freshCore = {
 		endpoint: { relay: "wolfpack-pi-tasks-v2", id: "fresh-endpoint" },
@@ -124,6 +125,7 @@ test("automatic relay-loss evidence is durable before another prompt and does no
 		async receive(): Promise<readonly []> { return []; },
 		listTasks: () => [],
 		async close(): Promise<void> { undefined; },
+		hasPendingWork: () => false,
 	} as unknown as TaskCore & { close(): Promise<void> };
 	const context = {
 		isIdle: (): boolean => true,

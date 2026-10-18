@@ -1,7 +1,7 @@
-import { expect, spyOn, test } from "bun:test";
+import { expect, jest, spyOn, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import piTasks, { createConfiguredCoreLoader, createSingleFlightInboxRefresh, registerAgentTaskTools } from "../src/extension";
+import piTasks, { ACTIVE_POLL_MS, IDLE_POLL_MS, createConfiguredCoreLoader, createSingleFlightInboxRefresh, registerAgentTaskTools } from "../src/extension";
 import { createInMemoryTaskRelay } from "../src/in-memory-task-relay";
 import { createTaskCore } from "../src/task-core";
 import type { TaskCore } from "../src/task-core";
@@ -32,6 +32,7 @@ test("returns structured relay metadata and the persisted task id after assignme
 		async createTask(): Promise<never> {
 			throw new TaskProtocolError("TARGET_NOT_REGISTERED", "target is inactive", { retryable: false, details: { taskId: "persisted-task" } });
 		},
+		hasPendingWork: () => false,
 	} as unknown as TaskCore;
 	registerAgentTaskTools({
 		on(): void { undefined; },
@@ -61,6 +62,7 @@ test("reports canonical origin cancellation with a structured blocked-delivery w
 		getTask(taskId: string) {
 			return { taskId, origin, target, status: "cancelled" };
 		},
+		hasPendingWork: () => false,
 	} as unknown as TaskCore;
 	registerAgentTaskTools({
 		on(): void { undefined; },
@@ -98,6 +100,7 @@ test("continues timeout and inbox processing while reporting degraded outbox del
 		},
 		async evaluateTimeouts(): Promise<void> { calls.push("timeout"); },
 		async receive(): Promise<readonly []> { calls.push("receive"); return []; },
+		hasPendingWork: () => false,
 	} as unknown as TaskCore;
 	const context = {
 		hasPendingMessages: (): boolean => false,
@@ -137,6 +140,7 @@ test("continues inbox receive and reports degradation when timeout delivery fail
 			throw new TaskOutboxDeliveryError("TARGET_NOT_REGISTERED", "timed-out task target is inactive", { retryable: false });
 		},
 		async receive(): Promise<readonly []> { calls.push("receive"); return []; },
+		hasPendingWork: () => false,
 	} as unknown as TaskCore;
 	const context = {
 		hasPendingMessages: (): boolean => false,
@@ -174,6 +178,7 @@ test("reports receive-created delivery failures as outbox degradation", async ()
 		async receive(): Promise<readonly []> {
 			throw new TaskOutboxDeliveryError("TARGET_NOT_REGISTERED", "canonical event target is inactive", { retryable: false });
 		},
+		hasPendingWork: () => false,
 	} as unknown as TaskCore;
 	const context = {
 		hasPendingMessages: (): boolean => false,
@@ -222,10 +227,12 @@ test("reports inbox delivery evidence failure as outbox degradation after advanc
 		async createTask() { return { taskId: "created-task" }; },
 		getTask() { return undefined; },
 		listTasks() { return []; },
+		hasPendingWork() { return false; },
+		onChange() { return () => undefined; },
 		async connect(): Promise<void> { undefined; },
 		async flushOutbox(): Promise<void> { undefined; },
 		async evaluateTimeouts(): Promise<void> { undefined; },
-		async receive() { return acknowledgements === 0 ? [delivery] : []; },
+		async receive() { return acknowledgements === 0 ? [{ kind: "relay" as const, delivery, order: 1 }] : []; },
 		isSelfAuthoredConversation() { return false; },
 		async recordInsertion(): Promise<never> {
 			throw new TaskOutboxDeliveryError("DELIVERY_UNCONFIRMED", "peer delivery outcome is unknown", {
@@ -241,6 +248,7 @@ test("reports inbox delivery evidence failure as outbox degradation after advanc
 		},
 		async acknowledgeRelayDelivery(): Promise<void> { acknowledgements += 1; },
 		async acknowledgeParent(): Promise<void> { undefined; },
+		completeLocalPresentation(): void { throw new Error("relay-only fixture has no local presentations"); },
 	};
 	const context = {
 		isIdle: (): boolean => true,
@@ -288,6 +296,7 @@ test("does not mislabel relay failures during outbox delivery as degradation", a
 		},
 		async evaluateTimeouts(): Promise<void> { undefined; },
 		async receive(): Promise<readonly []> { return []; },
+		hasPendingWork: () => false,
 	} as unknown as TaskCore;
 	const context = {
 		hasPendingMessages: (): boolean => true,
@@ -324,6 +333,7 @@ test("does not mislabel relay receive failures as outbox degradation", async () 
 		async receive(): Promise<readonly []> {
 			throw new TaskProtocolError("TARGET_NOT_REGISTERED", "relay receive registration is absent", { retryable: false });
 		},
+		hasPendingWork: () => false,
 	} as unknown as TaskCore;
 	const context = {
 		hasPendingMessages: (): boolean => false,
@@ -352,21 +362,17 @@ test("does not mislabel relay receive failures as outbox degradation", async () 
 test("starts polling after rejected startup and clears the warning after autonomous recovery", async () => {
 	let sessionStart: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
 	let sessionShutdown: (() => void) | undefined;
-	let poll: (() => void) | undefined;
 	let attempts = 0;
 	let recovered: (() => void) | undefined;
 	const recovery = new Promise<void>((resolve) => { recovered = resolve; });
 	const statuses: Array<string | undefined> = [];
-	const originalSetInterval = globalThis.setInterval;
-	globalThis.setInterval = ((handler: (...args: unknown[]) => void) => {
-		poll = (): void => handler();
-		return 1 as unknown as ReturnType<typeof setInterval>;
-	}) as typeof setInterval;
+	jest.useFakeTimers();
 	const healthyCore = {
 		async connect(): Promise<void> { undefined; },
 		async flushOutbox(): Promise<void> { undefined; },
 		async evaluateTimeouts(): Promise<void> { undefined; },
 		async receive(): Promise<readonly []> { return []; },
+		hasPendingWork: () => false,
 	} as unknown as TaskCore;
 	const context = {
 		hasPendingMessages: (): boolean => false,
@@ -395,30 +401,24 @@ test("starts polling after rejected startup and clears the warning after autonom
 
 		await sessionStart!({}, context);
 		expect(statuses).toEqual(["tasks: relay unavailable"]);
-		expect(poll).toBeDefined();
-		poll?.();
+		jest.advanceTimersByTime(IDLE_POLL_MS); // core load failed, so the idle cadence applies
 		await recovery;
 		await Promise.resolve();
 		expect(attempts).toBe(2);
 		expect(statuses.at(-1)).toBeUndefined();
 	} finally {
 		sessionShutdown?.();
-		globalThis.setInterval = originalSetInterval;
+		jest.useRealTimers();
 	}
 });
 
 test("renews registration and receives real completion while pending Pi messages defer presentation", async () => {
 	let sessionStart: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
 	let sessionShutdown: (() => void) | undefined;
-	let poll: (() => void) | undefined;
 	let statusUpdates = 0;
 	let polled!: () => void;
 	const pollCompleted = new Promise<void>((resolve) => { polled = resolve; });
-	const originalSetInterval = globalThis.setInterval;
-	globalThis.setInterval = ((handler: (...args: unknown[]) => void) => {
-		poll = (): void => handler();
-		return 1 as unknown as ReturnType<typeof setInterval>;
-	}) as typeof setInterval;
+	jest.useFakeTimers();
 	const relay = createInMemoryTaskRelay("memory");
 	const parentStore = createTaskStore(), childStore = createTaskStore();
 	const parent = createTaskCore({ endpoint: { relay: "memory", id: "parent" }, relay, store: parentStore });
@@ -450,7 +450,7 @@ test("renews registration and receives real completion while pending Pi messages
 
 		await sessionStart!({}, context);
 		await child.submitIntent({ taskId: task.taskId, type: "task.completed", payload: { summary: "done" } });
-		poll?.();
+		jest.advanceTimersByTime(ACTIVE_POLL_MS); // the parent still holds an active task
 		await pollCompleted;
 		expect(connects).toHaveBeenCalledTimes(2);
 		expect(statuses).toEqual([undefined, undefined]);
@@ -460,7 +460,7 @@ test("renews registration and receives real completion while pending Pi messages
 	} finally {
 		sessionShutdown?.();
 		connects.mockRestore();
-		globalThis.setInterval = originalSetInterval;
+		jest.useRealTimers();
 		parentStore.close(); childStore.close();
 	}
 });
@@ -524,15 +524,10 @@ test("continues autonomous polling after Pi replaces the extension context at ag
 	let sessionStart: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
 	let agentEnd: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
 	let sessionShutdown: (() => void) | undefined;
-	let poll: (() => void) | undefined;
 	let refreshes = 0;
 	let polled: (() => void) | undefined;
 	const pollCompleted = new Promise<void>((resolve) => { polled = resolve; });
-	const originalSetInterval = globalThis.setInterval;
-	globalThis.setInterval = ((handler: (...args: unknown[]) => void) => {
-		poll = (): void => handler();
-		return 1 as unknown as ReturnType<typeof setInterval>;
-	}) as typeof setInterval;
+	jest.useFakeTimers();
 	const core = {
 		async connect(): Promise<void> { undefined; },
 		async flushOutbox(): Promise<void> {
@@ -541,6 +536,7 @@ test("continues autonomous polling after Pi replaces the extension context at ag
 		},
 		async evaluateTimeouts(): Promise<void> { undefined; },
 		async receive(): Promise<readonly []> { return []; },
+		hasPendingWork: () => false,
 	} as unknown as TaskCore;
 	const context = () => ({
 		hasPendingMessages: (): boolean => false,
@@ -560,12 +556,12 @@ test("continues autonomous polling after Pi replaces the extension context at ag
 
 		await sessionStart!({}, context());
 		await agentEnd!({}, context());
-		poll?.();
+		jest.advanceTimersByTime(IDLE_POLL_MS);
 		await Promise.race([pollCompleted, Bun.sleep(100).then(() => { throw new Error("background poll did not refresh"); })]);
 		expect(refreshes).toBe(3);
 	} finally {
 		sessionShutdown?.();
-		globalThis.setInterval = originalSetInterval;
+		jest.useRealTimers();
 	}
 });
 
@@ -592,11 +588,12 @@ test("keeps missing idle insertion evidence unacknowledged and retryable after p
 		async connect(): Promise<void> { undefined; },
 		async flushOutbox(): Promise<void> { undefined; },
 		async evaluateTimeouts(): Promise<void> { undefined; },
-		async receive() { return [delivery]; },
+		async receive() { return [{ kind: "relay" as const, delivery, order: 1 }]; },
 		isSelfAuthoredConversation() { return false; },
 		async submitIntent(input: { readonly payload: { readonly stage: string; readonly state: string } }): Promise<void> { deliveryEvidence.add(`${input.payload.stage}:${input.payload.state}`); },
 		async recordInsertion(): Promise<void> { recordedInsertions += 1; },
 		async acknowledgeRelayDelivery(): Promise<void> { acknowledgements += 1; },
+		hasPendingWork: () => false,
 	} as unknown as TaskCore;
 	const context = {
 		isIdle: (): boolean => true,
@@ -663,10 +660,12 @@ test("persists an idle task event before sending one separate wake", async () =>
 		async createTask() { return { taskId: "created-task" }; },
 		getTask() { return undefined; },
 		listTasks() { return []; },
+		hasPendingWork() { return false; },
+		onChange() { return () => undefined; },
 		async connect(): Promise<void> { undefined; },
 		async flushOutbox(): Promise<void> { undefined; },
 		async evaluateTimeouts(): Promise<void> { undefined; },
-		async receive() { return acknowledgements === 0 ? [delivery] : []; },
+		async receive() { return acknowledgements === 0 ? [{ kind: "relay" as const, delivery, order: 1 }] : []; },
 		isSelfAuthoredConversation() { return false; },
 		async submitIntent(input): Promise<void> {
 			const { stage, state } = input.payload;
@@ -684,6 +683,7 @@ test("persists an idle task event before sending one separate wake", async () =>
 		},
 		async acknowledgeRelayDelivery(): Promise<void> { acknowledgements += 1; },
 		async acknowledgeParent(): Promise<void> { undefined; },
+		completeLocalPresentation(): void { throw new Error("relay-only fixture has no local presentations"); },
 	};
 	const context = {
 		isIdle: (): boolean => idle,
@@ -755,10 +755,12 @@ test("does not flush or acknowledge a captured wake request after session shutdo
 		async createTask() { return { taskId: "created-task" }; },
 		getTask() { return undefined; },
 		listTasks() { return []; },
+		hasPendingWork() { return false; },
+		onChange() { return () => undefined; },
 		async connect(): Promise<void> { undefined; },
 		async flushOutbox(): Promise<void> { undefined; },
 		async evaluateTimeouts(): Promise<void> { undefined; },
-		async receive() { return acknowledgements === 0 ? [delivery] : []; },
+		async receive() { return acknowledgements === 0 ? [{ kind: "relay" as const, delivery, order: 1 }] : []; },
 		isSelfAuthoredConversation() { return false; },
 		async recordInsertion(): Promise<void> { undefined; },
 		recordWakeRequest() {
@@ -768,6 +770,7 @@ test("does not flush or acknowledge a captured wake request after session shutdo
 		async submitIntent(): Promise<void> { undefined; },
 		async acknowledgeRelayDelivery(): Promise<void> { acknowledgements += 1; },
 		async acknowledgeParent(): Promise<void> { undefined; },
+		completeLocalPresentation(): void { throw new Error("relay-only fixture has no local presentations"); },
 	};
 	const context = {
 		isIdle: (): boolean => true,
@@ -802,7 +805,6 @@ test("invalidates a pending lifecycle poll when the session shuts down", async (
 	let sessionStart: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
 	let agentEnd: ((event: unknown, context: unknown) => Promise<unknown>) | undefined;
 	let sessionShutdown: (() => void) | undefined;
-	let poll: (() => void) | undefined;
 	let receiveCalls = 0;
 	let releasePoll: (() => void) | undefined;
 	let pollStarted: (() => void) | undefined;
@@ -810,11 +812,7 @@ test("invalidates a pending lifecycle poll when the session shuts down", async (
 	const pendingPoll = new Promise<void>((resolve) => { releasePoll = resolve; });
 	const statuses: Array<string | undefined> = [];
 	let deliveries = 0;
-	const originalSetInterval = globalThis.setInterval;
-	globalThis.setInterval = ((handler: (...args: unknown[]) => void) => {
-		poll = (): void => handler();
-		return 1 as unknown as ReturnType<typeof setInterval>;
-	}) as typeof setInterval;
+	jest.useFakeTimers();
 	const source = { relay: "memory", id: "parent" };
 	const target = { relay: "memory", id: "receiver" };
 	const core = {
@@ -826,14 +824,15 @@ test("invalidates a pending lifecycle poll when the session shuts down", async (
 			if (receiveCalls === 1) return [];
 			pollStarted?.();
 			await pendingPoll;
-			return [{
+			return [{ kind: "relay", order: 1, delivery: {
 				cursor: "1",
 				envelope: {
 					envelopeId: "late-event", protocolVersion: TASK_PROTOCOL_VERSION, source, target, taskId: "task-1", kind: TaskEnvelopeKind.canonicalEvent,
 					payload: JSON.stringify({ eventId: "event-1", taskId: "task-1", type: "task.information", sequence: "1", source, target, occurredAt: 1, payload: { message: "late" } }),
 				},
-			}] as const;
+			} }] as const;
 		},
+		hasPendingWork: () => false,
 	} as unknown as TaskCore;
 	const context = {
 		hasPendingMessages: (): boolean => false,
@@ -857,7 +856,7 @@ test("invalidates a pending lifecycle poll when the session shuts down", async (
 
 		await sessionStart!({}, context);
 		const statusesBeforeShutdown = [...statuses];
-		poll?.();
+		jest.advanceTimersByTime(IDLE_POLL_MS);
 		await started;
 		const joinedRefresh = agentEnd!({}, context);
 		sessionShutdown?.();
@@ -867,7 +866,7 @@ test("invalidates a pending lifecycle poll when the session shuts down", async (
 		expect(statuses).toEqual(statusesBeforeShutdown);
 	} finally {
 		sessionShutdown?.();
-		globalThis.setInterval = originalSetInterval;
+		jest.useRealTimers();
 	}
 });
 
@@ -936,6 +935,7 @@ test.each(["RELAY_RESET", "RELAY_REBIND_REQUIRED"] as const)("automatically repl
 			{ taskId: "completed-task", status: "completed" },
 		],
 		close(): Promise<void> { if (!oldClosing) { oldCloses += 1; oldClosing = Promise.resolve(); } return oldClosing; },
+		hasPendingWork: () => true,
 	} as unknown as TaskCore & { close(): Promise<void> };
 	const freshCore = {
 		endpoint: { relay: "wolfpack-pi-tasks-v2", id: "fresh-endpoint" },
@@ -947,6 +947,7 @@ test.each(["RELAY_RESET", "RELAY_REBIND_REQUIRED"] as const)("automatically repl
 		getTask: () => undefined,
 		async createTask(): Promise<{ readonly taskId: string }> { freshCreates += 1; return { taskId: "fresh-task" }; },
 		async close(): Promise<void> { undefined; },
+		hasPendingWork: () => false,
 	} as unknown as TaskCore & { close(): Promise<void> };
 	const context = {
 		isIdle: (): boolean => true,
@@ -1026,6 +1027,7 @@ test("retries a rejected configured core during a later lifecycle inbox refresh"
 		async flushOutbox(): Promise<void> { calls.push("flush"); },
 		async evaluateTimeouts(): Promise<void> { calls.push("timeout"); },
 		async receive(): Promise<readonly []> { calls.push("receive"); return []; },
+		hasPendingWork: () => false,
 	} as unknown as TaskCore;
 	const context = {
 		hasPendingMessages: (): boolean => false,

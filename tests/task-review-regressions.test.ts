@@ -5,9 +5,11 @@ import { createTaskWorkScope } from '../src/task-work-scope';
 import { deliverTaskInbox } from '../src/task-inbox';
 import { createInMemoryTaskRelay } from '../src/in-memory-task-relay';
 import { TASK_PROTOCOL_VERSION, TaskProtocolError } from '../src/task-protocol';
-import type { TaskRelay } from '../src/task-protocol';
+import type { RelayDelivery, TaskRelay } from '../src/task-protocol';
+import type { TaskInboxItem } from '../src/task-core';
 
 const origin = { relay: 'memory', id: 'origin' }, target = { relay: 'memory', id: 'target' };
+const relayDeliveries = (items: readonly TaskInboxItem[]): RelayDelivery[] => items.flatMap(item => item.kind === 'relay' ? [item.delivery] : []);
 function wrap(base: TaskRelay): TaskRelay {
   return { id: base.id, connect: input => base.connect(input), resolve: input => base.resolve(input),
     send: (input, signal) => base.send(input, signal), receive: (input, signal) => base.receive(input, signal),
@@ -65,7 +67,7 @@ test('failed requested ACK repairs leave an initial receive opportunity', async 
   await parent.connect(); await child.connect();
   await parent.createTask({ target, task: 'previous one', timeoutMs: 60_000 });
   await parent.createTask({ target, task: 'previous two', timeoutMs: 60_000 });
-  const previous = await child.receive();
+  const previous = relayDeliveries(await child.receive());
   for (const delivery of previous) {
     try { await child.acknowledgeRelayDelivery(delivery.cursor); } catch {}
   }
@@ -104,7 +106,7 @@ test('slow ignored-abort ACK repair preserves protected intake and uncertain req
   await parent.connect(); await child.connect();
   await parent.createTask({ target, task: 'old one', timeoutMs: 60_000 });
   await parent.createTask({ target, task: 'old two', timeoutMs: 60_000 });
-  const previous = await child.receive();
+  const previous = relayDeliveries(await child.receive());
   for (const delivery of previous) await expect(child.acknowledgeRelayDelivery(delivery.cursor)).rejects.toMatchObject({ code: 'RELAY_UNAVAILABLE' });
   const requested = childStore.requestedRelayAcknowledgements(target);
   const fresh = await parent.createTask({ target, task: 'within the same held page', timeoutMs: 60_000 });
@@ -143,12 +145,15 @@ test('public receive preserves raw-intent fanout and one-page array return', asy
     const scope = createTaskWorkScope();
     expect(await child.receive(scope.signal, scope)).toHaveLength(1);
     await child.submitIntent({ taskId: created.taskId, type: 'task.completed', payload: { summary: 'done' } });
-    expect(await parent.receive()).toEqual([]);
+    // The raw intent is canonicalized in the same page; the origin view is queued locally, not self-echoed.
+    const items = await parent.receive();
+    expect(items.map(item => item.kind)).toEqual(['local']);
+    expect(items[0]!.kind === 'local' ? items[0]!.event.type : undefined).toBe('task.completed');
     expect(parent.getTask(created.taskId)?.status).toBe('completed');
-    expect(parentStore.outbox('accepted').filter(record => record.envelope.kind === 'canonical_event')).toHaveLength(2);
-    const canonical = await parent.receive();
-    expect(canonical).toHaveLength(1);
-    expect(JSON.parse(canonical[0]!.envelope.payload).type).toBe('task.completed');
+    expect(parentStore.outbox('accepted').filter(record => record.envelope.kind === 'canonical_event')).toHaveLength(1);
+    // Until presentation completes, the next one-page receive returns the same local item.
+    const again = await parent.receive();
+    expect(again).toEqual(items);
   } finally { parentStore.close(); childStore.close(); }
 });
 

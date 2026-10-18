@@ -17,8 +17,12 @@ export interface TaskOperationRecord {
   readonly taskId: string; readonly operation: string; readonly logicalId: string;
   readonly logicalType: string; readonly envelopeIds: readonly string[];
 }
+export interface PresentationRecord { readonly taskId: string; readonly eventId: string; }
+export interface PendingPresentation extends PresentationRecord { readonly order: number; }
 export interface TaskStore {
   transaction<T>(operation: () => T): T;
+  /** Synchronous hook after each top-level commit or non-transactional write; a throwing listener is isolated and logged. */
+  onChange(listener: () => void): () => void;
   putTask(task: Omit<TaskRecord, "events">): void;
   getTask(taskId: string): TaskSnapshot | undefined;
   listTasks(): readonly TaskSnapshot[];
@@ -36,6 +40,12 @@ export interface TaskStore {
   quarantineOutbox(envelopeId: string, input: OutboxQuarantineInput): void;
   quarantinedOutbox(): readonly OutboxQuarantineRecord[];
   persistInbox(envelope: RelayEnvelope, cursor: string): boolean;
+  /** Store arrival order of a persisted inbox envelope; shares the presentation order sequence. */
+  inboxOrder(envelopeId: string): number | undefined;
+  /** Origin-local canonical events awaiting Pi presentation; ids only, events stay in the task log. */
+  enqueuePresentation(details: PresentationRecord): void;
+  pendingPresentations(): readonly PendingPresentation[];
+  completePresentation(eventId: string): void;
   getReceiveCursor(): string;
   setReceiveCursor(cursor: string): void;
   trackRelayDeliveries(endpoint: TaskEndpoint, deliveries: readonly { readonly cursor: string; readonly envelopeId: string }[]): void;
@@ -80,6 +90,11 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
     } else pendingOutbox.delete(id);
   };
   let bytes = 0, entries = 0, sequence = 0, closed = false;
+  const listeners = new Set<() => void>();
+  // Listeners run after state is final; a failure is logged, not rethrown, because the write already committed.
+  const notify = () => { for (const listener of [...listeners]) { try { listener(); } catch (error) { console.error("pi-tasks: task store change listener failed", error); } } };
+  // Top-level writes refresh the pending-outbox index before notifying so listeners see committed state.
+  const committed = (name: string, key: string) => { if (frames.length) return; if (name === "outbox") syncPendingOutbox(key); notify(); };
   const remember = (name: string, key: string, target: Map<string, Cell>, prior: Cell | undefined) => {
     const frame = frames.at(-1), identity = JSON.stringify([name, key]);
     if (frame && !frame.has(identity)) frame.set(identity, { table: target, key, prior });
@@ -96,12 +111,14 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
     remember(name, key, target, prior);
     target.set(key, { text, bytes: size, order: prior?.order ?? sequence++ });
     bytes += size - (prior?.bytes ?? 0); if (!prior) entries++;
+    committed(name, key);
     return true;
   };
   const remove = (name: string, key: string) => {
     const target = table(name), prior = target.get(key); if (!prior) return;
     remember(name, key, target, prior);
     target.delete(key); bytes -= prior.bytes; entries--;
+    committed(name, key);
   };
   const pair = (a: string, b: string) => JSON.stringify([a, b]);
   const requireTask = (id: string) => { if (!get("tasks", id)) throw new TaskProtocolError("TASK_NOT_FOUND", "task is not active in this endpoint lifetime"); };
@@ -130,22 +147,26 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
     transaction<T>(operation: () => T): T {
       check(); const priorBytes = bytes, priorEntries = entries, priorSequence = sequence;
       const frame = new Map<string, Undo>(); frames.push(frame);
+      let result: T, topLevelChange = false;
       try {
-        const result = operation();
+        result = operation();
         if (result instanceof Promise) throw new TypeError("task transactions must be synchronous");
         const parent = frames.at(-2);
         if (parent) {
           for (const [key, item] of frame) if (!parent.has(key)) parent.set(key, item);
         } else {
           for (const item of frame.values()) if (item.table === tables.get("outbox")) syncPendingOutbox(item.key);
+          topLevelChange = frame.size > 0;
         }
-        return result;
       } catch (error) {
         for (const item of [...frame.values()].reverse()) { if (item.prior) item.table.set(item.key, item.prior); else item.table.delete(item.key); }
         bytes = priorBytes; entries = priorEntries; sequence = priorSequence;
         throw error;
       } finally { frames.pop(); }
+      if (topLevelChange) notify();
+      return result;
     },
+    onChange(listener) { const entry = () => listener(); listeners.add(entry); return () => { listeners.delete(entry); }; },
     putTask(task) { put("tasks", task.taskId, task, true); },
     getTask(id) { const task = get<Omit<TaskRecord, "events">>("tasks", id); return task ? snapshot(task, rows<TaskEvent>("events").filter(event => event.taskId === id)) : undefined; },
     listTasks() {
@@ -184,6 +205,10 @@ export function createTaskStore(options: TaskStoreOptions = {}): TaskStore {
     },
     quarantinedOutbox() { return rows<OutboxQuarantineRecord>("quarantine"); },
     persistInbox(envelope, cursor) { return put("inbox", envelope.envelopeId, { envelope, cursor }, true); },
+    inboxOrder(id) { return table("inbox").get(id)?.order; },
+    enqueuePresentation(details) { requireTask(details.taskId); put("presentation", details.eventId, { taskId: details.taskId, eventId: details.eventId }, true); },
+    pendingPresentations() { return [...table("presentation").values()].sort((a, b) => a.order - b.order).map(row => ({ ...JSON.parse(row.text) as PresentationRecord, order: row.order })); },
+    completePresentation(eventId) { remove("presentation", eventId); },
     getReceiveCursor() { return state<string>("cursor") ?? "0"; },
     setReceiveCursor(cursor) { put("state", "cursor", cursor); },
     trackRelayDeliveries(endpoint, deliveries) {

@@ -69,16 +69,27 @@ export interface WakeRequest {
 	flush(signal?: AbortSignal): Promise<void>;
 }
 
+/** One presentable inbox item, merged by store arrival order. Local items are origin-canonicalized events that never travel through the relay to the origin. */
+export type TaskInboxItem =
+	| { readonly kind: "relay"; readonly delivery: RelayDelivery; readonly order: number }
+	| { readonly kind: "local"; readonly event: TaskEvent; readonly order: number };
+
 export interface TaskCore {
 	readonly endpoint: TaskEndpoint;
 	connect(signal?: AbortSignal, work?: TaskWorkScope): Promise<void>;
 	createTask(input: CreateTaskInput, signal?: AbortSignal, work?: TaskWorkScope): Promise<{ readonly taskId: string }>;
 	getTask(taskId: string): TaskSnapshot | undefined;
 	listTasks(): readonly TaskSnapshot[];
+	/** True while any task is active or the outbox holds pending envelopes; drives the background poll cadence. */
+	hasPendingWork(): boolean;
+	/** Synchronous notification after each committed store change; returns the unsubscribe function. */
+	onChange(listener: () => void): () => void;
 	/** Correlate a receiver conversation with a locally recorded outbound intent, never session history or payload author claims. */
 	isSelfAuthoredConversation(event: TaskEvent): boolean;
 	flushOutbox(signal?: AbortSignal, work?: TaskWorkScope): Promise<void>;
-	receive(signal?: AbortSignal, work?: TaskWorkScope): Promise<readonly RelayDelivery[]>;
+	receive(signal?: AbortSignal, work?: TaskWorkScope): Promise<readonly TaskInboxItem[]>;
+	/** Retire a local item after its Pi insertion and wake evidence exist; no relay ACK or receipt. */
+	completeLocalPresentation(eventId: string): void;
 	acknowledgeRelayDelivery(cursor: string, signal?: AbortSignal, work?: TaskWorkScope): Promise<void>;
 	submitIntent(input: SubmitIntentInput, signal?: AbortSignal, work?: TaskWorkScope): Promise<void>;
 	submitIntentWithOutcome?(input: SubmitIntentInput, signal?: AbortSignal, work?: TaskWorkScope): Promise<SubmitIntentOutcome>;
@@ -192,6 +203,8 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 		},
 		getTask(taskId) { return options.store.getTask(taskId); },
 		listTasks() { return options.store.listTasks(); },
+		onChange(listener) { return options.store.onChange(listener); },
+		hasPendingWork() { return options.store.hasPendingOutbox() || options.store.listTasks().some((task) => task.status === "active"); },
 		isSelfAuthoredConversation(event) {
 			if (!CONVERSATIONAL_EVENTS.has(event.type) || typeof event.payload.intentId !== "string") return false;
 			const task = options.store.getTask(event.taskId);
@@ -246,7 +259,7 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 				const pendingRaw = page.deliveries.find(delivery => delivery.envelope.kind === "intent" && options.store.pendingRelayEnvelopeId(options.endpoint, delivery.cursor) !== undefined);
 				if (pendingRaw) throw deferredTaskDelivery({ cursor: pendingRaw.cursor,
 					retryAfterMs: Math.max(0, options.store.relayAcknowledgementRetryAt(options.endpoint, pendingRaw.cursor) - Date.now()) });
-				return visibleDeliveries;
+				return inboxItems(options.store, visibleDeliveries);
 			} finally {
 				work.retryAllowed = retryAllowed;
 				// Inbox delivery owns the later retry share; direct receive retains its own.
@@ -254,6 +267,7 @@ export function createTaskCore(options: TaskCoreOptions): TaskCore {
 			}
 		},
 		acknowledgeRelayDelivery,
+		completeLocalPresentation(eventId) { options.store.completePresentation(eventId); },
 		async submitIntent(input, signal, work) { await submitIntentWithOutcome(input, signal, work); },
 		submitIntentWithOutcome,
 		async recordInsertion(input, signal, work = createTaskWorkScope(signal)) {
@@ -379,9 +393,9 @@ function persistIntent(options: TaskCoreOptions, now: () => number, ids: () => s
 	if (!sameEndpoint(options.endpoint, task.origin) && !sameEndpoint(options.endpoint, task.target)) throw new TaskProtocolError("NOT_PARTICIPANT", "historical task belongs to a different endpoint", { retryable: false });
 	if (sameEndpoint(options.endpoint, task.origin)) {
 		const operation = input.type === "task.cancelled" ? ORIGIN_CANCELLATION_OPERATION : reservedOperation;
-		// The origin already recorded its own conversational event; echo only peer-authored conversations back for model incorporation.
-		const echoCanonicalEventToOrigin = !CONVERSATIONAL_EVENTS.has(input.type);
-		const canonical = canonicalize(options, now, ids, task, { intentId: ids(), taskId: input.taskId, type: input.type, payload: input.payload }, input.type, operation, echoCanonicalEventToOrigin);
+		// The origin already recorded its own conversational event; present only peer-authored conversations for model incorporation.
+		const presentToOrigin = !CONVERSATIONAL_EVENTS.has(input.type);
+		const canonical = canonicalize(options, now, ids, task, { intentId: ids(), taskId: input.taskId, type: input.type, payload: input.payload }, input.type, operation, presentToOrigin);
 		return { envelopeIds: canonical.envelopeIds, outcome: { authority: "origin", canonicalEvent: { type: canonical.eventType, reused: canonical.reused } } };
 	}
 	const envelopeId = ids();
@@ -441,15 +455,16 @@ interface Canonicalization {
 	readonly reused: boolean;
 }
 
-function canonicalize(options: TaskCoreOptions, now: () => number, ids: () => string, task: TaskRecord, intent: TaskIntent, requestedType: string, operation?: string, echoCanonicalEventToOrigin = true): Canonicalization {
+/** Origin-only. The origin sees its canonical event through the local presentation queue, never a relay envelope to itself. */
+function canonicalize(options: TaskCoreOptions, now: () => number, ids: () => string, task: TaskRecord, intent: TaskIntent, requestedType: string, operation?: string, presentToOrigin = true): Canonicalization {
 	const terminal = TERMINAL_EVENTS.has(requestedType);
 	const type = terminal && TERMINAL_STATUSES.has(task.status) ? "task.late_terminal" : requestedType;
 	const sequence = String(task.events.length + 1);
 	const canonical = event(task, ids(), type, sequence, options.endpoint, task.target, now(), { ...intent.payload, intentId: intent.intentId });
-	const suppressSelfTargetConversationEcho = !echoCanonicalEventToOrigin && sameEndpoint(task.origin, task.target);
-	const targetEnvelope = suppressSelfTargetConversationEcho ? undefined : envelope(ids(), options.endpoint, task.target, task.taskId, TaskEnvelopeKind.canonicalEvent, canonical, canonical.occurredAt);
-	const originEnvelope = !echoCanonicalEventToOrigin || sameEndpoint(task.origin, task.target) ? undefined : envelope(ids(), options.endpoint, task.origin, task.taskId, TaskEnvelopeKind.canonicalEvent, canonical, canonical.occurredAt);
-	const persistedEnvelopeIds = [targetEnvelope, originEnvelope].flatMap((item) => item === undefined ? [] : [item.envelopeId]);
+	// A self-targeted task presents through its target envelope; suppress that for its own conversations.
+	const selfTarget = sameEndpoint(task.origin, task.target);
+	const targetEnvelope = !presentToOrigin && selfTarget ? undefined : envelope(ids(), options.endpoint, task.target, task.taskId, TaskEnvelopeKind.canonicalEvent, canonical, canonical.occurredAt);
+	const persistedEnvelopeIds = targetEnvelope === undefined ? [] : [targetEnvelope.envelopeId];
 	if (operation !== undefined) {
 		const reservation = options.store.reserveTaskOperation({ taskId: task.taskId, operation, logicalId: canonical.eventId, logicalType: canonical.type, envelopeIds: persistedEnvelopeIds });
 		if (!reservation.created) return { envelopeIds: reservation.record.envelopeIds, eventType: reservation.record.logicalType, reused: true };
@@ -457,8 +472,22 @@ function canonicalize(options: TaskCoreOptions, now: () => number, ids: () => st
 	options.store.appendEvent(canonical);
 	if (TERMINAL_EVENTS.has(type)) options.store.setStatus(task.taskId, statusFor(type));
 	if (targetEnvelope !== undefined) options.store.putOutbox(targetEnvelope);
-	if (originEnvelope !== undefined) options.store.putOutbox(originEnvelope);
+	if (presentToOrigin && !selfTarget) options.store.enqueuePresentation({ taskId: task.taskId, eventId: canonical.eventId });
 	return { envelopeIds: persistedEnvelopeIds, eventType: type, reused: false };
+}
+
+function inboxItems(store: TaskStore, deliveries: readonly RelayDelivery[]): readonly TaskInboxItem[] {
+	const items: TaskInboxItem[] = deliveries.map((delivery) => {
+		const order = store.inboxOrder(delivery.envelope.envelopeId);
+		if (order === undefined) throw new Error("visible relay delivery was not persisted");
+		return { kind: "relay", delivery, order };
+	});
+	for (const pending of store.pendingPresentations()) {
+		const event = store.getTask(pending.taskId)?.events.find((candidate) => candidate.eventId === pending.eventId);
+		if (event === undefined) throw new Error("local presentation event is not in the task log");
+		items.push({ kind: "local", event, order: pending.order });
+	}
+	return items.sort((left, right) => left.order - right.order);
 }
 
 async function flushDeliveryEvidence(options: TaskCoreOptions, signal: AbortSignal | undefined, taskId: string, envelopeIds: readonly string[], evidence: DeliveryEvidence, work: TaskWorkScope, flush: OutboxFlusher): Promise<void> {

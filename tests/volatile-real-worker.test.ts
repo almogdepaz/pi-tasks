@@ -5,7 +5,10 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { createTaskStore } from "../src/task-store";
 import { createVolatileTaskSession } from "../src/volatile-task-session";
+import type { TaskInboxItem } from "../src/task-core";
+import type { RelayDelivery } from "../src/task-protocol";
 
+const relayDeliveries = (items: readonly TaskInboxItem[]): RelayDelivery[] => items.flatMap(item => item.kind === "relay" ? [item.delivery] : []);
 const wolfpack = process.env.PI_TASKS_WOLFPACK_SOURCE;
 const revision = process.env.PI_TASKS_WOLFPACK_REVISION;
 
@@ -87,7 +90,7 @@ test.skipIf(!wolfpack)("actual volatile adapter/HTTP/workers: sparse ACKs, peer 
     expect(aStore.outbox("pending")).toEqual([]); expect(aStore.outbox("accepted")).toHaveLength(1);
     await ac.createTask({ target, task: "second", timeoutMs: 60_000 });
     await ac.createTask({ target, task: "third", timeoutMs: 60_000 });
-    const first = await bc.receive(); expect(first.map(d => d.cursor)).toEqual(["1", "2", "3"]);
+    const first = relayDeliveries(await bc.receive()); expect(first.map(d => d.cursor)).toEqual(["1", "2", "3"]);
     expect(await failure(bc.acknowledgeRelayDelivery("2"))).toMatchObject({ code: "RELAY_UNAVAILABLE" });
     expect(bStore.getReceiveCursor()).toBe("0");
     bSession.close(); // Reconnect the transport within this RAM-owned endpoint lifetime.
@@ -96,14 +99,14 @@ test.skipIf(!wolfpack)("actual volatile adapter/HTTP/workers: sparse ACKs, peer 
     const ackCalls = b.calls.filter(call => call.operation === "acknowledge");
     expect(ackCalls).toHaveLength(2); expect(ackCalls[1]).toEqual(ackCalls[0]);
     expect(bStore.getReceiveCursor()).toBe("0");
-    const sparse = await bc.receive(); expect(sparse.map(d => d.cursor)).toEqual(["1", "3"]);
+    const sparse = relayDeliveries(await bc.receive()); expect(sparse.map(d => d.cursor)).toEqual(["1", "3"]);
     expect(sparse[1]!.envelope.envelopeId).toBe(first[2]!.envelope.envelopeId);
     await bc.acknowledgeRelayDelivery("3");
     bSession.close(); // Reconnect the transport within this RAM-owned endpoint lifetime.
     bSession = createVolatileTaskSession({ url: b.url, callerSession: "receiver", store: bStore }); sessions.push(bSession);
     bc = await bSession.connect();
     expect(bStore.getRelayTransportBinding()).toEqual(bBinding);
-    const pending = await bc.receive(); expect(pending.map(d => d.cursor)).toEqual(["1"]);
+    const pending = relayDeliveries(await bc.receive()); expect(pending.map(d => d.cursor)).toEqual(["1"]);
     await bc.acknowledgeRelayDelivery("1"); expect(bStore.getReceiveCursor()).toBe("3");
     await b.restart();
     expect(await failure(bc.receive())).toMatchObject({ code: "RELAY_RESET", retryable: false });
@@ -124,7 +127,7 @@ test.skipIf(!wolfpack)("actual volatile adapter/HTTP/workers: sparse ACKs, peer 
     expect(fresh.listTasks()).toEqual([]); // History belongs to the Pi session, not a new endpoint.
     await expect(fresh.submitIntent({ taskId: first[0]!.envelope.taskId, type: "task.completed", payload: { summary: "not authorized for retired endpoint" } })).rejects.toMatchObject({ code: "UNKNOWN_TASK" });
     await fresh.createTask({ target: fresh.endpoint, task: "new lifetime", timeoutMs: 60_000 });
-    expect((await fresh.receive()).map(d => d.cursor)).toEqual(["1"]);
+    expect(relayDeliveries(await fresh.receive()).map(d => d.cursor)).toEqual(["1"]);
   } finally {
     for (const session of sessions) session.close();
     for (const store of stores) store.close();

@@ -67,13 +67,14 @@ test.each([false, true])("queued parent intake canonicalizes completion behind h
 		const created = await parent.createTask({ target: receiver, task: "complete behind queued follow-ups", timeoutMs: 60_000 });
 		await child.receive();
 		await child.submitIntent({ taskId: created.taskId, type: "task.information", payload: { message: "earlier visible progress" } });
-		expect(await parent.receive()).toEqual([]);
+		const progress = await parent.receive();
+		expect(progress.map(item => item.kind)).toEqual(["local"]); // Canonical progress is queued locally, never echoed through the relay.
+		const held = progress[0]?.kind === "local" ? progress[0].event : undefined;
+		if (held === undefined) throw new Error("expected held canonical progress");
 		const cursorBefore = parentStore.getReceiveCursor();
 		await child.submitIntent({ taskId: created.taskId, type: "task.completed", payload: { summary: "finished", result: { verified: true } } });
 		const before = await relay.receive({ endpoint: origin, cursor: cursorBefore, limit: 100 });
-		expect(before.deliveries.map(delivery => delivery.envelope.kind)).toEqual(["canonical_event", "intent"]);
-		const held = before.deliveries[0];
-		if (held === undefined) throw new Error("expected held canonical progress");
+		expect(before.deliveries.map(delivery => delivery.envelope.kind)).toEqual(["intent"]);
 
 		await deliverTaskInbox(pi, parent, context);
 		expect(parent.getTask(created.taskId)?.status).toBe("completed");
@@ -84,10 +85,9 @@ test.each([false, true])("queued parent intake canonicalizes completion behind h
 		await deliverTaskInbox(pi, parent, context);
 		expect(parent.getTask(created.taskId)?.events.filter(event => event.type === "task.completed")).toHaveLength(1);
 		expect(entries).toEqual([]);
-		expect(parentStore.getReceiveCursor()).toBe(cursorBefore);
-		const replay = await relay.receive({ endpoint: origin, cursor: cursorBefore, limit: 100 });
-		expect(replay.deliveries.map(delivery => delivery.envelope.kind)).toEqual(["canonical_event", "canonical_event"]);
-		expect(replay.deliveries[0]).toEqual(held); // Later raw intent ACK must not consume the held prefix.
+		// The raw intent ACK advances the relay cursor, but the held local prefix keeps its order ahead of completion.
+		expect((await relay.receive({ endpoint: origin, cursor: parentStore.getReceiveCursor(), limit: 100 })).deliveries).toEqual([]);
+		expect(parentStore.pendingPresentations().map(item => item.eventId)).toEqual([held.eventId, terminal.eventId]);
 
 		pending = false; idle = false;
 		await deliverTaskInbox(pi, parent, context);
@@ -97,6 +97,7 @@ test.each([false, true])("queued parent intake canonicalizes completion behind h
 		await deliverTaskInbox(pi, parent, context);
 		expect(messages.filter(message => message.customType === "pi-tasks-event" && message.details.eventId === terminal.eventId)).toHaveLength(1);
 		expect(messages.filter(message => message.customType === "pi-tasks-wake" && message.details.eventId === terminal.eventId)).toHaveLength(1);
+		expect(messages.filter(message => message.customType === "pi-tasks-event").map(message => message.details.eventId)).toEqual([held.eventId, terminal.eventId]);
 		expect(await parent.receive()).toEqual([]);
 	} finally { parentStore.close(); childStore.close(); }
 });
@@ -244,12 +245,13 @@ test.each(["task.completed", "task.failed", "task.cancelled", "task.timed_out"] 
 			expect.objectContaining({ type: "custom_message", customType: "pi-tasks-event", details: expect.objectContaining({ taskId: created.taskId, eventId: terminal.eventId, event: terminal }) }),
 		]));
 		expect(wakes).toEqual([]);
-		expect(parent.getTask(created.taskId)?.events.filter(event => event.type === "task.delivery_receipt" && event.payload.eventId === terminal.eventId).map(event => event.payload.stage)).toEqual(["pi_inserted"]);
+		// Origin-local presentation records no relay delivery receipt for the origin's own view.
+		expect(parent.getTask(created.taskId)?.events.filter(event => event.type === "task.delivery_receipt" && event.payload.eventId === terminal.eventId)).toEqual([]);
 		expect(await parent.receive()).toEqual([]);
 	} finally { parentStore.close(); childStore.close(); }
 });
 
-test("retries an acknowledged terminal relay ACK without creating a wake receipt", async () => {
+test("retries an acknowledged terminal local completion without creating a wake or receipt", async () => {
 	const relay = createInMemoryTaskRelay("memory");
 	const parentStore = createTaskStore(), childStore = createTaskStore();
 	const parent = createTaskCore({ endpoint: origin, relay, store: parentStore, ids: ids("parent") });
@@ -277,105 +279,75 @@ test("retries an acknowledged terminal relay ACK without creating a wake receipt
 		await parent.acknowledgeParent(created.taskId);
 
 		idle = true;
-		const acknowledge = parent.acknowledgeRelayDelivery.bind(parent);
-		let relayAckFailed = false;
-		const relayAck = spyOn(parent, "acknowledgeRelayDelivery").mockImplementation(async (cursor) => {
-			if (!relayAckFailed) {
-				relayAckFailed = true;
-				throw new Error("fixture relay ACK unavailable");
+		const complete = parent.completeLocalPresentation.bind(parent);
+		let completionFailed = false;
+		const completion = spyOn(parent, "completeLocalPresentation").mockImplementation((eventId) => {
+			if (!completionFailed) {
+				completionFailed = true;
+				throw new Error("fixture local completion unavailable");
 			}
-			return acknowledge(cursor);
+			return complete(eventId);
 		});
 		try {
-			await expect(deliverTaskInbox(pi, parent, context)).rejects.toThrow("fixture relay ACK unavailable");
+			await expect(deliverTaskInbox(pi, parent, context)).rejects.toThrow("fixture local completion unavailable");
 			await deliverTaskInbox(pi, parent, context);
 			await deliverTaskInbox(pi, parent, context);
-		} finally { relayAck.mockRestore(); }
+		} finally { completion.mockRestore(); }
 
-		expect(relayAckFailed).toBe(true);
+		expect(completionFailed).toBe(true);
 		expect(wakes).toEqual([]);
-		expect(parent.getTask(created.taskId)?.events.filter(event => event.type === "task.delivery_receipt" && event.payload.eventId === terminal.eventId).map(event => event.payload.stage)).toEqual(["pi_inserted"]);
+		expect(entries.filter(entry => (entry as { customType?: string; details?: { eventId?: string } }).customType === "pi-tasks-event" && (entry as { details: { eventId: string } }).details.eventId === terminal.eventId)).toHaveLength(1);
+		expect(parent.getTask(created.taskId)?.events.filter(event => event.type === "task.delivery_receipt" && event.payload.eventId === terminal.eventId)).toEqual([]);
 		expect(await parent.receive()).toEqual([]);
 	} finally { parentStore.close(); childStore.close(); }
 });
 
-test("retains an issued terminal wake when parent acknowledgment completes during deferred wake-request relay flush", async () => {
-	const backing = createInMemoryTaskRelay("memory");
-	let wakeRequestStarted!: () => void;
-	let releaseWakeRequest!: () => void;
-	const firstWakeRequest = new Promise<void>((resolve) => { wakeRequestStarted = resolve; });
-	const releaseFirstWakeRequest = new Promise<void>((resolve) => { releaseWakeRequest = resolve; });
-	let delayWakeRequest = true;
-	const relay: TaskRelay = {
-		id: backing.id,
-		connect: (input) => backing.connect(input),
-		resolve: (input) => backing.resolve(input),
-		send: async (input) => {
-			const payload = JSON.parse(input.payload) as { readonly type?: string; readonly payload?: { readonly stage?: string } };
-			if (delayWakeRequest && input.source.id === origin.id && input.kind === "canonical_event" && payload.type === "task.delivery_receipt" && payload.payload?.stage === "wake_requested") {
-				delayWakeRequest = false;
-				wakeRequestStarted();
-				await releaseFirstWakeRequest;
-			}
-			return backing.send(input);
-		},
-		receive: (input) => backing.receive(input),
-		acknowledgeDelivery: (input) => backing.acknowledgeDelivery(input),
-	};
+test("retains an issued local terminal wake when parent acknowledgment completes during wake issuance", async () => {
+	const relay = createInMemoryTaskRelay("memory");
 	const parentStore = createTaskStore(), childStore = createTaskStore();
 	const parent = createTaskCore({ endpoint: origin, relay, store: parentStore, ids: ids("parent") });
 	const child = createTaskCore({ endpoint: receiver, relay, store: childStore, ids: ids("child") });
 	const entries: unknown[] = [];
+	let taskId = "";
+	let acknowledgement: Promise<unknown> | undefined;
 	const pi = {
-		sendMessage(message: { readonly customType: string; readonly details: unknown }) { entries.push({ type: "custom_message", ...message }); },
+		sendMessage(message: { readonly customType: string; readonly details: unknown }) {
+			entries.push({ type: "custom_message", ...message });
+			// The parent acknowledges while the local wake is being issued, before presentation completes.
+			if (message.customType === "pi-tasks-wake" && acknowledgement === undefined) acknowledgement = parent.acknowledgeParent(taskId);
+		},
 		appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); },
 	};
 	let idle = false;
 	const context = { isIdle: (): boolean => idle, hasPendingMessages: (): boolean => false, sessionManager: { getEntries: (): readonly unknown[] => entries } };
+	const wakes = (): unknown[] => entries.filter((entry) => typeof entry === "object" && entry !== null && "customType" in entry && entry.customType === "pi-tasks-wake");
 	try {
 		await parent.connect(); await child.connect();
 		const created = await parent.createTask({ target: receiver, task: "report a blocker", timeoutMs: 60_000 });
+		taskId = created.taskId;
 		await child.receive();
 		await child.submitIntent({ taskId: created.taskId, type: "task.failed", payload: { summary: "blocked" } });
 		await deliverTaskInbox(pi, parent, context);
 		await deliverTaskInbox(pi, parent, context);
 		idle = true;
 
-		const delivery = deliverTaskInbox(pi, parent, context);
-		await firstWakeRequest;
-		const wakesBeforeRelayFlush = entries.filter((entry) => typeof entry === "object" && entry !== null && "customType" in entry && entry.customType === "pi-tasks-wake");
-		await parent.acknowledgeParent(created.taskId);
-		releaseWakeRequest();
-		await delivery;
+		await deliverTaskInbox(pi, parent, context);
+		await acknowledgement;
+		await deliverTaskInbox(pi, parent, context);
 
-		expect(wakesBeforeRelayFlush).toHaveLength(1);
+		expect(acknowledgement).toBeDefined();
 		expect(parent.getTask(created.taskId)?.events.some((event) => event.type === "task.parent_acknowledged")).toBe(true);
-		expect(entries.filter((entry) => typeof entry === "object" && entry !== null && "customType" in entry && entry.customType === "pi-tasks-wake")).toHaveLength(1);
-		expect(parent.getTask(created.taskId)?.events.filter((event) => event.type === "task.delivery_receipt").map((event) => event.payload.stage)).toEqual(["pi_inserted", "wake_requested", "wake_accepted"]);
+		expect(wakes()).toHaveLength(1);
+		expect(parentStore.pendingPresentations()).toEqual([]);
+		expect(parent.getTask(created.taskId)?.events.filter((event) => event.type === "task.delivery_receipt")).toEqual([]);
 	} finally {
-		releaseWakeRequest();
 		parentStore.close();
 		childStore.close();
 	}
 });
 
-test("retries wake-request evidence after an ACK without duplicating the already-issued terminal wake", async () => {
-	const backing = createInMemoryTaskRelay("memory");
-	let rejectWakeRequest = true;
-	const relay: TaskRelay = {
-		id: backing.id,
-		connect: (input) => backing.connect(input),
-		resolve: (input) => backing.resolve(input),
-		send: async (input) => {
-			const payload = JSON.parse(input.payload) as { readonly type?: string; readonly payload?: { readonly stage?: string } };
-			if (rejectWakeRequest && input.source.id === origin.id && input.kind === "canonical_event" && payload.type === "task.delivery_receipt" && payload.payload?.stage === "wake_requested") {
-				throw new TaskProtocolError("RELAY_UNAVAILABLE", "wake request relay unavailable");
-			}
-			return backing.send(input);
-		},
-		receive: (input) => backing.receive(input),
-		acknowledgeDelivery: (input) => backing.acknowledgeDelivery(input),
-	};
+test("retries local completion after an ACK without duplicating the already-issued terminal wake", async () => {
+	const relay = createInMemoryTaskRelay("memory");
 	const parentStore = createTaskStore(), childStore = createTaskStore();
 	const parent = createTaskCore({ endpoint: origin, relay, store: parentStore, ids: ids("parent") });
 	const child = createTaskCore({ endpoint: receiver, relay, store: childStore, ids: ids("child") });
@@ -386,6 +358,7 @@ test("retries wake-request evidence after an ACK without duplicating the already
 	};
 	let idle = false;
 	const context = { isIdle: (): boolean => idle, hasPendingMessages: (): boolean => false, sessionManager: { getEntries: (): readonly unknown[] => entries } };
+	const wakes = (): unknown[] => entries.filter((entry) => typeof entry === "object" && entry !== null && "customType" in entry && entry.customType === "pi-tasks-wake");
 	try {
 		await parent.connect(); await child.connect();
 		const created = await parent.createTask({ target: receiver, task: "report a blocker", timeoutMs: 60_000 });
@@ -395,15 +368,24 @@ test("retries wake-request evidence after an ACK without duplicating the already
 		await deliverTaskInbox(pi, parent, context);
 		idle = true;
 
-		await expect(deliverTaskInbox(pi, parent, context)).rejects.toMatchObject({ code: "RELAY_UNAVAILABLE", retryable: true });
-		expect(entries.filter((entry) => typeof entry === "object" && entry !== null && "customType" in entry && entry.customType === "pi-tasks-wake")).toHaveLength(1);
-		rejectWakeRequest = false;
-		await parent.acknowledgeParent(created.taskId);
-		await deliverTaskInbox(pi, parent, context);
-		await deliverTaskInbox(pi, parent, context);
+		const complete = parent.completeLocalPresentation.bind(parent);
+		let rejectCompletion = true;
+		const completion = spyOn(parent, "completeLocalPresentation").mockImplementation((eventId) => {
+			if (rejectCompletion) throw new TaskProtocolError("RELAY_UNAVAILABLE", "local completion unavailable");
+			return complete(eventId);
+		});
+		try {
+			await expect(deliverTaskInbox(pi, parent, context)).rejects.toMatchObject({ code: "RELAY_UNAVAILABLE", retryable: true });
+			expect(wakes()).toHaveLength(1);
+			rejectCompletion = false;
+			await parent.acknowledgeParent(created.taskId);
+			await deliverTaskInbox(pi, parent, context);
+			await deliverTaskInbox(pi, parent, context);
+		} finally { completion.mockRestore(); }
 
-		expect(entries.filter((entry) => typeof entry === "object" && entry !== null && "customType" in entry && entry.customType === "pi-tasks-wake")).toHaveLength(1);
-		expect(parent.getTask(created.taskId)?.events.filter((event) => event.type === "task.delivery_receipt").map((event) => event.payload.stage)).toEqual(["pi_inserted", "wake_requested", "wake_accepted"]);
+		expect(wakes()).toHaveLength(1);
+		expect(parentStore.pendingPresentations()).toEqual([]);
+		expect(parent.getTask(created.taskId)?.events.filter((event) => event.type === "task.delivery_receipt")).toEqual([]);
 	} finally { parentStore.close(); childStore.close(); }
 });
 
@@ -452,8 +434,8 @@ test.each(["task.information", "task.question", "task.answer"] as const)("retain
 		await parent.connect();
 		const created = await parent.createTask({ target: origin, task: "answer locally", timeoutMs: 60_000 });
 		const assignment = (await parent.receive()).at(0);
-		if (assignment === undefined) throw new Error("expected self-target assignment");
-		await parent.acknowledgeRelayDelivery(assignment.cursor);
+		if (assignment?.kind !== "relay") throw new Error("expected self-target assignment");
+		await parent.acknowledgeRelayDelivery(assignment.delivery.cursor);
 		await parent.submitIntent({ taskId: created.taskId, type, payload: { message: "origin-authored" } });
 		const event = parent.getTask(created.taskId)?.events.at(-1);
 		if (event === undefined) throw new Error("expected origin-authored canonical event");
@@ -465,7 +447,7 @@ test.each(["task.information", "task.question", "task.answer"] as const)("retain
 	} finally { store.close(); }
 });
 
-test("origin acknowledges raw receiver intents before rendering their canonical message and completion", async () => {
+test("origin acknowledges raw receiver intents and renders their canonical message and completion in the same refresh", async () => {
 	const relay = createInMemoryTaskRelay("memory");
 	const parentStore = createTaskStore();
 	const parent = createTaskCore({ endpoint: origin, relay, store: parentStore, ids: ids("parent") });
@@ -498,14 +480,16 @@ test("origin acknowledges raw receiver intents before rendering their canonical 
 	]);
 	expect(parent.getTask(created.taskId)?.events.slice(-2).map((event) => event.type)).toEqual(["task.information", "task.completed"]);
 	expect(parentStore.getReceiveCursor()).toBe("7");
-	expect(parentEntries).toEqual([]);
-
-	await deliverTaskInbox(parentPi, parent, parentContext);
-
+	// Canonical events are queued locally while the raw intents are acknowledged, so the same refresh renders them.
 	expect(parentEntries).toEqual(expect.arrayContaining([
 		expect.objectContaining({ type: "custom_message", content: expect.stringContaining("progress") }),
 		expect.objectContaining({ type: "custom_message", content: expect.stringContaining("finished") }),
 	]));
+	const rendered = parentEntries.length;
+
+	await deliverTaskInbox(parentPi, parent, parentContext);
+
+	expect(parentEntries).toHaveLength(rendered);
 });
 
 test("retains retryable delivery evidence before advancing past preserved nonretryable evidence", async () => {
@@ -516,7 +500,8 @@ test("retains retryable delivery evidence before advancing past preserved nonret
 		connect: (input) => backing.connect(input),
 		resolve: (input) => backing.resolve(input),
 		send: async (input) => {
-			if (peerFailure !== undefined && input.source.id === origin.id && input.target.id === receiver.id && input.kind === "canonical_event") {
+			// Receipt evidence is relay-only: the receiver reports it to the origin as raw intents.
+			if (peerFailure !== undefined && input.source.id === receiver.id && input.target.id === origin.id && input.kind === "intent") {
 				if (peerFailure === "retryable") throw new TaskProtocolError("RELAY_UNAVAILABLE", "relay is temporarily unavailable");
 				throw new TaskProtocolError("DELIVERY_UNCONFIRMED", "peer delivery outcome is unknown", {
 					retryable: false,
@@ -540,28 +525,28 @@ test("retains retryable delivery evidence before advancing past preserved nonret
 		appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); },
 	};
 	const context = { isIdle: (): boolean => true, hasPendingMessages: (): boolean => false, sessionManager: { getEntries: (): readonly unknown[] => entries } };
+	const insertedMessages = (): unknown[] => entries.filter((entry) => typeof entry === "object" && entry !== null && "customType" in entry && entry.customType === "pi-tasks-event" && "content" in entry && typeof entry.content === "string" && /first|second/.test(entry.content));
 
 	try {
 		await parent.connect();
 		await child.connect();
 		const created = await parent.createTask({ target: receiver, task: "implement", timeoutMs: 1_000 });
-		await child.receive();
-		await child.submitIntent({ taskId: created.taskId, type: "task.information", payload: { message: "first" } });
-		await child.submitIntent({ taskId: created.taskId, type: "task.information", payload: { message: "second" } });
-		expect(await parent.receive()).toEqual([]); // Canonicalize both raw intents before the peer disappears.
-		const cursorBeforeEvidence = parentStore.getReceiveCursor();
+		await deliverTaskInbox(pi, child, context);
+		await parent.submitIntent({ taskId: created.taskId, type: "task.information", payload: { message: "first" } });
+		await parent.submitIntent({ taskId: created.taskId, type: "task.information", payload: { message: "second" } });
+		const cursorBeforeEvidence = childStore.getReceiveCursor();
 		peerFailure = "retryable";
 
-		await expect(deliverTaskInbox(pi, parent, context)).rejects.toMatchObject({ code: "RELAY_UNAVAILABLE", retryable: true });
-		expect(parentStore.getReceiveCursor()).toBe(cursorBeforeEvidence);
+		await expect(deliverTaskInbox(pi, child, context)).rejects.toMatchObject({ code: "RELAY_UNAVAILABLE", retryable: true });
+		expect(childStore.getReceiveCursor()).toBe(cursorBeforeEvidence);
 
 		peerFailure = "blocked";
-		const degradation = await deliverTaskInbox(pi, parent, context);
+		const degradation = await deliverTaskInbox(pi, child, context);
 
 		expect(degradation).toMatchObject({ code: "DELIVERY_UNCONFIRMED", retryable: false });
-		expect(entries.filter((entry) => typeof entry === "object" && entry !== null && "customType" in entry && entry.customType === "pi-tasks-event")).toHaveLength(2);
-		expect(parentStore.quarantinedOutbox()).not.toHaveLength(0);
-		await expect(deliverTaskInbox(pi, parent, context)).resolves.toBeUndefined();
+		expect(insertedMessages()).toHaveLength(2);
+		expect(childStore.quarantinedOutbox()).not.toHaveLength(0);
+		await expect(deliverTaskInbox(pi, child, context)).resolves.toBeUndefined();
 	} finally {
 		parentStore.close();
 		childStore.close();
@@ -579,10 +564,10 @@ test("origin acknowledges raw receiver intents and renders their canonical messa
 	await child.submitIntent({ taskId: created.taskId, type: "task.information", payload: { message: "progress" } });
 	await child.submitIntent({ taskId: created.taskId, type: "task.completed", payload: { summary: "finished" } });
 
-	expect(await parent.receive()).toEqual([]);
-	const echoed = await relay.receive({ endpoint: origin, cursor: "0", limit: 100 });
-	expect(echoed.deliveries).toHaveLength(2);
-	expect(echoed.deliveries.every((delivery) => delivery.envelope.kind === "canonical_event")).toBe(true);
+	// Raw intents are acknowledged and their canonical events are queued locally; no self-echo reaches the relay.
+	expect((await parent.receive()).map((item) => item.kind)).toEqual(["local", "local"]);
+	const mailbox = await relay.receive({ endpoint: origin, cursor: "0", limit: 100 });
+	expect(mailbox.deliveries.filter((delivery) => delivery.envelope.kind === "canonical_event")).toEqual([]);
 
 	const parentEntries: unknown[] = [];
 	const parentPi = {

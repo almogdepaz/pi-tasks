@@ -51,7 +51,8 @@ async function fixture() {
   await expect(core.receive()).rejects.toMatchObject({ code: "RELAY_UNAVAILABLE" });
   const requested = store.requestedRelayAcknowledgements(origin);
   const originals = store.outbox("accepted").filter(row => row.envelope.kind === "canonical_event").map(row => row.envelope);
-  expect(requested).toHaveLength(1); expect(originals).toHaveLength(2);
+  // Each raw intent now yields one canonical replica (to the peer); the origin view is a local presentation.
+  expect(requested).toHaveLength(1); expect(originals).toHaveLength(1);
   const originalAck = attempts[0]!;
   // This intent has NOT been canonicalized yet. Staging only the old replay is insufficient.
   await child.submitIntent({ taskId: old.taskId, type: "task.information", payload: { message: "new raw update" } });
@@ -84,7 +85,7 @@ test("raw ACK replay failure cannot gate initial intake behind a second new raw 
       expect(refresh.work.attemptedAcknowledgements.size).toBe(1);
     }
     expect(f.pages.length - f.before).toBe(4);
-    expect(f.pages[f.before]).toEqual({ count: 4, hasMore: false, kinds: ["intent", "canonical_event", "intent", "assignment"] });
+    expect(f.pages[f.before]).toEqual({ count: 3, hasMore: false, kinds: ["intent", "intent", "assignment"] });
     // Newly accepted canonical copies can join subsequent initial pages; none needs read-ahead.
     expect(f.pages.slice(f.before).every(page => page.count < 50 && !page.hasMore)).toBe(true);
     expect(f.retained()).toEqual(f.originals);
@@ -92,7 +93,7 @@ test("raw ACK replay failure cannot gate initial intake behind a second new raw 
     expect(f.pending()).toContainEqual({ cursor: f.originalAck.cursor, envelopeId: f.originalAck.envelopeId, retryAt: 0 });
     expect(f.store.getReceiveCursor()).toBe("0");
     expect(f.core.getTask(f.fresh.taskId)?.status).toBe("active");
-    expect(f.canonical()).toHaveLength(4); expect(f.pending()).toHaveLength(2);
+    expect(f.canonical()).toHaveLength(2); expect(f.pending()).toHaveLength(2);
     expect(f.attempts.slice(1).every(attempt => JSON.stringify(attempt) === JSON.stringify(f.originalAck))).toBe(true);
   } finally { f.close(); }
 });
@@ -111,7 +112,7 @@ for (const cancellation of ["background bound", "caller"] as const) {
       const outcome = await Promise.race([drive, Bun.sleep(3_000).then(() => "repair did not yield within its background bound")]);
       expect(outcome).toMatchObject({ code: "ABORTED", details: { mayHaveBeenDelivered: true } });
       expect(f.core.getTask(f.fresh.taskId)?.status).toBe("active");
-      expect(f.retained()).toEqual(f.originals); expect(f.canonical()).toHaveLength(4);
+      expect(f.retained()).toEqual(f.originals); expect(f.canonical()).toHaveLength(2);
       expect(f.pending()).toHaveLength(2); expect(refresh.work.attemptedAcknowledgements.size).toBe(1);
       expect(f.pages.length - f.before).toBe(1);
       expect(f.pending()).toContainEqual({ cursor: f.originalAck.cursor, envelopeId: f.originalAck.envelopeId, retryAt: 0 });
@@ -139,15 +140,16 @@ for (const blocked of ["full", "partial"] as const) {
         await expect(f.refresh().run()).rejects.toMatchObject({ code: "RELAY_UNAVAILABLE", retryable: true, message: "required canonical replica unavailable" });
         // Required replicas now run before speculation, reporting their actual refusal.
         // Final speculation must not send the same failed identity again in this scope.
+        // With no origin self-replica, "partial" (peer replica blocked) blocks the only required replica, like "full".
         const sent = f.canonicalAttempts.slice(before).map(envelope => envelope.envelopeId);
-        expect(sent).toHaveLength(cycle === 0 || blocked === "full" ? 2 : 1);
+        expect(sent).toHaveLength(1);
         expect(new Set(sent).size).toBe(sent.length);
       }
       expect(f.core.getTask(f.fresh.taskId)).toBeUndefined();
       expect(f.attempts.length).toBe(attempts); expect(f.store.requestedRelayAcknowledgements(origin)).toEqual(f.requested);
       expect(f.retained()).toEqual(f.originals); expect(f.store.getReceiveCursor()).toBe("0");
-      expect(f.canonical()).toHaveLength(blocked === "partial" ? 3 : 2);
-      expect(f.store.outbox("pending")).toHaveLength(blocked === "partial" ? 1 : 2);
+      expect(f.canonical()).toHaveLength(1);
+      expect(f.store.outbox("pending")).toHaveLength(1);
     } finally { f.close(); }
   });
 }
@@ -162,7 +164,7 @@ test("staged raw ACKs share the remaining cycle budget and report pending exhaus
     expect(f.core.getTask(f.fresh.taskId)?.status).toBe("active");
     expect(refresh.work.attemptedAcknowledgements.size).toBe(48);
     expect(f.attempts).toHaveLength(2); // Initial refused ACK, then exactly one accepted raw ACK.
-    expect(f.pending()).toHaveLength(1); expect(f.canonical()).toHaveLength(4); expect(f.retained()).toEqual(f.originals);
+    expect(f.pending()).toHaveLength(1); expect(f.canonical()).toHaveLength(2); expect(f.retained()).toEqual(f.originals);
     await f.refresh().run(); expect(f.pending()).toEqual([]);
   } finally { f.close(); }
 });
@@ -178,6 +180,6 @@ test("raw replay staging preserves ACK cooldown while eligible later raw repair 
     await expect(f.refresh().run()).rejects.toMatchObject({ code: "TASK_DELIVERY_DEFERRED", retryable: true });
     expect(f.pending()).toEqual([{ cursor: f.originalAck.cursor, envelopeId: f.originalAck.envelopeId, retryAt }]);
     expect(f.attempts).toHaveLength(3); expect(f.attempts[2]!.cursor).not.toBe(f.originalAck.cursor);
-    expect(f.retained()).toEqual(f.originals); expect(f.canonical()).toHaveLength(4); expect(f.store.getReceiveCursor()).toBe("0");
+    expect(f.retained()).toEqual(f.originals); expect(f.canonical()).toHaveLength(2); expect(f.store.getReceiveCursor()).toBe("0");
   } finally { f.close(); }
 });

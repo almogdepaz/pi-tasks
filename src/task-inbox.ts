@@ -35,75 +35,29 @@ type DeliveryEvidencePayload =
 	| { readonly stage: typeof TaskDeliveryStage.receiverRecorded | typeof TaskDeliveryStage.wakeRequested | typeof TaskDeliveryStage.wakeAccepted; readonly state: typeof TaskDeliveryEvidenceState.confirmed }
 	| { readonly stage: typeof TaskDeliveryStage.piInsertion; readonly state: typeof TaskDeliveryEvidenceState.blocked; readonly retryable: true };
 
-/** Persists model-visible Pi evidence before advancing the relay cursor, then starts one separate turn. */
+/** Relay items carry delivery receipts; origin-local items never emit receipts, insertion records or ACKs. */
+interface RelayReceipts {
+	readonly signal: AbortSignal;
+	readonly work: TaskWorkScope;
+	readonly report: (error: TaskOutboxDeliveryError | undefined) => void;
+}
+
+/** Persists model-visible Pi evidence before advancing the relay cursor or retiring a local item, then starts one separate turn. */
 export async function deliverTaskInbox(pi: InboxPi, core: TaskCore, context: InboxContext, signal?: AbortSignal, work = createTaskWorkScope(signal)): Promise<TaskOutboxDeliveryError | undefined> {
 	signal = work.signal;
 	work.retryAllowed = false; // Reserve intake, presentation and evidence/ACK ahead of old work.
 	let outboxError: TaskOutboxDeliveryError | undefined;
+	const receipts: RelayReceipts = { signal, work, report: (error) => { outboxError ??= error; } };
 	try {
-		const deliveries = await core.receive(signal, work);
-		for (const delivery of deliveries) {
-			if (delivery.envelope.kind === TaskEnvelopeKind.intent) {
-				await core.acknowledgeRelayDelivery(delivery.cursor, signal, work);
-				pi.appendEntry(TASK_CURSOR_CUSTOM_TYPE, { cursor: delivery.cursor });
+		for (const item of await core.receive(signal, work)) {
+			if (item.kind === "local") {
+				// A held local item stops the loop exactly like a held relay item, so later events cannot overtake it.
+				if (!await presentEvent(pi, core, context, item.event, undefined)) break;
+				core.completeLocalPresentation(item.event.eventId);
 				continue;
 			}
-			const event = inboxEvent(delivery);
-			if (!isKnownEvent(event.type)) throw new TaskProtocolError("UNKNOWN_EVENT", `unknown task inbox event type: ${event.type}`);
-			if (context.hasPendingMessages()) break;
-			const eventDetails = { taskId: event.taskId, eventId: event.eventId };
-			const eventKey = key(event.taskId, event.eventId);
-			const modelVisible = isModelVisible(event.type) && !core.isSelfAuthoredConversation(event);
-			if (!modelVisible && !recordedEventKeys(context.sessionManager.getEntries()).has(eventKey)) {
-				// Archive control facts and confirmed self-authored conversations without model insertion or wake.
-				// This is evidence only: no task state or delivery queue is reconstructed.
-				pi.appendEntry(TASK_RECORD_CUSTOM_TYPE, { ...eventDetails, event });
-			}
-			if (event.type === "task.created") {
-				const evidenceError = await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.receiverRecorded, state: TaskDeliveryEvidenceState.confirmed }, signal, work);
-				outboxError ??= evidenceError;
-			}
-			let incorporated = incorporatedEvents(context.sessionManager.getEntries()).has(eventKey);
-			if (!incorporated && modelVisible) {
-				if (!context.isIdle()) break;
-				pi.sendMessage({
-					customType: TASK_EVENT_CUSTOM_TYPE,
-					content: renderTaskEvent(event),
-					display: true,
-					details: { ...eventDetails, event },
-				}, { triggerTurn: false });
-				incorporated = incorporatedEvents(context.sessionManager.getEntries()).has(eventKey);
-				if (!incorporated) {
-					const evidenceError = await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.piInsertion, state: TaskDeliveryEvidenceState.blocked, retryable: true }, signal, work);
-					outboxError ??= evidenceError;
-					break;
-				}
-			}
-			if (modelVisible) {
-				const insertionError = await settleDeliveryEvidence(() => core.recordInsertion(eventDetails, signal, work));
-				outboxError ??= insertionError;
-				let wakeAccepted = taskMessageKeys(context.sessionManager.getEntries(), TASK_WAKE_CUSTOM_TYPE).has(eventKey);
-				const wakeSuppressed = !wakeAccepted && hasAcknowledgedLocalOriginTerminal(core, event);
-				if (!wakeAccepted && !wakeSuppressed) {
-					if (!context.isIdle()) break;
-					// This synchronous local write closes the ACK/wake race; do not await relay I/O before Pi emits the wake.
-					const wakeRequest = core.recordWakeRequest(eventDetails, work);
-					pi.sendMessage({
-						customType: TASK_WAKE_CUSTOM_TYPE,
-						content: "Process the pending Pi task event.",
-						display: false,
-						details: eventDetails,
-					}, { triggerTurn: true, deliverAs: "followUp" });
-					wakeAccepted = taskMessageKeys(context.sessionManager.getEntries(), TASK_WAKE_CUSTOM_TYPE).has(eventKey);
-					if (!wakeAccepted) break;
-					const wakeRequestError = await settleDeliveryEvidence(() => wakeRequest.flush(signal));
-					outboxError ??= wakeRequestError;
-				}
-				if (wakeAccepted) {
-					const wakeAcceptanceError = await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.wakeAccepted, state: TaskDeliveryEvidenceState.confirmed }, signal, work);
-					outboxError ??= wakeAcceptanceError;
-				}
-			}
+			const delivery = item.delivery;
+			if (delivery.envelope.kind !== TaskEnvelopeKind.intent && !await presentEvent(pi, core, context, inboxEvent(delivery), receipts)) break;
 			await core.acknowledgeRelayDelivery(delivery.cursor, signal, work);
 			pi.appendEntry(TASK_CURSOR_CUSTOM_TYPE, { cursor: delivery.cursor });
 		}
@@ -118,8 +72,55 @@ export async function deliverTaskInbox(pi: InboxPi, core: TaskCore, context: Inb
 	return outboxError;
 }
 
-async function recordDeliveryEvidence(core: TaskCore, event: TaskEventDetails, evidence: DeliveryEvidencePayload, signal: AbortSignal, work: TaskWorkScope): Promise<TaskOutboxDeliveryError | undefined> {
-	return settleDeliveryEvidence(() => core.submitIntent({ taskId: event.taskId, type: "task.delivery_receipt", payload: { eventId: event.eventId, ...evidence } }, signal, work));
+/** Idle gate, insertion, rescan, wake and wake evidence for one event. Returns false when presentation is held. */
+async function presentEvent(pi: InboxPi, core: TaskCore, context: InboxContext, event: TaskEvent, receipts: RelayReceipts | undefined): Promise<boolean> {
+	if (!isKnownEvent(event.type)) throw new TaskProtocolError("UNKNOWN_EVENT", `unknown task inbox event type: ${event.type}`);
+	if (context.hasPendingMessages()) return false;
+	const eventDetails = { taskId: event.taskId, eventId: event.eventId };
+	const eventKey = key(event.taskId, event.eventId);
+	const modelVisible = isModelVisible(event.type) && !core.isSelfAuthoredConversation(event);
+	if (!modelVisible && !recordedEventKeys(context.sessionManager.getEntries()).has(eventKey)) {
+		// Archive control facts and confirmed self-authored conversations without model insertion or wake.
+		// This is evidence only: no task state or delivery queue is reconstructed.
+		pi.appendEntry(TASK_RECORD_CUSTOM_TYPE, { ...eventDetails, event });
+	}
+	if (receipts && event.type === "task.created") receipts.report(await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.receiverRecorded, state: TaskDeliveryEvidenceState.confirmed }, receipts));
+	if (!modelVisible) return true;
+	if (!incorporatedEvents(context.sessionManager.getEntries()).has(eventKey)) {
+		if (!context.isIdle()) return false;
+		pi.sendMessage({
+			customType: TASK_EVENT_CUSTOM_TYPE,
+			content: renderTaskEvent(event),
+			display: true,
+			details: { ...eventDetails, event },
+		}, { triggerTurn: false });
+		if (!incorporatedEvents(context.sessionManager.getEntries()).has(eventKey)) {
+			if (receipts) receipts.report(await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.piInsertion, state: TaskDeliveryEvidenceState.blocked, retryable: true }, receipts));
+			return false;
+		}
+	}
+	if (receipts) receipts.report(await settleDeliveryEvidence(() => core.recordInsertion(eventDetails, receipts.signal, receipts.work)));
+	let wakeAccepted = taskMessageKeys(context.sessionManager.getEntries(), TASK_WAKE_CUSTOM_TYPE).has(eventKey);
+	if (!wakeAccepted && !hasAcknowledgedLocalOriginTerminal(core, event)) {
+		if (!context.isIdle()) return false;
+		// This synchronous local write closes the ACK/wake race; do not await relay I/O before Pi emits the wake.
+		const wakeRequest = receipts && core.recordWakeRequest(eventDetails, receipts.work);
+		pi.sendMessage({
+			customType: TASK_WAKE_CUSTOM_TYPE,
+			content: "Process the pending Pi task event.",
+			display: false,
+			details: eventDetails,
+		}, { triggerTurn: true, deliverAs: "followUp" });
+		wakeAccepted = taskMessageKeys(context.sessionManager.getEntries(), TASK_WAKE_CUSTOM_TYPE).has(eventKey);
+		if (!wakeAccepted) return false;
+		if (receipts && wakeRequest) receipts.report(await settleDeliveryEvidence(() => wakeRequest.flush(receipts.signal)));
+	}
+	if (receipts && wakeAccepted) receipts.report(await recordDeliveryEvidence(core, eventDetails, { stage: TaskDeliveryStage.wakeAccepted, state: TaskDeliveryEvidenceState.confirmed }, receipts));
+	return true;
+}
+
+async function recordDeliveryEvidence(core: TaskCore, event: TaskEventDetails, evidence: DeliveryEvidencePayload, receipts: RelayReceipts): Promise<TaskOutboxDeliveryError | undefined> {
+	return settleDeliveryEvidence(() => core.submitIntent({ taskId: event.taskId, type: "task.delivery_receipt", payload: { eventId: event.eventId, ...evidence } }, receipts.signal, receipts.work));
 }
 
 async function settleDeliveryEvidence(operation: () => Promise<void>): Promise<TaskOutboxDeliveryError | undefined> {

@@ -15,12 +15,16 @@ import type { TaskEndpoint, TaskSnapshot } from "./task-protocol";
 const DEFAULT_TASK_TIMEOUT_MS = 30 * 60 * 1_000;
 const MIN_TASK_TIMEOUT_MS = 1_000;
 const MAX_TASK_TIMEOUT_MS = 86_400_000;
-const BACKGROUND_POLL_MS = 5_000;
+/** Background cadence while work is pending (active task, pending outbox, or a worker awaiting assignment). */
+export const ACTIVE_POLL_MS = 1_000;
+/** Background cadence otherwise. */
+export const IDLE_POLL_MS = 5_000;
 const TARGET_NOT_REGISTERED_CODE = "TARGET_NOT_REGISTERED";
 const RELAY_STATE_LOST_CODE = "RELAY_STATE_LOST";
 const RELAY_LOSS_CUSTOM_TYPE = "pi-tasks-relay-loss";
 const RELAY_LOSS_CODES = new Set(["RELAY_RESET", "RELAY_REBIND_REQUIRED"]);
-const WAIT_POLL_MS = 250;
+const WAIT_BACKOFF_INITIAL_MS = 250;
+const WAIT_BACKOFF_MAX_MS = 2_000;
 const SUMMARY_MAX_CHARS = 1_200;
 const PRE_ASSIGNMENT_TOOLS = new Set(["agent_task_inbox", "agent_task_status", "agent_task_wait"]);
 const COORDINATOR_ONLY_TASK_TOOLS = new Set(["agent_task_send", "agent_task_cancel", "agent_task_ack"]);
@@ -101,7 +105,7 @@ export function createConfiguredCoreLoader(factory: ConfiguredCoreFactory): Conf
 /** Registers endpoint-owned tools using the memory-owned Wolfpack transport by default. */
 export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefined = undefined, createCore: ConfiguredCoreFactory = defaultCoreFactory): void {
 	let inboxContext: ExtensionContext | undefined;
-	let backgroundTimer: ReturnType<typeof setInterval> | undefined;
+	let backgroundTimer: ReturnType<typeof setTimeout> | undefined;
 	let lifecycleEpoch = 0;
 	const closingTaskIds = new Set<string>();
 	const workerGateEnabled = process.env.PI_TASK_WORKER === "1";
@@ -144,6 +148,9 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 			async acknowledgeRelayDelivery(cursor, acknowledgementSignal, acknowledgementWork) {
 				if (isCurrent()) await activeCore.acknowledgeRelayDelivery(cursor, acknowledgementSignal, acknowledgementWork);
 			},
+			completeLocalPresentation(eventId) {
+				if (isCurrent()) activeCore.completeLocalPresentation(eventId);
+			},
 			async recordInsertion(input, insertionSignal, insertionWork) {
 				if (isCurrent()) await activeCore.recordInsertion(input, insertionSignal, insertionWork);
 			},
@@ -172,13 +179,57 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		}, signal, work);
 		return outboxError ?? inboxOutboxError;
 	});
+	const cancelBackgroundRefresh = (): void => {
+		if (backgroundTimer) clearTimeout(backgroundTimer);
+		backgroundTimer = undefined;
+	};
+	/** Keep exactly one pending background timer; each lifecycle refresh re-arms it with the next cadence. */
+	const scheduleBackgroundRefresh = (epoch: number, delayMs: number): void => {
+		cancelBackgroundRefresh();
+		backgroundTimer = setTimeout(() => {
+			backgroundTimer = undefined;
+			if (inboxContext && lifecycleEpoch === epoch) void requestRefresh();
+		}, delayMs);
+	};
+	// Active cadence while a task is active, the outbox is pending, or a gate-enabled worker lacks an eligible assignment.
+	// An eligible assignment implies an active task, so the worker clause together with the first reduces to `workerGateEnabled`.
+	const nextPollDelay = (activeCore: TaskCore | undefined): number => activeCore !== undefined && (workerGateEnabled || activeCore.hasPendingWork()) ? ACTIVE_POLL_MS : IDLE_POLL_MS;
 	const startBackgroundRefresh = (context: ExtensionContext, epoch: number): void => {
 		inboxContext = context;
-		if (backgroundTimer) clearInterval(backgroundTimer);
-		backgroundTimer = setInterval(() => {
-			const currentContext = inboxContext;
-			if (currentContext) void refreshLifecycle(currentContext, epoch);
-		}, BACKGROUND_POLL_MS);
+		scheduleBackgroundRefresh(epoch, IDLE_POLL_MS);
+	};
+	let lifecycleRefresh: Promise<void> | undefined;
+	let trailingRefresh = false;
+	/** Immediate single-flight lifecycle refresh; requests made while one runs coalesce into one trailing run. */
+	const requestRefresh = (): Promise<void> => {
+		if (lifecycleRefresh) {
+			trailingRefresh = true;
+			return lifecycleRefresh;
+		}
+		const current = (async (): Promise<void> => {
+			do {
+				trailingRefresh = false;
+				const context = inboxContext;
+				if (!context) return;
+				try {
+					await refreshLifecycle(context, lifecycleEpoch);
+				} catch (error) {
+					// Callers fire and forget, so a failure escaping refreshLifecycle (e.g. a throwing status UI) must not reject.
+					console.error("pi-tasks: lifecycle refresh failed", error);
+					if (inboxContext === context) {
+						try {
+							context.ui.setStatus("pi-tasks", context.ui.theme.fg("warning", `tasks: refresh failed: ${error instanceof Error ? error.message : String(error)}`));
+						} catch {
+							// Status is best effort; the failure is already logged above.
+						}
+					}
+				}
+			} while (trailingRefresh);
+		})().finally(() => {
+			if (lifecycleRefresh === current) lifecycleRefresh = undefined;
+		});
+		lifecycleRefresh = current;
+		return current;
 	};
 	const announceFreshBinding = (context: ExtensionContext): void => {
 		if (pendingRelayLossCount === undefined) return;
@@ -194,8 +245,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 			const recoveryEpoch = ++lifecycleEpoch;
 			const activeTasks = activeCore?.listTasks().filter((task) => task.status === "active") ?? [];
 			inboxContext = undefined;
-			if (backgroundTimer) clearInterval(backgroundTimer);
-			backgroundTimer = undefined;
+			cancelBackgroundRefresh();
 			await ownedLoader.close();
 			if (recoveryEpoch !== lifecycleEpoch) return;
 			for (const task of activeTasks) {
@@ -241,6 +291,19 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		} catch (error) {
 			if (isCurrent() && isRelayLoss(error) && await recoverRelayLoss(context, epoch, activeCore)) return;
 			if (isCurrent()) context.ui.setStatus("pi-tasks", context.ui.theme.fg("warning", outboxFailureStatus(error)));
+		} finally {
+			if (isCurrent()) {
+				// The chain must outlive a failed cadence evaluation (e.g. an unreadable task snapshot): err toward polling and surface the fault.
+				let delay = ACTIVE_POLL_MS;
+				let delayError: unknown;
+				try {
+					delay = nextPollDelay(activeCore);
+				} catch (error) {
+					delayError = error;
+				}
+				scheduleBackgroundRefresh(epoch, delay); // Armed before the status write, which may itself throw.
+				if (delayError !== undefined) context.ui.setStatus("pi-tasks", context.ui.theme.fg("warning", `tasks: local task state unreadable: ${delayError instanceof Error ? delayError.message : String(delayError)}`));
+			}
 		}
 	};
 
@@ -276,25 +339,25 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		await ownedLoader?.start();
 		if (epoch !== lifecycleEpoch) return;
 		startBackgroundRefresh(context, epoch);
-		await refreshLifecycle(context, epoch);
+		await requestRefresh();
 	});
 	pi.on("agent_end", async (_event, context) => {
 		if (!inboxContext) return;
-		const epoch = lifecycleEpoch;
 		inboxContext = context;
-		await refreshLifecycle(context, epoch);
+		await requestRefresh();
 	});
 	pi.on("agent_settled", async (_event, context) => {
 		if (!inboxContext) return;
-		const epoch = lifecycleEpoch;
 		inboxContext = context;
-		await refreshLifecycle(context, epoch);
+		await requestRefresh();
+	});
+	pi.on("turn_end", async () => {
+		void requestRefresh();
 	});
 	pi.on("session_shutdown", async () => {
 		closingTaskIds.clear();
 		lifecycleEpoch += 1;
-		if (backgroundTimer) clearInterval(backgroundTimer);
-		backgroundTimer = undefined;
+		cancelBackgroundRefresh();
 		inboxContext = undefined;
 		pendingRelayLossCount = undefined;
 		await ownedLoader?.close();
@@ -305,6 +368,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		async execute(_id, params, signal) {
 			try {
 				const sent = await (await configuredCore(signal)).createTask({ target: params.to, task: params.task, timeoutMs: params.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS }, signal);
+				void requestRefresh();
 				return toolResult(sent, `## task accepted\n- task: \`${sent.taskId}\`\n- target: \`${params.to.relay}/${params.to.id}\`\n- delivery: relay acceptance only`);
 			} catch (error) { return taskError(error); }
 		},
@@ -327,14 +391,17 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 		async execute(_id, params, signal, onUpdate) {
 			const deadline = Date.now() + (params.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS);
 			try {
-				for (;;) {
-					await refreshInbox(signal);
-					const task = (await configuredCore(signal)).getTask(params.taskId);
+				// Fetching belongs to the background cadence; the wait re-checks local state on store changes or backoff.
+				void requestRefresh();
+				for (let backoff = WAIT_BACKOFF_INITIAL_MS; ; backoff = Math.min(backoff * 2, WAIT_BACKOFF_MAX_MS)) {
+					// Resolve the core each round so a relay-loss replacement is re-subscribed.
+					const activeCore = await configuredCore(signal);
+					const task = activeCore.getTask(params.taskId);
 					if (!task) return taskError(new TaskProtocolError("UNKNOWN_TASK", `unknown task: ${params.taskId}`, { retryable: false }));
 					if (terminal(task.status)) return toolResult(task, `## task status\n- task: \`${task.taskId}\`\n- status: ${task.status}`);
 					if (Date.now() >= deadline) return toolResult({ taskId: params.taskId, status: task.status }, `## task wait\n- task: \`${params.taskId}\`\n- status: ${task.status}\n- wait timed out`);
 					onUpdate?.({ content: [{ type: "text", text: `waiting for ${params.taskId}...` }], details: {} });
-					await abortableSleep(Math.max(1, Math.min(WAIT_POLL_MS, deadline - Date.now())), signal, () => new Error("task wait was cancelled"));
+					await abortableSleep(Math.max(1, Math.min(backoff, deadline - Date.now())), signal, () => new Error("task wait was cancelled"), (wake) => activeCore.onChange(wake));
 				}
 			} catch (error) { return taskError(error); }
 		}, renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
@@ -353,7 +420,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 	});
 	pi.registerTool({
 		name: "agent_task_message", label: "Message Agent Task", description: "Record a message intent in this lifetime before relay submission.", parameters: MessageParams,
-		async execute(_id, params, signal) { try { await (await configuredCore(signal)).submitIntent({ taskId: params.taskId, type: `task.${params.type}`, payload: { message: params.message } }, signal); return toolResult({ taskId: params.taskId }, `## task ${params.type}\n- task: \`${params.taskId}\``); } catch (error) { return taskError(error); } },
+		async execute(_id, params, signal) { try { await (await configuredCore(signal)).submitIntent({ taskId: params.taskId, type: `task.${params.type}`, payload: { message: params.message } }, signal); void requestRefresh(); return toolResult({ taskId: params.taskId }, `## task ${params.type}\n- task: \`${params.taskId}\``); } catch (error) { return taskError(error); } },
 		renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
 	});
 	pi.registerTool({
@@ -363,6 +430,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 				const activeCore = await configuredCore(signal);
 				try {
 					await activeCore.submitIntent({ taskId: params.taskId, type: "task.cancelled", payload: {} }, signal);
+					void requestRefresh();
 					return toolResult({ taskId: params.taskId }, `## task cancellation requested\n- task: \`${params.taskId}\``);
 				} catch (error) {
 					return blockedCancellationResult(activeCore, params.taskId, error) ?? taskError(error);
@@ -373,7 +441,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 	});
 	pi.registerTool({
 		name: "agent_task_ack", label: "Acknowledge Agent Task", description: "Record parent acknowledgement as an origin-owned logical event.", parameters: TaskIdParams,
-		async execute(_id, params, signal) { try { await (await configuredCore(signal)).acknowledgeParent(params.taskId, signal); return toolResult({ taskId: params.taskId }, `## task acknowledged\n- task: \`${params.taskId}\``); } catch (error) { return taskError(error); } },
+		async execute(_id, params, signal) { try { await (await configuredCore(signal)).acknowledgeParent(params.taskId, signal); void requestRefresh(); return toolResult({ taskId: params.taskId }, `## task acknowledged\n- task: \`${params.taskId}\``); } catch (error) { return taskError(error); } },
 		renderResult(result, _options, theme) { return new Text(theme.fg("accent", text(result))); },
 	});
 	pi.registerTool({
@@ -389,6 +457,7 @@ export function registerAgentTaskTools(pi: ExtensionAPI, core: TaskCore | undefi
 				} catch (error) {
 					return blockedDoneResult(activeCore, params.taskId, params.status, error) ?? taskError(error);
 				}
+				void requestRefresh();
 				const task = activeCore.getTask(params.taskId);
 				if (!task) return taskError(new TaskProtocolError("UNKNOWN_TASK", `unknown task: ${params.taskId}`, { retryable: false }));
 				if (submission?.authority === "origin" && submission.canonicalEvent.type === "task.late_terminal") {

@@ -1,6 +1,6 @@
 import { expect, spyOn, test } from "bun:test";
 import { createInMemoryTaskRelay } from "../src/in-memory-task-relay";
-import { createTaskCore } from "../src/task-core";
+import { createTaskCore, type TaskInboxItem } from "../src/task-core";
 import { deliverTaskInbox, type TaskEventDetails } from "../src/task-inbox";
 import { TaskEnvelopeKind, TaskProtocolError, type TaskEvent } from "../src/task-protocol";
 import { createTaskStore } from "../src/task-store";
@@ -9,6 +9,7 @@ const origin = { relay: "memory", id: "origin" };
 const receiver = { relay: "memory", id: "receiver" };
 const conversationTypes: Array<"task.information" | "task.question" | "task.answer"> = ["task.information", "task.question", "task.answer"];
 function ids(prefix: string) { let next = 0; return () => `${prefix}-${++next}`; }
+function relayCursor(item: TaskInboxItem | undefined): string { if (item?.kind !== "relay") throw new Error("expected a relay item"); return item.delivery.cursor; }
 function presentation() {
 	const messages: Array<{ customType: string; details: TaskEventDetails }> = [];
 	const records: Array<{ customType: string; data: { cursor: string } | TaskEventDetails }> = [];
@@ -28,8 +29,7 @@ async function fixture() {
 	const child = createTaskCore({ endpoint: receiver, relay, store: childStore, ids: ids("child") });
 	await parent.connect(); await child.connect();
 	const task = await parent.createTask({ target: receiver, task: "conversation", timeoutMs: 60_000 });
-	const assignment = (await child.receive())[0]!;
-	await child.acknowledgeRelayDelivery(assignment.cursor);
+	await child.acknowledgeRelayDelivery(relayCursor((await child.receive())[0]));
 	return { relay, parentStore, childStore, parent, child, taskId: task.taskId };
 }
 function conversation(core: ReturnType<typeof createTaskCore>, taskId: string, type: string): TaskEvent {
@@ -38,11 +38,12 @@ function conversation(core: ReturnType<typeof createTaskCore>, taskId: string, t
 	return event;
 }
 
-test.each(conversationTypes)("archives receiver-authored %s without a self wake, preserving peer insertion/evidence", async type => {
+test.each(conversationTypes)("archives receiver-authored %s without a self wake, preserving origin insertion and wake", async type => {
 	const f = await fixture(), parent = presentation(), child = presentation();
 	await f.child.submitIntent({ taskId: f.taskId, type, payload: { message: "same prose in either direction" } });
-	await deliverTaskInbox(parent.pi, f.parent, parent.context); // Canonicalize the raw intent first.
+	await deliverTaskInbox(parent.pi, f.parent, parent.context); // Canonicalize the raw intent and present it locally in the same refresh.
 	const event = conversation(f.parent, f.taskId, type);
+	expect(parent.messages.map(message => [message.customType, message.details.eventId])).toEqual([["pi-tasks-event", event.eventId], ["pi-tasks-wake", event.eventId]]);
 	await deliverTaskInbox(child.pi, f.child, child.context);
 	expect(child.messages).toEqual([]);
 	expect(child.records).toContainEqual({ customType: "pi-tasks-event-record", data: { taskId: f.taskId, eventId: event.eventId, event } });
@@ -51,8 +52,9 @@ test.each(conversationTypes)("archives receiver-authored %s without a self wake,
 	expect(await f.child.receive()).toEqual([]);
 	await deliverTaskInbox(parent.pi, f.parent, parent.context);
 	expect(parent.messages.map(message => message.customType)).toEqual(["pi-tasks-event", "pi-tasks-wake"]);
+	// Origin-local presentation emits no relay delivery receipts for the origin's own view.
 	const evidence = f.parent.getTask(f.taskId)!.events.filter(candidate => candidate.type === "task.delivery_receipt" && candidate.payload.eventId === event.eventId);
-	expect(evidence.map(candidate => candidate.payload.stage)).toEqual(["pi_inserted", "wake_requested", "wake_accepted"]);
+	expect(evidence).toEqual([]);
 	f.parentStore.close(); f.childStore.close();
 });
 
@@ -143,8 +145,7 @@ test("local intent correlation is task/type scoped and canonical replay stays no
 	expect(child.messages).toEqual([]);
 	expect(child.records.filter(record => record.customType === "pi-tasks-event-record")).toHaveLength(1);
 	const second = await f.parent.createTask({ target: receiver, task: "another task", timeoutMs: 60_000 });
-	const assignment = (await f.child.receive())[0]!;
-	await f.child.acknowledgeRelayDelivery(assignment.cursor);
+	await f.child.acknowledgeRelayDelivery(relayCursor((await f.child.receive())[0]));
 	for (const [taskId, type, eventId] of [[f.taskId, "task.answer", "wrong-type"], [second.taskId, "task.question", "wrong-task"]]) {
 		await f.relay.send({ envelopeId: `${eventId}-envelope`, protocolVersion: "pi-tasks/v2", source: origin, target: receiver, taskId: taskId!, kind: TaskEnvelopeKind.canonicalEvent,
 			payload: JSON.stringify({ ...selfEvent, taskId, type, eventId, sequence: "3" }) });

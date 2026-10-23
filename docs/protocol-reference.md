@@ -71,11 +71,11 @@ Remote task endpoints must be locally resolved aliases. The paired CLI qualifies
 
 ## delegation workflow
 
-Configure `WOLFPACK_IMPLEMENTER_MODEL` and `WOLFPACK_REVIEWER_MODEL`; defaults are `openai-codex/gpt-5.6-terra` and `openai-codex/gpt-5.6-sol`. Explicit user or project choices override those defaults.
+Configure `WOLFPACK_IMPLEMENTER_MODEL` and `WOLFPACK_REVIEWER_MODEL`; both default to `openai-codex/gpt-6.1-sol:high`. Explicit user or project choices override those defaults.
 
 ```bash
-IMPLEMENTER_MODEL="${WOLFPACK_IMPLEMENTER_MODEL:-openai-codex/gpt-5.6-terra}"
-REVIEWER_MODEL="${WOLFPACK_REVIEWER_MODEL:-openai-codex/gpt-5.6-sol}"
+IMPLEMENTER_MODEL="${WOLFPACK_IMPLEMENTER_MODEL:-openai-codex/gpt-6.1-sol:high}"
+REVIEWER_MODEL="${WOLFPACK_REVIEWER_MODEL:-openai-codex/gpt-6.1-sol:high}"
 ```
 
 1. Use one assignment mode: full-startup instructions, or an endpoint assignment—not both. For a task worker: `wolfpack agent spawn --project-dir /absolute/worktree --name <task-role> --model "$IMPLEMENTER_MODEL" --task-worker --readiness-timeout-ms 30000 --json` (or `"$REVIEWER_MODEL"`). This mode rejects prompts/plans and `--notify-parent`; put all instructions in `agent_task_send.task`.

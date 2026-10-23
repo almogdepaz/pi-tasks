@@ -21,8 +21,8 @@ never combine a plan-driven spawn with a narrower endpoint task. prefer one cohe
 Pi role models are explicit and configurable at spawn time:
 
 ```bash
-IMPLEMENTER_MODEL="${WOLFPACK_IMPLEMENTER_MODEL:-openai-codex/gpt-5.6-terra}"
-REVIEWER_MODEL="${WOLFPACK_REVIEWER_MODEL:-openai-codex/gpt-5.6-sol}"
+IMPLEMENTER_MODEL="${WOLFPACK_IMPLEMENTER_MODEL:-openai-codex/gpt-6.1-sol:high}"
+REVIEWER_MODEL="${WOLFPACK_REVIEWER_MODEL:-openai-codex/gpt-6.1-sol:high}"
 ```
 
 Pass `--model "$IMPLEMENTER_MODEL"` when spawning the editing implementer and `--model "$REVIEWER_MODEL"` when spawning the read-only reviewer. an explicit user or project model choice overrides the environment/default. never infer role or model from the session name, and never omit the resolved model because the current parent default may differ.

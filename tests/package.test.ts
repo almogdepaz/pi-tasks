@@ -84,8 +84,7 @@ describe("v2-only package", () => {
 			expect(document).toContain("rejects prompts/plans and `--notify-parent`");
 			expect(document).toContain("WOLFPACK_IMPLEMENTER_MODEL");
 			expect(document).toContain("WOLFPACK_REVIEWER_MODEL");
-			expect(document).toContain("openai-codex/gpt-5.6-terra");
-			expect(document).toContain("openai-codex/gpt-5.6-sol");
+			expect(document).toContain("openai-codex/gpt-6.1-sol:high");
 			expect(document).toContain("agent_task_send.task");
 			expect(document).toContain('`deliverAs: "followUp"`');
 			expect(document).toContain("result.changedFiles");
